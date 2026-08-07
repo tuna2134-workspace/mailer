@@ -1,9 +1,14 @@
 #![forbid(unsafe_code)]
 
+use std::time::{Duration, SystemTime};
 use thiserror::Error;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 mod extensions;
-pub use extensions::{BodyKind, MailParameters, RcptParameters, parse_mail, parse_rcpt};
+pub use extensions::{
+    BodyKind, DeliverBy, DeliverByMode, FutureRelease, MailParameters, RcptParameters, parse_mail,
+    parse_rcpt,
+};
 
 pub const MAX_COMMAND_LINE: usize = 512;
 
@@ -173,10 +178,13 @@ pub struct SessionExtensions {
     pub max_message_size: u64,
     pub starttls: bool,
     pub auth_plain: bool,
+    pub auth_scram: bool,
     pub dsn: bool,
     pub chunking: bool,
     pub smtp_utf8: bool,
     pub require_tls: bool,
+    pub deliver_by_min_seconds: Option<u32>,
+    pub future_release_max_seconds: Option<u32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -200,7 +208,10 @@ pub struct Session {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Action {
     Reply(Reply),
-    Recipient(String),
+    Recipient {
+        address: String,
+        parameters: RcptParameters,
+    },
     BeginData(Transaction),
     BeginBdat {
         transaction: Transaction,
@@ -229,10 +240,13 @@ impl Session {
                 max_message_size: u64::MAX,
                 starttls: false,
                 auth_plain: false,
+                auth_scram: false,
                 dsn: false,
                 chunking: false,
                 smtp_utf8: false,
                 require_tls: false,
+                deliver_by_min_seconds: None,
+                future_release_max_seconds: None,
             },
         )
     }
@@ -309,7 +323,7 @@ impl Session {
                 mechanism,
                 initial_response,
             } if self.extended_hello
-                && self.extensions.auth_plain
+                && (self.extensions.auth_plain || self.extensions.auth_scram)
                 && self.tls_active
                 && !self.authenticated =>
             {
@@ -328,6 +342,36 @@ impl Session {
                     || parameters.body == BodyKind::BinaryMime && !self.extensions.chunking
                     || parameters.smtp_utf8 && !self.extensions.smtp_utf8
                     || parameters.require_tls && !self.extensions.require_tls
+                    || parameters.deliver_by.is_some()
+                        && self.extensions.deliver_by_min_seconds.is_none()
+                    || parameters.future_release.is_some()
+                        && self.extensions.future_release_max_seconds.is_none()
+                    || parameters.deliver_by.is_some_and(|request| {
+                        request.seconds > 0
+                            && request.seconds.unsigned_abs()
+                                < self.extensions.deliver_by_min_seconds.unwrap_or_default()
+                    })
+                    || parameters
+                        .future_release
+                        .is_some_and(|request| match request {
+                            FutureRelease::HoldFor(seconds) => {
+                                seconds
+                                    > self
+                                        .extensions
+                                        .future_release_max_seconds
+                                        .unwrap_or_default()
+                            }
+                            FutureRelease::HoldUntil(until) => {
+                                until
+                                    > SystemTime::now()
+                                        + Duration::from_secs(u64::from(
+                                            self.extensions
+                                                .future_release_max_seconds
+                                                .unwrap_or_default(),
+                                        ))
+                            }
+                        })
+                    || future_release_after_deliver_by(&parameters)
                     || (parameters.ret.is_some() || parameters.envid.is_some())
                         && !self.extensions.dsn
                 {
@@ -368,7 +412,10 @@ impl Session {
                         text: "Unsupported RCPT TO parameter",
                     })
                 }
-                SessionState::Mail(_) => Action::Recipient(forward_path),
+                SessionState::Mail(_) => Action::Recipient {
+                    address: forward_path,
+                    parameters,
+                },
                 _ => bad_sequence(),
             },
             Command::Data => match &self.state {
@@ -445,11 +492,28 @@ impl Session {
         if self.extensions.starttls && !self.tls_active {
             values.push("STARTTLS".into());
         }
-        if self.extensions.auth_plain && self.tls_active {
-            values.push("AUTH PLAIN".into());
+        if (self.extensions.auth_plain || self.extensions.auth_scram) && self.tls_active {
+            let mut mechanisms = Vec::new();
+            if self.extensions.auth_plain {
+                mechanisms.push("PLAIN");
+            }
+            if self.extensions.auth_scram {
+                mechanisms.extend(["SCRAM-SHA-256", "SCRAM-SHA-256-PLUS"]);
+            }
+            values.push(format!("AUTH {}", mechanisms.join(" ")));
         }
         if self.extensions.require_tls {
             values.push("REQUIRETLS".into());
+        }
+        if let Some(minimum) = self.extensions.deliver_by_min_seconds {
+            values.push(format!("DELIVERBY {minimum}"));
+        }
+        if let Some(maximum) = self.extensions.future_release_max_seconds
+            && let Ok(date) = (OffsetDateTime::now_utc()
+                + time::Duration::seconds(i64::from(maximum)))
+            .format(&Rfc3339)
+        {
+            values.push(format!("FUTURERELEASE {maximum} {date}"));
         }
         values
     }
@@ -461,6 +525,21 @@ fn ok(text: &'static str) -> Action {
         enhanced: Some("2.0.0"),
         text,
     })
+}
+
+fn future_release_after_deliver_by(parameters: &MailParameters) -> bool {
+    let (Some(release), Some(deliver)) = (parameters.future_release, parameters.deliver_by) else {
+        return false;
+    };
+    if deliver.seconds <= 0 {
+        return true;
+    }
+    let deliver_at =
+        SystemTime::now() + Duration::from_secs(u64::from(deliver.seconds.unsigned_abs()));
+    match release {
+        FutureRelease::HoldFor(seconds) => seconds >= deliver.seconds.unsigned_abs(),
+        FutureRelease::HoldUntil(until) => until >= deliver_at,
+    }
 }
 
 fn bad_sequence() -> Action {
@@ -519,7 +598,7 @@ mod tests {
         ));
         assert!(matches!(
             session.command(parse_command(b"RCPT TO:<alice@example.test>\r\n", false)?),
-            Action::Recipient(_)
+            Action::Recipient { .. }
         ));
         session.accept_recipient("alice@example.test".into());
         assert!(matches!(
@@ -599,10 +678,13 @@ mod tests {
                 max_message_size: 1024,
                 starttls: true,
                 auth_plain: true,
+                auth_scram: true,
                 dsn: false,
                 chunking: true,
                 smtp_utf8: false,
                 require_tls: false,
+                deliver_by_min_seconds: None,
+                future_release_max_seconds: None,
             },
         );
         let Action::Ehlo { capabilities, .. } = session.command(Command::Ehlo("client".into()))
@@ -628,6 +710,72 @@ mod tests {
             panic!("EHLO action expected");
         };
         assert!(!capabilities.iter().any(|value| value == "STARTTLS"));
-        assert!(capabilities.iter().any(|value| value == "AUTH PLAIN"));
+        assert!(
+            capabilities
+                .iter()
+                .any(|value| { value == "AUTH PLAIN SCRAM-SHA-256 SCRAM-SHA-256-PLUS" })
+        );
+    }
+
+    #[test]
+    fn deliver_by_and_future_release_are_bounded() -> Result<(), ParseError> {
+        let Command::Mail { parameters, .. } = parse_command(
+            b"MAIL FROM:<sender@example.test> BY=3600;R;T HOLDFOR=60\r\n",
+            false,
+        )?
+        else {
+            panic!("MAIL expected");
+        };
+        assert_eq!(
+            parameters.deliver_by,
+            Some(DeliverBy {
+                seconds: 3600,
+                mode: DeliverByMode::Return,
+                trace: true,
+            })
+        );
+        assert_eq!(parameters.future_release, Some(FutureRelease::HoldFor(60)));
+
+        let mut session = Session::with_extensions(
+            10,
+            SessionExtensions {
+                hostname: "mail.example.test".into(),
+                max_message_size: 1024,
+                starttls: false,
+                auth_plain: false,
+                auth_scram: false,
+                dsn: true,
+                chunking: false,
+                smtp_utf8: false,
+                require_tls: false,
+                deliver_by_min_seconds: Some(30),
+                future_release_max_seconds: Some(300),
+            },
+        );
+        let Action::Ehlo { capabilities, .. } = session.command(Command::Ehlo("client".into()))
+        else {
+            panic!("EHLO expected");
+        };
+        assert!(capabilities.iter().any(|value| value == "DELIVERBY 30"));
+        assert!(
+            capabilities
+                .iter()
+                .any(|value| value.starts_with("FUTURERELEASE 300 "))
+        );
+        assert!(matches!(
+            session.command(parse_command(
+                b"MAIL FROM:<sender@example.test> BY=20;N\r\n",
+                false,
+            )?),
+            Action::Reply(Reply { code: 555, .. })
+        ));
+        assert_eq!(
+            parse_command(
+                b"MAIL FROM:<sender@example.test> HOLDFOR=10 HOLDUNTIL=2030-01-01T00:00:00Z\r\n",
+                false,
+            ),
+            Err(ParseError::InvalidSyntax)
+        );
+        Ok(())
     }
 }

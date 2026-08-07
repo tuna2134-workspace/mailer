@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use mail_domain::{Alias, Domain, Mailbox, MailboxId, QueueId, Tenant, TenantId, User};
 use mail_storage::{
     AdminRepository, ApiCredential, AuditEvent, IdempotencyRecord, MailRepository,
-    MailboxAllocation, QueueLease, StorageError, Versioned,
+    MailboxAllocation, PasswordCredential, QueueLease, StorageError, Versioned,
 };
 use std::{
     collections::HashMap,
@@ -268,14 +268,14 @@ impl MailRepository for InMemoryRepository {
     async fn create_user_with_password(
         &self,
         user: &User,
-        password_hash: &str,
+        credential: &PasswordCredential,
     ) -> Result<(), StorageError> {
         self.create_user(user).await?;
         self.state
             .lock()
             .map_err(|error| StorageError::Unavailable(error.to_string()))?
             .password_hashes
-            .insert(user.id, password_hash.to_owned());
+            .insert(user.id, credential.argon2_hash.clone());
         Ok(())
     }
 

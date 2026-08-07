@@ -23,6 +23,8 @@ async fn main() -> Result<()> {
     let acme_addr = address("MAIL_ACME_LISTEN", "0.0.0.0:443")?;
     let admin_addr = address("MAIL_ADMIN_LISTEN", "127.0.0.1:8443")?;
     let smtp_addr = address("MAIL_SMTP_LISTEN", "0.0.0.0:25")?;
+    let submission_addr = address("MAIL_SUBMISSION_LISTEN", "0.0.0.0:587")?;
+    let implicit_submission_addr = address("MAIL_SUBMISSIONS_LISTEN", "0.0.0.0:465")?;
     let hostname = match std::env::var("MAIL_HOSTNAME") {
         Ok(value) => value,
         Err(_) => domains
@@ -85,6 +87,65 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("bind SMTP listener {smtp_addr}"))?;
     let smtp_repository = Arc::new(repository.clone());
+    let submission_listener = TcpListener::bind(submission_addr)
+        .await
+        .with_context(|| format!("bind Submission listener {submission_addr}"))?;
+    let submission_repository = Arc::clone(&smtp_repository);
+    let submission_tls = Arc::clone(&smtp_tls);
+    let submission_hostname = hostname.clone();
+    let submission_task = tokio::spawn(async move {
+        mail_smtp_server::serve(
+            submission_listener,
+            submission_repository,
+            mail_smtp_server::SmtpConfig {
+                hostname: submission_hostname,
+                tls: Some(submission_tls),
+                auth_plain: true,
+                auth_scram: true,
+                chunking: true,
+                dsn: true,
+                smtp_utf8: true,
+                require_tls: true,
+                require_auth: true,
+                authenticated_relay: true,
+                deliver_by_min_seconds: Some(0),
+                future_release_max_seconds: Some(30 * 24 * 60 * 60),
+                ..mail_smtp_server::SmtpConfig::default()
+            },
+        )
+        .await
+    });
+    let implicit_submission_listener = TcpListener::bind(implicit_submission_addr)
+        .await
+        .with_context(|| {
+            format!("bind implicit TLS Submission listener {implicit_submission_addr}")
+        })?;
+    let implicit_repository = Arc::clone(&smtp_repository);
+    let implicit_tls = Arc::clone(&smtp_tls);
+    let implicit_hostname = hostname.clone();
+    let implicit_submission_task = tokio::spawn(async move {
+        mail_smtp_server::serve(
+            implicit_submission_listener,
+            implicit_repository,
+            mail_smtp_server::SmtpConfig {
+                hostname: implicit_hostname,
+                tls: Some(implicit_tls),
+                auth_plain: true,
+                auth_scram: true,
+                chunking: true,
+                dsn: true,
+                smtp_utf8: true,
+                require_tls: true,
+                require_auth: true,
+                authenticated_relay: true,
+                implicit_tls: true,
+                deliver_by_min_seconds: Some(0),
+                future_release_max_seconds: Some(30 * 24 * 60 * 60),
+                ..mail_smtp_server::SmtpConfig::default()
+            },
+        )
+        .await
+    });
     let smtp_task = tokio::spawn(async move {
         mail_smtp_server::serve(
             smtp_listener,
@@ -93,7 +154,12 @@ async fn main() -> Result<()> {
                 hostname,
                 tls: Some(smtp_tls),
                 auth_plain: true,
+                auth_scram: true,
                 chunking: true,
+                dsn: true,
+                smtp_utf8: true,
+                require_tls: true,
+                deliver_by_min_seconds: Some(0),
                 ..mail_smtp_server::SmtpConfig::default()
             },
         )
@@ -114,6 +180,14 @@ async fn main() -> Result<()> {
         result = smtp_task => {
             result.context("SMTP listener task stopped")??;
             bail!("SMTP listener stopped unexpectedly");
+        }
+        result = submission_task => {
+            result.context("Submission listener task stopped")??;
+            bail!("Submission listener stopped unexpectedly");
+        }
+        result = implicit_submission_task => {
+            result.context("implicit TLS Submission listener task stopped")??;
+            bail!("implicit TLS Submission listener stopped unexpectedly");
         }
         result = shutdown_signal() => {
             result.context("install shutdown signal handler")?;

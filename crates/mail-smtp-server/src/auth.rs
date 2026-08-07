@@ -1,6 +1,10 @@
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::SaltString};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use mail_storage::SmtpRepository;
+use mail_sasl::{ScramCredential, ScramExchange, ScramMechanism, client_identity};
+use mail_storage::{SmtpRepository, SmtpScramCredential};
+use ring::rand::{SecureRandom as _, SystemRandom};
+use std::num::NonZeroU32;
+use uuid::Uuid;
 
 use crate::SmtpError;
 
@@ -26,9 +30,9 @@ pub(crate) fn decode_plain(response: &str) -> Option<(String, Vec<u8>)> {
 pub(crate) async fn authenticate<R: SmtpRepository>(
     repository: &R,
     response: &str,
-) -> Result<bool, SmtpError> {
+) -> Result<Option<Uuid>, SmtpError> {
     let Some((identity, password)) = decode_plain(response) else {
-        return Ok(false);
+        return Ok(None);
     };
     let account = repository
         .smtp_auth_account(&identity)
@@ -56,13 +60,78 @@ pub(crate) async fn authenticate<R: SmtpRepository>(
     })
     .await
     .map_err(|_| SmtpError::Storage)?;
+    let user_id = account.as_ref().map(|value| value.user_id);
     if let Some(account) = account {
         repository
             .record_smtp_auth(account.user_id, valid)
             .await
             .map_err(|_| SmtpError::Storage)?;
     }
-    Ok(valid)
+    Ok(valid.then_some(user_id).flatten())
+}
+
+pub(crate) struct ServerScramAuth {
+    user_id: Option<Uuid>,
+    exchange: ScramExchange,
+}
+
+pub(crate) async fn begin_scram<R: SmtpRepository>(
+    repository: &R,
+    mechanism: ScramMechanism,
+    client_first: &str,
+    tls_exporter: Option<&[u8]>,
+) -> Result<(String, ServerScramAuth), SmtpError> {
+    let identity = client_identity(mechanism, client_first).map_err(|_| SmtpError::Auth)?;
+    let account = repository
+        .smtp_auth_account(&identity)
+        .await
+        .map_err(|_| SmtpError::Storage)?;
+    let user_id = account.as_ref().map(|value| value.user_id);
+    let credential = match account.and_then(|value| value.scram) {
+        Some(value) => convert_scram(value)?,
+        None => tokio::task::spawn_blocking(|| {
+            Ok::<_, SmtpError>(mail_sasl::derive_credential(
+                b"invalid-account-password",
+                b"maild-scram-dummy-salt",
+                NonZeroU32::new(4096).ok_or(SmtpError::Auth)?,
+            ))
+        })
+        .await
+        .map_err(|_| SmtpError::Storage)??,
+    };
+    let mut nonce = [0_u8; 18];
+    SystemRandom::new()
+        .fill(&mut nonce)
+        .map_err(|_| SmtpError::Storage)?;
+    let nonce = STANDARD.encode(nonce);
+    let (_, server_first, exchange) =
+        ScramExchange::start(mechanism, client_first, credential, &nonce, tls_exporter)
+            .map_err(|_| SmtpError::Auth)?;
+    Ok((server_first, ServerScramAuth { user_id, exchange }))
+}
+
+pub(crate) async fn finish_scram<R: SmtpRepository>(
+    repository: &R,
+    auth: ServerScramAuth,
+    client_final: &str,
+) -> Result<Option<(Uuid, String)>, SmtpError> {
+    let result = auth.exchange.finish(client_final).ok();
+    if let Some(user_id) = auth.user_id {
+        repository
+            .record_smtp_auth(user_id, result.is_some())
+            .await
+            .map_err(|_| SmtpError::Storage)?;
+    }
+    Ok(auth.user_id.zip(result))
+}
+
+fn convert_scram(value: SmtpScramCredential) -> Result<ScramCredential, SmtpError> {
+    Ok(ScramCredential {
+        salt: value.salt,
+        iterations: NonZeroU32::new(value.iterations).ok_or(SmtpError::Auth)?,
+        stored_key: value.stored_key.try_into().map_err(|_| SmtpError::Auth)?,
+        server_key: value.server_key.try_into().map_err(|_| SmtpError::Auth)?,
+    })
 }
 
 #[cfg(test)]

@@ -10,7 +10,9 @@ argon2.workspace = true
 axum.workspace = true
 mail-application = { path = "../mail-application" }
 mail-domain = { path = "../mail-domain" }
+mail-sasl = { path = "../mail-sasl" }
 mail-storage = { path = "../mail-storage" }
+ring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

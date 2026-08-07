@@ -3,7 +3,7 @@
 use mail_domain::{Alias, Domain, Mailbox, Tenant, TenantId, User};
 use mail_storage::{
     AdminRepository, ApiTokenInfo, ApplicationPasswordInfo, AuditRecord, IdempotencyRecord,
-    MailboxInfo, Versioned,
+    MailboxInfo, PasswordCredential, Versioned,
 };
 use mail_storage::{ApiCredential, AuditEvent, MailRepository, StorageError};
 use thiserror::Error;
@@ -67,10 +67,10 @@ impl<R: MailRepository> AdministrationService<R> {
     pub async fn create_user_with_password(
         &self,
         user: &User,
-        password_hash: &str,
+        credential: &PasswordCredential,
     ) -> Result<(), ApplicationError> {
         self.repository
-            .create_user_with_password(user, password_hash)
+            .create_user_with_password(user, credential)
             .await
             .map_err(Into::into)
     }
@@ -282,10 +282,10 @@ impl<R: AdminRepository> AdministrationService<R> {
         &self,
         tenant: TenantId,
         user: mail_domain::UserId,
-        hash: &str,
+        credential: &PasswordCredential,
     ) -> Result<(), ApplicationError> {
         self.repository
-            .set_user_password(tenant, user, hash)
+            .set_user_password(tenant, user, credential)
             .await
             .map_err(Into::into)
     }
@@ -379,10 +379,10 @@ impl<R: AdminRepository> AdministrationService<R> {
         user: mail_domain::UserId,
         id: Uuid,
         name: &str,
-        hash: &str,
+        credential: &PasswordCredential,
     ) -> Result<ApplicationPasswordInfo, ApplicationError> {
         self.repository
-            .create_application_password(tenant, user, id, name, hash)
+            .create_application_password(tenant, user, id, name, credential)
             .await
             .map_err(Into::into)
     }

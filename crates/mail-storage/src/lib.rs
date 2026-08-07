@@ -97,6 +97,15 @@ pub struct QueueLease {
     pub recipient: String,
     pub destination_domain: String,
     pub envelope_sender: String,
+    pub require_tls: bool,
+    pub smtp_utf8: bool,
+    pub dsn_ret: Option<String>,
+    pub envelope_id: Option<String>,
+    pub dsn_notify: Option<String>,
+    pub original_recipient: Option<String>,
+    pub deliver_by_at: Option<SystemTime>,
+    pub deliver_by_mode: Option<String>,
+    pub deliver_by_trace: bool,
     pub attempt_count: u32,
     pub expires_at: SystemTime,
 }
@@ -120,6 +129,27 @@ pub struct LocalRecipient {
     pub address: String,
     pub tenant_id: TenantId,
     pub mailbox_id: MailboxId,
+    pub dsn_notify: Option<String>,
+    pub original_recipient: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SmtpMailOptions {
+    pub smtp_utf8: bool,
+    pub require_tls: bool,
+    pub dsn_ret: Option<String>,
+    pub envelope_id: Option<String>,
+    pub deliver_by_at: Option<SystemTime>,
+    pub deliver_by_mode: Option<String>,
+    pub deliver_by_trace: bool,
+    pub release_at: Option<SystemTime>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubmissionRecipient {
+    pub address: String,
+    pub dsn_notify: Option<String>,
+    pub original_recipient: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -132,6 +162,31 @@ pub struct StoredMessage {
 pub struct SmtpAuthAccount {
     pub user_id: Uuid,
     pub password_hashes: Vec<String>,
+    pub scram: Option<SmtpScramCredential>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SmtpScramCredential {
+    pub salt: Vec<u8>,
+    pub iterations: u32,
+    pub stored_key: Vec<u8>,
+    pub server_key: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PasswordCredential {
+    pub argon2_hash: String,
+    pub scram: Option<SmtpScramCredential>,
+}
+
+impl PasswordCredential {
+    #[must_use]
+    pub fn argon2_only(hash: impl Into<String>) -> Self {
+        Self {
+            argon2_hash: hash.into(),
+            scram: None,
+        }
+    }
 }
 
 #[async_trait]
@@ -159,7 +214,7 @@ pub trait MailRepository: Send + Sync {
     async fn create_user_with_password(
         &self,
         user: &User,
-        password_hash: &str,
+        credential: &PasswordCredential,
     ) -> Result<(), StorageError>;
     async fn list_users(
         &self,
@@ -242,7 +297,7 @@ pub trait AdminRepository: MailRepository {
         &self,
         _tenant: TenantId,
         _user: mail_domain::UserId,
-        _hash: &str,
+        _credential: &PasswordCredential,
     ) -> Result<(), StorageError> {
         Err(StorageError::NotFound)
     }
@@ -312,7 +367,7 @@ pub trait AdminRepository: MailRepository {
         _user: mail_domain::UserId,
         _id: Uuid,
         _name: &str,
-        _hash: &str,
+        _credential: &PasswordCredential,
     ) -> Result<ApplicationPasswordInfo, StorageError> {
         Err(StorageError::NotFound)
     }
@@ -411,6 +466,7 @@ pub trait SmtpRepository: Send + Sync {
         envelope_sender: &str,
         recipients: &[LocalRecipient],
         received_header: &[u8],
+        options: &SmtpMailOptions,
     ) -> Result<StoredMessage, StorageError>;
     async fn abort_smtp_ingestion(&self, ingestion_id: Uuid) -> Result<(), StorageError>;
 
@@ -423,5 +479,27 @@ pub trait SmtpRepository: Send + Sync {
 
     async fn record_smtp_auth(&self, _user_id: Uuid, _success: bool) -> Result<(), StorageError> {
         Ok(())
+    }
+
+    async fn authorize_smtp_sender(
+        &self,
+        _user_id: Uuid,
+        _sender: &str,
+    ) -> Result<bool, StorageError> {
+        Ok(false)
+    }
+
+    async fn commit_submission_ingestion(
+        &self,
+        _ingestion_id: Uuid,
+        _user_id: Uuid,
+        _envelope_sender: &str,
+        _recipients: &[SubmissionRecipient],
+        _received_header: &[u8],
+        _options: &SmtpMailOptions,
+    ) -> Result<StoredMessage, StorageError> {
+        Err(StorageError::Unavailable(
+            "message submission is unsupported".into(),
+        ))
     }
 }

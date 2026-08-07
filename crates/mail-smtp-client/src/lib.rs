@@ -1,13 +1,21 @@
-use std::{io, net::SocketAddr, time::Duration};
+use std::{
+    io,
+    net::SocketAddr,
+    time::{Duration, SystemTime},
+};
 
 use mail_dns::{MailHost, MailRoute};
 use mail_storage::{MailRepository, QueueLease, StorageError};
+use rustls_platform_verifier::BuilderVerifierExt;
 use thiserror::Error;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::TcpStream,
     time::timeout,
 };
+
+trait ClientIo: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> ClientIo for T {}
 
 const REPLY_LIMIT: usize = 8 * 1024;
 const MESSAGE_CHUNK: u32 = 64 * 1024;
@@ -66,6 +74,21 @@ impl SmtpClient {
                 diagnostic: "invalid envelope address".into(),
             });
         }
+        if [
+            &lease.dsn_ret,
+            &lease.envelope_id,
+            &lease.dsn_notify,
+            &lease.original_recipient,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|value| has_line_break(value) || value.contains(' '))
+        {
+            return Ok(SendResult::Failed {
+                code: Some("5.6.0".into()),
+                diagnostic: "invalid DSN envelope option".into(),
+            });
+        }
         let MailRoute::Hosts(hosts) = route else {
             unreachable!()
         };
@@ -105,33 +128,174 @@ impl SmtpClient {
                 });
             }
         };
-        let (read, mut write) = stream.into_split();
-        let mut read = BufReader::new(read);
-        let greeting = self.reply(&mut read).await;
+        let mut connection = BufReader::new(Box::new(stream) as Box<dyn ClientIo>);
+        let greeting = self.reply(&mut connection).await;
         if let Some(result) = classify_reply(greeting, "greeting", &[220]) {
             return Ok(result);
         }
 
         if let Err(error) = self
-            .write(&mut write, format!("EHLO {}\r\n", self.hostname).as_bytes())
+            .write(
+                connection.get_mut(),
+                format!("EHLO {}\r\n", self.hostname).as_bytes(),
+            )
             .await
         {
             return Ok(deferred_io(host, &error));
         }
-        let ehlo = self.reply(&mut read).await;
+        let ehlo = self.reply(&mut connection).await;
+        let mut tls_active = false;
+        let mut requiretls_supported = false;
+        let mut smtp_utf8_supported = false;
+        let mut dsn_supported = false;
+        let mut deliver_by_supported = false;
         if matches!(ehlo, Ok((500..=599, _))) {
             if let Err(error) = self
-                .write(&mut write, format!("HELO {}\r\n", self.hostname).as_bytes())
+                .write(
+                    connection.get_mut(),
+                    format!("HELO {}\r\n", self.hostname).as_bytes(),
+                )
                 .await
             {
                 return Ok(deferred_io(host, &error));
             }
-            if let Some(result) = classify_reply(self.reply(&mut read).await, "HELO", &[250]) {
+            if let Some(result) = classify_reply(self.reply(&mut connection).await, "HELO", &[250])
+            {
                 return Ok(result);
             }
-        } else if let Some(result) = classify_reply(ehlo, "EHLO", &[250]) {
-            return Ok(result);
+        } else {
+            let starttls = matches!(&ehlo, Ok((250, text)) if text.split_ascii_whitespace().any(|value| value.eq_ignore_ascii_case("STARTTLS")));
+            requiretls_supported = matches!(&ehlo, Ok((250, text)) if text.split_ascii_whitespace().any(|value| value.eq_ignore_ascii_case("REQUIRETLS")));
+            smtp_utf8_supported = matches!(&ehlo, Ok((250, text)) if text.split_ascii_whitespace().any(|value| value.eq_ignore_ascii_case("SMTPUTF8")));
+            dsn_supported = matches!(&ehlo, Ok((250, text)) if text.split_ascii_whitespace().any(|value| value.eq_ignore_ascii_case("DSN")));
+            deliver_by_supported = matches!(&ehlo, Ok((250, text)) if text.split_ascii_whitespace().any(|value| value.eq_ignore_ascii_case("DELIVERBY")));
+            if let Some(result) = classify_reply(ehlo, "EHLO", &[250]) {
+                return Ok(result);
+            }
+            if starttls {
+                if let Err(error) = self.write(connection.get_mut(), b"STARTTLS\r\n").await {
+                    return Ok(deferred_io(host, &error));
+                }
+                if let Some(result) =
+                    classify_reply(self.reply(&mut connection).await, "STARTTLS", &[220])
+                {
+                    return Ok(result);
+                }
+                let tls = match rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()
+                .and_then(BuilderVerifierExt::with_platform_verifier)
+                .map(no_client_auth)
+                {
+                    Ok(config) => config,
+                    Err(error) => {
+                        return Ok(SendResult::Deferred {
+                            code: Some("4.7.5".into()),
+                            diagnostic: format!("TLS verifier unavailable: {error}"),
+                        });
+                    }
+                };
+                let server_name = match rustls::pki_types::ServerName::try_from(host.name.clone()) {
+                    Ok(name) => name,
+                    Err(error) => {
+                        return Ok(SendResult::Deferred {
+                            code: Some("4.7.5".into()),
+                            diagnostic: format!("invalid TLS server name: {error}"),
+                        });
+                    }
+                };
+                let secured = match timeout(
+                    self.command_timeout,
+                    tokio_rustls::TlsConnector::from(std::sync::Arc::new(tls))
+                        .connect(server_name, connection.into_inner()),
+                )
+                .await
+                {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(error)) => {
+                        return Ok(SendResult::Deferred {
+                            code: Some("4.7.5".into()),
+                            diagnostic: format!("TLS handshake failed: {error}"),
+                        });
+                    }
+                    Err(_) => {
+                        return Ok(SendResult::Deferred {
+                            code: Some("4.7.5".into()),
+                            diagnostic: "TLS handshake timed out".into(),
+                        });
+                    }
+                };
+                connection = BufReader::new(Box::new(secured));
+                tls_active = true;
+                if let Err(error) = self
+                    .write(
+                        connection.get_mut(),
+                        format!("EHLO {}\r\n", self.hostname).as_bytes(),
+                    )
+                    .await
+                {
+                    return Ok(deferred_io(host, &error));
+                }
+                let ehlo = self.reply(&mut connection).await;
+                requiretls_supported = matches!(&ehlo, Ok((250, text)) if text.split_ascii_whitespace().any(|value| value.eq_ignore_ascii_case("REQUIRETLS")));
+                smtp_utf8_supported = matches!(&ehlo, Ok((250, text)) if text.split_ascii_whitespace().any(|value| value.eq_ignore_ascii_case("SMTPUTF8")));
+                dsn_supported = matches!(&ehlo, Ok((250, text)) if text.split_ascii_whitespace().any(|value| value.eq_ignore_ascii_case("DSN")));
+                deliver_by_supported = matches!(&ehlo, Ok((250, text)) if text.split_ascii_whitespace().any(|value| value.eq_ignore_ascii_case("DELIVERBY")));
+                if let Some(result) = classify_reply(ehlo, "EHLO after TLS", &[250]) {
+                    return Ok(result);
+                }
+            }
         }
+        if lease.require_tls && (!tls_active || !requiretls_supported) {
+            return Ok(SendResult::Deferred {
+                code: Some("4.7.5".into()),
+                diagnostic: "REQUIRETLS cannot be satisfied by destination".into(),
+            });
+        }
+        if lease.smtp_utf8 && !smtp_utf8_supported {
+            return Ok(SendResult::Failed {
+                code: Some("5.6.7".into()),
+                diagnostic: "destination does not support SMTPUTF8".into(),
+            });
+        }
+        if !dsn_supported
+            && (lease.dsn_ret.is_some()
+                || lease.envelope_id.is_some()
+                || lease.dsn_notify.is_some()
+                || lease.original_recipient.is_some())
+        {
+            return Ok(SendResult::Deferred {
+                code: Some("4.5.1".into()),
+                diagnostic: "destination does not support requested DSN options".into(),
+            });
+        }
+        if lease.deliver_by_mode.as_deref() == Some("R") && !deliver_by_supported {
+            return Ok(SendResult::Deferred {
+                code: Some("4.5.1".into()),
+                diagnostic: "destination does not support required DELIVERBY return mode".into(),
+            });
+        }
+        let deliver_by = if deliver_by_supported {
+            lease
+                .deliver_by_at
+                .and_then(|deadline| {
+                    deadline
+                        .duration_since(SystemTime::now())
+                        .ok()
+                        .map(|remaining| {
+                            format!(
+                                " BY={};{}{}",
+                                remaining.as_secs().clamp(1, 999_999_999),
+                                lease.deliver_by_mode.as_deref().unwrap_or("N"),
+                                if lease.deliver_by_trace { ";T" } else { "" }
+                            )
+                        })
+                })
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         let reverse_path = if lease.envelope_sender.is_empty() {
             "<>".to_owned()
         } else {
@@ -139,34 +303,63 @@ impl SmtpClient {
         };
         if let Err(error) = self
             .write(
-                &mut write,
-                format!("MAIL FROM:{reverse_path}\r\n").as_bytes(),
+                connection.get_mut(),
+                format!(
+                    "MAIL FROM:{reverse_path}{}{}{}{}{}\r\n",
+                    if lease.require_tls { " REQUIRETLS" } else { "" },
+                    if lease.smtp_utf8 { " SMTPUTF8" } else { "" },
+                    lease
+                        .dsn_ret
+                        .as_ref()
+                        .map_or_else(String::new, |value| format!(" RET={value}")),
+                    lease
+                        .envelope_id
+                        .as_ref()
+                        .map_or_else(String::new, |value| format!(" ENVID={value}")),
+                    deliver_by
+                )
+                .as_bytes(),
             )
             .await
         {
             return Ok(deferred_io(host, &error));
         }
-        if let Some(result) = classify_reply(self.reply(&mut read).await, "MAIL FROM", &[250]) {
+        if let Some(result) = classify_reply(self.reply(&mut connection).await, "MAIL FROM", &[250])
+        {
             return Ok(result);
         }
         if let Err(error) = self
             .write(
-                &mut write,
-                format!("RCPT TO:<{}>\r\n", lease.recipient).as_bytes(),
+                connection.get_mut(),
+                format!(
+                    "RCPT TO:<{}>{}{}\r\n",
+                    lease.recipient,
+                    lease
+                        .dsn_notify
+                        .as_ref()
+                        .map_or_else(String::new, |value| format!(" NOTIFY={value}")),
+                    lease
+                        .original_recipient
+                        .as_ref()
+                        .map_or_else(String::new, |value| format!(" ORCPT={value}")),
+                )
+                .as_bytes(),
             )
             .await
         {
             return Ok(deferred_io(host, &error));
         }
-        if let Some(result) =
-            classify_reply(self.reply(&mut read).await, "RCPT TO", &[250, 251, 252])
-        {
+        if let Some(result) = classify_reply(
+            self.reply(&mut connection).await,
+            "RCPT TO",
+            &[250, 251, 252],
+        ) {
             return Ok(result);
         }
-        if let Err(error) = self.write(&mut write, b"DATA\r\n").await {
+        if let Err(error) = self.write(connection.get_mut(), b"DATA\r\n").await {
             return Ok(deferred_io(host, &error));
         }
-        if let Some(result) = classify_reply(self.reply(&mut read).await, "DATA", &[354]) {
+        if let Some(result) = classify_reply(self.reply(&mut connection).await, "DATA", &[354]) {
             return Ok(result);
         }
 
@@ -181,7 +374,7 @@ impl SmtpClient {
                 break;
             }
             let stuffed = dot_stuff(&chunk, &mut line_start);
-            if let Err(error) = self.write(&mut write, &stuffed).await {
+            if let Err(error) = self.write(connection.get_mut(), &stuffed).await {
                 return Ok(deferred_io(host, &error));
             }
             for byte in chunk.iter().copied() {
@@ -193,17 +386,19 @@ impl SmtpClient {
             }
         }
         if tail != *b"\r\n" {
-            if let Err(error) = self.write(&mut write, b"\r\n").await {
+            if let Err(error) = self.write(connection.get_mut(), b"\r\n").await {
                 return Ok(deferred_io(host, &error));
             }
         }
-        if let Err(error) = self.write(&mut write, b".\r\n").await {
+        if let Err(error) = self.write(connection.get_mut(), b".\r\n").await {
             return Ok(deferred_io(host, &error));
         }
-        if let Some(result) = classify_reply(self.reply(&mut read).await, "message body", &[250]) {
+        if let Some(result) =
+            classify_reply(self.reply(&mut connection).await, "message body", &[250])
+        {
             return Ok(result);
         }
-        let _ = write.write_all(b"QUIT\r\n").await;
+        let _ = connection.get_mut().write_all(b"QUIT\r\n").await;
         Ok(SendResult::Delivered)
     }
 
@@ -229,6 +424,12 @@ impl SmtpClient {
 
 fn has_line_break(value: &str) -> bool {
     value.contains(['\r', '\n'])
+}
+
+fn no_client_auth(
+    builder: rustls::ConfigBuilder<rustls::ClientConfig, rustls::client::WantsClientCert>,
+) -> rustls::ClientConfig {
+    builder.with_no_client_auth()
 }
 
 fn deferred_io(host: &MailHost, error: &io::Error) -> SendResult {

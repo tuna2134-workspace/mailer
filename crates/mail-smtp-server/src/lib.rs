@@ -2,11 +2,14 @@
 
 mod auth;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use mail_smtp_proto::{
     Action, Command, DataError, ParseError, Reply, Session, SessionExtensions, Transaction,
     parse_command, unstuff_data_line,
 };
-use mail_storage::{LocalRecipient, SmtpRepository, StorageError};
+use mail_storage::{
+    LocalRecipient, SmtpMailOptions, SmtpRepository, StorageError, SubmissionRecipient,
+};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc2822};
@@ -29,9 +32,11 @@ struct BdatIngestion {
     size: u64,
     transaction: Transaction,
     recipients: Vec<LocalRecipient>,
+    submission_recipients: Vec<SubmissionRecipient>,
 }
 
 #[derive(Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct SmtpConfig {
     pub hostname: String,
     pub max_message_size: u64,
@@ -42,7 +47,16 @@ pub struct SmtpConfig {
     pub allow_bare_lf: bool,
     pub tls: Option<Arc<rustls::ServerConfig>>,
     pub auth_plain: bool,
+    pub auth_scram: bool,
     pub chunking: bool,
+    pub dsn: bool,
+    pub smtp_utf8: bool,
+    pub require_tls: bool,
+    pub require_auth: bool,
+    pub authenticated_relay: bool,
+    pub implicit_tls: bool,
+    pub deliver_by_min_seconds: Option<u32>,
+    pub future_release_max_seconds: Option<u32>,
 }
 
 impl Default for SmtpConfig {
@@ -57,7 +71,16 @@ impl Default for SmtpConfig {
             allow_bare_lf: false,
             tls: None,
             auth_plain: false,
+            auth_scram: false,
             chunking: false,
+            dsn: false,
+            smtp_utf8: false,
+            require_tls: false,
+            require_auth: false,
+            authenticated_relay: false,
+            implicit_tls: false,
+            deliver_by_min_seconds: None,
+            future_release_max_seconds: None,
         }
     }
 }
@@ -72,6 +95,8 @@ pub enum SmtpError {
     Storage,
     #[error("message rejected: {0}")]
     Data(#[from] DataError),
+    #[error("authentication exchange failed")]
+    Auth,
 }
 
 pub async fn serve<R: SmtpRepository + 'static>(
@@ -100,6 +125,27 @@ async fn reject_busy(mut stream: TcpStream) {
     let _ = stream.shutdown().await;
 }
 
+async fn accept_tls(
+    stream: Box<dyn SmtpIo>,
+    config: Arc<rustls::ServerConfig>,
+    handshake_timeout: Duration,
+) -> Result<(Box<dyn SmtpIo>, [u8; 32]), SmtpError> {
+    let secured = timeout(
+        handshake_timeout,
+        tokio_rustls::TlsAcceptor::from(config).accept(stream),
+    )
+    .await
+    .map_err(|_| SmtpError::Timeout)?
+    .map_err(io)?;
+    let mut exporter = [0_u8; 32];
+    secured
+        .get_ref()
+        .1
+        .export_keying_material(&mut exporter, b"EXPORTER-Channel-Binding", None)
+        .map_err(|_| SmtpError::Auth)?;
+    Ok((Box::new(secured), exporter))
+}
+
 #[allow(clippy::too_many_lines, clippy::semicolon_if_nothing_returned)]
 pub async fn run_session<S, R>(
     stream: S,
@@ -111,7 +157,14 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     R: SmtpRepository,
 {
-    let mut stream: Box<dyn SmtpIo> = Box::new(stream);
+    let stream: Box<dyn SmtpIo> = Box::new(stream);
+    let (mut stream, initial_exporter) = if config.implicit_tls {
+        let tls = config.tls.clone().ok_or(SmtpError::Storage)?;
+        let (stream, exporter) = accept_tls(stream, tls, config.command_timeout).await?;
+        (stream, Some(exporter))
+    } else {
+        (stream, None)
+    };
     write_reply(
         &mut stream,
         &Reply {
@@ -128,14 +181,23 @@ where
             max_message_size: config.max_message_size,
             starttls: config.tls.is_some(),
             auth_plain: config.auth_plain,
-            dsn: false,
+            auth_scram: config.auth_scram,
+            dsn: config.dsn,
             chunking: config.chunking,
-            smtp_utf8: false,
-            require_tls: false,
+            smtp_utf8: config.smtp_utf8,
+            require_tls: config.require_tls,
+            deliver_by_min_seconds: config.deliver_by_min_seconds,
+            future_release_max_seconds: config.future_release_max_seconds,
         },
     );
+    if config.implicit_tls {
+        session.reset_after_tls();
+    }
     let mut resolved = HashMap::<String, LocalRecipient>::new();
     let mut auth_attempts = 0_u8;
+    let mut tls_exporter = initial_exporter;
+    let mut authenticated_user = None;
+    let mut relay = HashMap::<String, SubmissionRecipient>::new();
     let mut bdat: Option<BdatIngestion> = None;
     loop {
         let line = timeout(
@@ -154,6 +216,38 @@ where
                 continue;
             }
         };
+        if let Command::Mail { reverse_path, .. } = &command
+            && config.require_auth
+        {
+            let Some(user_id) = authenticated_user else {
+                write_reply(
+                    &mut stream,
+                    &Reply {
+                        code: 530,
+                        enhanced: Some("5.7.0"),
+                        text: "Authentication required",
+                    },
+                )
+                .await?;
+                continue;
+            };
+            if !repository
+                .authorize_smtp_sender(user_id, reverse_path)
+                .await
+                .map_err(storage)?
+            {
+                write_reply(
+                    &mut stream,
+                    &Reply {
+                        code: 553,
+                        enhanced: Some("5.7.1"),
+                        text: "Sender address is not authorized",
+                    },
+                )
+                .await?;
+                continue;
+            }
+        }
         if bdat.is_some()
             && !matches!(
                 command,
@@ -186,6 +280,7 @@ where
                     .map_err(storage)?;
             }
             resolved.clear();
+            relay.clear();
         }
         let action = session.command(command);
         match action {
@@ -197,15 +292,11 @@ where
             Action::StartTls(reply) => {
                 write_reply(&mut stream, &reply).await?;
                 let tls = config.tls.clone().ok_or(SmtpError::Storage)?;
-                stream = timeout(
-                    config.command_timeout,
-                    tokio_rustls::TlsAcceptor::from(tls).accept(stream),
-                )
-                .await
-                .map_err(|_| SmtpError::Timeout)?
-                .map(|value| Box::new(value) as Box<dyn SmtpIo>)
-                .map_err(io)?;
+                let (secured, exporter) = accept_tls(stream, tls, config.command_timeout).await?;
+                tls_exporter = Some(exporter);
+                stream = secured;
                 session.reset_after_tls();
+                authenticated_user = None;
                 resolved.clear();
             }
             Action::Authenticate {
@@ -213,27 +304,13 @@ where
                 initial_response,
             } => {
                 auth_attempts = auth_attempts.saturating_add(1);
-                if mechanism != "PLAIN" || auth_attempts > 3 {
+                if auth_attempts > 3 {
                     write_reply(&mut stream, &auth_failed()).await?;
                     continue;
                 }
-                let response = match initial_response {
-                    Some(value) if value != "=" => value,
-                    _ => {
-                        stream.write_all(b"334 \r\n").await.map_err(io)?;
-                        let Some(line) =
-                            timeout(config.command_timeout, read_line_bounded(&mut stream, 4096))
-                                .await
-                                .map_err(|_| SmtpError::Timeout)??
-                        else {
-                            return Ok(());
-                        };
-                        String::from_utf8(line)
-                            .map_err(|_| SmtpError::Storage)?
-                            .trim_end_matches(['\r', '\n'])
-                            .to_owned()
-                    }
-                };
+                let response =
+                    read_auth_response(&mut stream, initial_response, config.command_timeout, true)
+                        .await?;
                 if response == "*" {
                     write_reply(
                         &mut stream,
@@ -244,7 +321,13 @@ where
                         },
                     )
                     .await?;
-                } else if auth::authenticate(repository, &response).await? {
+                } else if mechanism == "PLAIN" {
+                    let authenticated = auth::authenticate(repository, &response).await?;
+                    let Some(user_id) = authenticated else {
+                        write_reply(&mut stream, &auth_failed()).await?;
+                        continue;
+                    };
+                    authenticated_user = Some(user_id);
                     session.authentication_succeeded();
                     write_reply(
                         &mut stream,
@@ -255,6 +338,59 @@ where
                         },
                     )
                     .await?;
+                } else if matches!(mechanism.as_str(), "SCRAM-SHA-256" | "SCRAM-SHA-256-PLUS") {
+                    let mechanism = if mechanism == "SCRAM-SHA-256-PLUS" {
+                        mail_sasl::ScramMechanism::Sha256Plus
+                    } else {
+                        mail_sasl::ScramMechanism::Sha256
+                    };
+                    let client_first = STANDARD
+                        .decode(&response)
+                        .ok()
+                        .and_then(|value| String::from_utf8(value).ok());
+                    let Some(client_first) = client_first else {
+                        write_reply(&mut stream, &auth_failed()).await?;
+                        continue;
+                    };
+                    let Ok((server_first, exchange)) = auth::begin_scram(
+                        repository,
+                        mechanism,
+                        &client_first,
+                        tls_exporter.as_ref().map(<[u8; 32]>::as_slice),
+                    )
+                    .await
+                    else {
+                        write_reply(&mut stream, &auth_failed()).await?;
+                        continue;
+                    };
+                    stream
+                        .write_all(format!("334 {}\r\n", STANDARD.encode(server_first)).as_bytes())
+                        .await
+                        .map_err(io)?;
+                    let client_final =
+                        read_auth_response(&mut stream, None, config.command_timeout, false)
+                            .await?;
+                    let client_final = STANDARD
+                        .decode(client_final)
+                        .ok()
+                        .and_then(|value| String::from_utf8(value).ok());
+                    let result = match client_final {
+                        Some(value) => auth::finish_scram(repository, exchange, &value).await?,
+                        None => None,
+                    };
+                    if let Some((user_id, server_final)) = result {
+                        authenticated_user = Some(user_id);
+                        session.authentication_succeeded();
+                        stream
+                            .write_all(
+                                format!("235 2.7.0 {}\r\n", STANDARD.encode(server_final))
+                                    .as_bytes(),
+                            )
+                            .await
+                            .map_err(io)?;
+                    } else {
+                        write_reply(&mut stream, &auth_failed()).await?;
+                    }
                 } else {
                     write_reply(&mut stream, &auth_failed()).await?;
                 }
@@ -270,12 +406,15 @@ where
                         .iter()
                         .filter_map(|address| resolved.get(address).cloned())
                         .collect();
+                    let submission_recipients =
+                        submission_recipients(&transaction, &resolved, &relay);
                     bdat = Some(BdatIngestion {
                         id: repository.begin_smtp_ingestion().await.map_err(storage)?,
                         position: 0,
                         size: 0,
                         transaction,
                         recipients,
+                        submission_recipients,
                     });
                 }
                 let ingestion = bdat.as_mut().ok_or(SmtpError::Storage)?;
@@ -300,6 +439,7 @@ where
                         .map_err(storage)?;
                     session.finish_data();
                     resolved.clear();
+                    relay.clear();
                     write_reply(&mut stream, &data_failure_reply(&error)).await?;
                     continue;
                 }
@@ -307,15 +447,30 @@ where
                     let ingestion = bdat.take().ok_or(SmtpError::Storage)?;
                     let received =
                         received_header(&config.hostname, peer, session.peer_name.as_deref());
-                    repository
-                        .commit_smtp_ingestion(
-                            ingestion.id,
-                            &ingestion.transaction.reverse_path,
-                            &ingestion.recipients,
-                            received.as_bytes(),
-                        )
-                        .await
-                        .map_err(storage)?;
+                    if config.authenticated_relay {
+                        repository
+                            .commit_submission_ingestion(
+                                ingestion.id,
+                                authenticated_user.ok_or(SmtpError::Auth)?,
+                                &ingestion.transaction.reverse_path,
+                                &ingestion.submission_recipients,
+                                received.as_bytes(),
+                                &mail_options(&ingestion.transaction),
+                            )
+                            .await
+                            .map_err(storage)?;
+                    } else {
+                        repository
+                            .commit_smtp_ingestion(
+                                ingestion.id,
+                                &ingestion.transaction.reverse_path,
+                                &ingestion.recipients,
+                                received.as_bytes(),
+                                &mail_options(&ingestion.transaction),
+                            )
+                            .await
+                            .map_err(storage)?;
+                    }
                     session.finish_data();
                     resolved.clear();
                 }
@@ -337,9 +492,11 @@ where
                 write_reply(&mut stream, &reply).await?;
                 return Ok(());
             }
-            Action::Recipient(address) => {
+            Action::Recipient {
+                address,
+                parameters,
+            } => {
                 if resolved.contains_key(&address) {
-                    session.accept_recipient(address);
                     write_reply(
                         &mut stream,
                         &Reply {
@@ -353,6 +510,11 @@ where
                 }
                 match repository.resolve_local_recipient(&address).await {
                     Ok(Some(recipient)) => {
+                        let recipient = LocalRecipient {
+                            dsn_notify: parameters.notify,
+                            original_recipient: parameters.orcpt,
+                            ..recipient
+                        };
                         resolved.insert(address.clone(), recipient);
                         session.accept_recipient(address);
                         write_reply(
@@ -366,15 +528,36 @@ where
                         .await?;
                     }
                     Ok(None) => {
-                        write_reply(
-                            &mut stream,
-                            &Reply {
-                                code: 550,
-                                enhanced: Some("5.1.1"),
-                                text: "No such local recipient; relaying denied",
-                            },
-                        )
-                        .await?
+                        if config.authenticated_relay && authenticated_user.is_some() {
+                            relay.insert(
+                                address.clone(),
+                                SubmissionRecipient {
+                                    address: address.clone(),
+                                    dsn_notify: parameters.notify,
+                                    original_recipient: parameters.orcpt,
+                                },
+                            );
+                            session.accept_recipient(address);
+                            write_reply(
+                                &mut stream,
+                                &Reply {
+                                    code: 250,
+                                    enhanced: Some("2.1.5"),
+                                    text: "Recipient OK",
+                                },
+                            )
+                            .await?;
+                        } else {
+                            write_reply(
+                                &mut stream,
+                                &Reply {
+                                    code: 550,
+                                    enhanced: Some("5.1.1"),
+                                    text: "No such local recipient; relaying denied",
+                                },
+                            )
+                            .await?;
+                        }
                     }
                     Err(_) => {
                         write_reply(
@@ -404,6 +587,7 @@ where
                     .iter()
                     .filter_map(|address| resolved.get(address).cloned())
                     .collect();
+                let submission_recipients = submission_recipients(&transaction, &resolved, &relay);
                 let result = timeout(
                     config.data_timeout,
                     receive_data(
@@ -412,13 +596,16 @@ where
                         config,
                         peer,
                         session.peer_name.as_deref(),
-                        &transaction.reverse_path,
+                        &transaction,
                         &recipients,
+                        authenticated_user,
+                        &submission_recipients,
                     ),
                 )
                 .await;
                 session.finish_data();
                 resolved.clear();
+                relay.clear();
                 match result {
                     Err(_) => return Err(SmtpError::Timeout),
                     Ok(Ok(())) => {
@@ -483,14 +670,17 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn receive_data<S: AsyncRead + AsyncWrite + Unpin, R: SmtpRepository>(
     stream: &mut S,
     repository: &R,
     config: &SmtpConfig,
     peer: SocketAddr,
     helo: Option<&str>,
-    reverse_path: &str,
+    transaction: &Transaction,
     recipients: &[LocalRecipient],
+    authenticated_user: Option<uuid::Uuid>,
+    submission_recipients: &[SubmissionRecipient],
 ) -> Result<(), SmtpError> {
     let ingestion = repository.begin_smtp_ingestion().await.map_err(storage)?;
     let result = receive_data_inner(stream, repository, config, ingestion).await;
@@ -502,11 +692,90 @@ async fn receive_data<S: AsyncRead + AsyncWrite + Unpin, R: SmtpRepository>(
         return Err(error);
     }
     let received = received_header(&config.hostname, peer, helo);
-    repository
-        .commit_smtp_ingestion(ingestion, reverse_path, recipients, received.as_bytes())
-        .await
-        .map_err(storage)?;
+    if config.authenticated_relay {
+        repository
+            .commit_submission_ingestion(
+                ingestion,
+                authenticated_user.ok_or(SmtpError::Auth)?,
+                &transaction.reverse_path,
+                submission_recipients,
+                received.as_bytes(),
+                &mail_options(transaction),
+            )
+            .await
+            .map_err(storage)?;
+    } else {
+        repository
+            .commit_smtp_ingestion(
+                ingestion,
+                &transaction.reverse_path,
+                recipients,
+                received.as_bytes(),
+                &mail_options(transaction),
+            )
+            .await
+            .map_err(storage)?;
+    }
     Ok(())
+}
+
+fn mail_options(transaction: &Transaction) -> SmtpMailOptions {
+    let now = std::time::SystemTime::now();
+    let deliver_by_at = transaction.parameters.deliver_by.map(|request| {
+        if request.seconds >= 0 {
+            now + Duration::from_secs(u64::from(request.seconds.unsigned_abs()))
+        } else {
+            now - Duration::from_secs(u64::from(request.seconds.unsigned_abs()))
+        }
+    });
+    let release_at = transaction
+        .parameters
+        .future_release
+        .map(|request| match request {
+            mail_smtp_proto::FutureRelease::HoldFor(seconds) => {
+                now + Duration::from_secs(u64::from(seconds))
+            }
+            mail_smtp_proto::FutureRelease::HoldUntil(until) => until,
+        });
+    SmtpMailOptions {
+        smtp_utf8: transaction.parameters.smtp_utf8,
+        require_tls: transaction.parameters.require_tls,
+        dsn_ret: transaction.parameters.ret.clone(),
+        envelope_id: transaction.parameters.envid.clone(),
+        deliver_by_at,
+        deliver_by_mode: transaction
+            .parameters
+            .deliver_by
+            .map(|request| match request.mode {
+                mail_smtp_proto::DeliverByMode::Notify => "N".into(),
+                mail_smtp_proto::DeliverByMode::Return => "R".into(),
+            }),
+        deliver_by_trace: transaction
+            .parameters
+            .deliver_by
+            .is_some_and(|request| request.trace),
+        release_at,
+    }
+}
+
+fn submission_recipients(
+    transaction: &Transaction,
+    local: &HashMap<String, LocalRecipient>,
+    relay: &HashMap<String, SubmissionRecipient>,
+) -> Vec<SubmissionRecipient> {
+    transaction
+        .recipients
+        .iter()
+        .filter_map(|address| {
+            relay.get(address).cloned().or_else(|| {
+                local.get(address).map(|recipient| SubmissionRecipient {
+                    address: address.clone(),
+                    dsn_notify: recipient.dsn_notify.clone(),
+                    original_recipient: recipient.original_recipient.clone(),
+                })
+            })
+        })
+        .collect()
 }
 
 async fn receive_bdat_piece<S: AsyncRead + Unpin, R: SmtpRepository>(
@@ -658,6 +927,29 @@ async fn write_reply<S: AsyncWrite + Unpin>(
     stream.write_all(reply.line().as_bytes()).await.map_err(io)
 }
 
+async fn read_auth_response<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    initial: Option<String>,
+    command_timeout: Duration,
+    send_empty_challenge: bool,
+) -> Result<String, SmtpError> {
+    if let Some(value) = initial.filter(|value| value != "=") {
+        return Ok(value);
+    }
+    if send_empty_challenge {
+        stream.write_all(b"334 \r\n").await.map_err(io)?;
+    }
+    let Some(line) = timeout(command_timeout, read_line_bounded(stream, 4096))
+        .await
+        .map_err(|_| SmtpError::Timeout)??
+    else {
+        return Err(SmtpError::Io("EOF during AUTH".into()));
+    };
+    String::from_utf8(line)
+        .map(|value| value.trim_end_matches(['\r', '\n']).to_owned())
+        .map_err(|_| SmtpError::Auth)
+}
+
 async fn write_ehlo<S: AsyncWrite + Unpin>(
     stream: &mut S,
     greeting: &Reply,
@@ -751,6 +1043,9 @@ mod tests {
     struct Repository {
         chunks: Mutex<Vec<u8>>,
         committed: Mutex<bool>,
+        auth_hash: Mutex<Option<String>>,
+        scram: Mutex<Option<mail_storage::SmtpScramCredential>>,
+        submitted: Mutex<Vec<String>>,
     }
 
     #[async_trait]
@@ -767,6 +1062,8 @@ mod tests {
                 address: address.into(),
                 tenant_id: TenantId::new(Uuid::nil()),
                 mailbox_id: MailboxId::new(Uuid::nil()),
+                dsn_notify: None,
+                original_recipient: None,
             }))
         }
 
@@ -793,6 +1090,7 @@ mod tests {
             _: &str,
             recipients: &[LocalRecipient],
             received: &[u8],
+            _: &SmtpMailOptions,
         ) -> Result<StoredMessage, StorageError> {
             if recipients.len() != 1 || !received.starts_with(b"Received:") {
                 return Err(StorageError::Conflict);
@@ -809,6 +1107,60 @@ mod tests {
 
         async fn abort_smtp_ingestion(&self, _: Uuid) -> Result<(), StorageError> {
             Ok(())
+        }
+
+        async fn smtp_auth_account(
+            &self,
+            identity: &str,
+        ) -> Result<Option<mail_storage::SmtpAuthAccount>, StorageError> {
+            let hash = self
+                .auth_hash
+                .lock()
+                .map_err(|_| StorageError::Unavailable("lock".into()))?
+                .clone();
+            let scram = self
+                .scram
+                .lock()
+                .map_err(|_| StorageError::Unavailable("lock".into()))?
+                .clone();
+            Ok(
+                (identity == "alice@example.test").then(|| mail_storage::SmtpAuthAccount {
+                    user_id: Uuid::nil(),
+                    password_hashes: hash.into_iter().collect(),
+                    scram,
+                }),
+            )
+        }
+
+        async fn record_smtp_auth(&self, _: Uuid, _: bool) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        async fn authorize_smtp_sender(
+            &self,
+            user_id: Uuid,
+            sender: &str,
+        ) -> Result<bool, StorageError> {
+            Ok(user_id == Uuid::nil() && sender == "alice@example.test")
+        }
+
+        async fn commit_submission_ingestion(
+            &self,
+            _: Uuid,
+            _: Uuid,
+            _: &str,
+            recipients: &[SubmissionRecipient],
+            _: &[u8],
+            _: &SmtpMailOptions,
+        ) -> Result<StoredMessage, StorageError> {
+            self.submitted
+                .lock()
+                .map_err(|_| StorageError::Unavailable("lock".into()))?
+                .extend(recipients.iter().map(|value| value.address.clone()));
+            Ok(StoredMessage {
+                message_ids: vec![Uuid::nil()],
+                octets: 0,
+            })
         }
     }
 
@@ -890,6 +1242,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn submission_rejects_unauthenticated_mail() -> Result<(), Box<dyn std::error::Error>> {
+        let (client, server) = duplex(4096);
+        let peer: SocketAddr = "192.0.2.5:2525".parse()?;
+        let config = SmtpConfig {
+            require_auth: true,
+            authenticated_relay: true,
+            ..SmtpConfig::default()
+        };
+        let task = tokio::spawn(async move {
+            run_session(server, peer, &Repository::default(), &config).await
+        });
+        let (read, mut write) = tokio::io::split(client);
+        let mut reader = BufReader::new(read);
+        assert!(response(&mut reader).await?.starts_with("220 "));
+        write.write_all(b"EHLO client.example\r\n").await?;
+        assert!(response(&mut reader).await?.starts_with("250-"));
+        write
+            .write_all(b"MAIL FROM:<sender@example.test>\r\n")
+            .await?;
+        assert!(response(&mut reader).await?.starts_with("530 "));
+        write.write_all(b"QUIT\r\n").await?;
+        assert!(response(&mut reader).await?.starts_with("221 "));
+        task.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn bdat_streams_exact_octets() -> Result<(), Box<dyn std::error::Error>> {
         let (client, server) = duplex(16 * 1024);
         let repository = Arc::new(Repository::default());
@@ -922,5 +1301,238 @@ mod tests {
         task.await??;
         assert_eq!(*repository.chunks.lock().map_err(|_| "lock")?, b"abcdef");
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn starttls_authenticates_and_submits_without_open_relay()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use argon2::{Argon2, PasswordHasher as _, password_hash::SaltString};
+        use rustls::{
+            ClientConfig, RootCertStore, ServerConfig,
+            pki_types::{PrivatePkcs8KeyDer, ServerName},
+        };
+
+        let identity = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
+        let certificate = identity.cert.der().clone();
+        let server_tls =
+            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()?
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![certificate.clone()],
+                    PrivatePkcs8KeyDer::from(identity.signing_key.serialize_der()).into(),
+                )?;
+        let mut roots = RootCertStore::empty();
+        roots.add(certificate)?;
+        let client_tls =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()?
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+
+        let (client, server) = duplex(16 * 1024);
+        let password_hash = Argon2::default()
+            .hash_password(
+                b"secret",
+                &SaltString::encode_b64(b"0123456789abcdef").map_err(|_| "salt")?,
+            )
+            .map_err(|_| "password hash")?
+            .to_string();
+        let repository = Arc::new(Repository {
+            auth_hash: Mutex::new(Some(password_hash)),
+            ..Repository::default()
+        });
+        let task_repository = Arc::clone(&repository);
+        let peer: SocketAddr = "192.0.2.4:2525".parse()?;
+        let config = SmtpConfig {
+            tls: Some(Arc::new(server_tls)),
+            auth_plain: true,
+            require_auth: true,
+            authenticated_relay: true,
+            ..SmtpConfig::default()
+        };
+        let task = tokio::spawn(async move {
+            run_session(server, peer, task_repository.as_ref(), &config).await
+        });
+        let mut client = BufReader::new(client);
+        assert!(response(&mut client).await?.starts_with("220 "));
+        client.get_mut().write_all(b"EHLO localhost\r\n").await?;
+        assert!(response(&mut client).await?.starts_with("250-"));
+        client.get_mut().write_all(b"STARTTLS\r\n").await?;
+        assert!(response(&mut client).await?.starts_with("220 "));
+
+        let client = tokio_rustls::TlsConnector::from(Arc::new(client_tls))
+            .connect(ServerName::try_from("localhost")?, client.into_inner())
+            .await?;
+        let mut client = BufReader::new(client);
+        client
+            .get_mut()
+            .write_all(b"AUTH PLAIN AGFsaWNlQGV4YW1wbGUudGVzdABzZWNyZXQ=\r\n")
+            .await?;
+        assert!(response(&mut client).await?.starts_with("503 "));
+        client.get_mut().write_all(b"EHLO localhost\r\n").await?;
+        assert!(response(&mut client).await?.starts_with("250-"));
+        client
+            .get_mut()
+            .write_all(b"AUTH PLAIN AGFsaWNlQGV4YW1wbGUudGVzdABzZWNyZXQ=\r\n")
+            .await?;
+        assert!(response(&mut client).await?.starts_with("235 "));
+        for (command, expected) in [
+            ("MAIL FROM:<alice@example.test>\r\n", "250 "),
+            ("RCPT TO:<bob@remote.test>\r\n", "250 "),
+            ("DATA\r\n", "354 "),
+        ] {
+            client.get_mut().write_all(command.as_bytes()).await?;
+            assert!(response(&mut client).await?.starts_with(expected));
+        }
+        client
+            .get_mut()
+            .write_all(b"Subject: submitted\r\n\r\nbody\r\n.\r\n")
+            .await?;
+        assert!(response(&mut client).await?.starts_with("250 "));
+        client.get_mut().write_all(b"QUIT\r\n").await?;
+        assert!(response(&mut client).await?.starts_with("221 "));
+        task.await??;
+        assert_eq!(
+            *repository.submitted.lock().map_err(|_| "lock")?,
+            ["bob@remote.test"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scram_sha_256_plus_uses_tls_exporter() -> Result<(), Box<dyn std::error::Error>> {
+        use rustls::{
+            ClientConfig, RootCertStore, ServerConfig,
+            pki_types::{PrivatePkcs8KeyDer, ServerName},
+        };
+
+        let identity = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
+        let certificate = identity.cert.der().clone();
+        let server_tls =
+            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()?
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![certificate.clone()],
+                    PrivatePkcs8KeyDer::from(identity.signing_key.serialize_der()).into(),
+                )?;
+        let mut roots = RootCertStore::empty();
+        roots.add(certificate)?;
+        let client_tls =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()?
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+        let salt = b"0123456789abcdef";
+        let credential = mail_sasl::derive_credential(
+            b"secret",
+            salt,
+            std::num::NonZeroU32::new(4096).ok_or("iterations")?,
+        );
+        let repository = Arc::new(Repository {
+            scram: Mutex::new(Some(mail_storage::SmtpScramCredential {
+                salt: credential.salt,
+                iterations: credential.iterations.get(),
+                stored_key: credential.stored_key.to_vec(),
+                server_key: credential.server_key.to_vec(),
+            })),
+            ..Repository::default()
+        });
+        let task_repository = Arc::clone(&repository);
+        let (client, server) = duplex(16 * 1024);
+        let peer: SocketAddr = "192.0.2.6:2525".parse()?;
+        let config = SmtpConfig {
+            tls: Some(Arc::new(server_tls)),
+            auth_scram: true,
+            ..SmtpConfig::default()
+        };
+        let task = tokio::spawn(async move {
+            run_session(server, peer, task_repository.as_ref(), &config).await
+        });
+        let mut client = BufReader::new(client);
+        assert!(response(&mut client).await?.starts_with("220 "));
+        client.get_mut().write_all(b"EHLO localhost\r\n").await?;
+        let _ = response(&mut client).await?;
+        client.get_mut().write_all(b"STARTTLS\r\n").await?;
+        assert!(response(&mut client).await?.starts_with("220 "));
+        let client = tokio_rustls::TlsConnector::from(Arc::new(client_tls))
+            .connect(ServerName::try_from("localhost")?, client.into_inner())
+            .await?;
+        let mut exporter = [0_u8; 32];
+        client.get_ref().1.export_keying_material(
+            &mut exporter,
+            b"EXPORTER-Channel-Binding",
+            None,
+        )?;
+        let mut client = BufReader::new(client);
+        client.get_mut().write_all(b"EHLO localhost\r\n").await?;
+        let _ = response(&mut client).await?;
+        let first_bare = "n=alice@example.test,r=clientnonce123";
+        let first = format!("p=tls-exporter,,{first_bare}");
+        client
+            .get_mut()
+            .write_all(format!("AUTH SCRAM-SHA-256-PLUS {}\r\n", STANDARD.encode(first)).as_bytes())
+            .await?;
+        let challenge = response(&mut client).await?;
+        let server_first = String::from_utf8(
+            STANDARD.decode(
+                challenge
+                    .strip_prefix("334 ")
+                    .ok_or("SCRAM challenge")?
+                    .trim_end(),
+            )?,
+        )?;
+        let final_message =
+            scram_client_final(b"secret", salt, 4096, first_bare, &server_first, &exporter)?;
+        client
+            .get_mut()
+            .write_all(format!("{}\r\n", STANDARD.encode(final_message)).as_bytes())
+            .await?;
+        assert!(response(&mut client).await?.starts_with("235 "));
+        client.get_mut().write_all(b"QUIT\r\n").await?;
+        let _ = response(&mut client).await?;
+        task.await??;
+        Ok(())
+    }
+
+    fn scram_client_final(
+        password: &[u8],
+        salt: &[u8],
+        iterations: u32,
+        first_bare: &str,
+        server_first: &str,
+        exporter: &[u8],
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        use ring::{digest, hmac, pbkdf2};
+        let nonce = server_first
+            .split(',')
+            .find_map(|value| value.strip_prefix("r="))
+            .ok_or("server nonce")?;
+        let mut binding = b"p=tls-exporter,,".to_vec();
+        binding.extend_from_slice(exporter);
+        let without_proof = format!("c={},r={nonce}", STANDARD.encode(binding));
+        let auth_message = format!("{first_bare},{server_first},{without_proof}");
+        let mut salted = [0_u8; 32];
+        pbkdf2::derive(
+            pbkdf2::PBKDF2_HMAC_SHA256,
+            std::num::NonZeroU32::new(iterations).ok_or("iterations")?,
+            salt,
+            password,
+            &mut salted,
+        );
+        let client_key = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, &salted), b"Client Key");
+        let stored_key = digest::digest(&digest::SHA256, client_key.as_ref());
+        let signature = hmac::sign(
+            &hmac::Key::new(hmac::HMAC_SHA256, stored_key.as_ref()),
+            auth_message.as_bytes(),
+        );
+        let proof: Vec<u8> = client_key
+            .as_ref()
+            .iter()
+            .zip(signature.as_ref())
+            .map(|(left, right)| left ^ right)
+            .collect();
+        Ok(format!("{without_proof},p={}", STANDARD.encode(proof)))
     }
 }

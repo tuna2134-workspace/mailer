@@ -8,8 +8,11 @@ license.workspace = true
 [dependencies]
 mail-dns = { path = "../mail-dns" }
 mail-storage = { path = "../mail-storage" }
+rustls.workspace = true
+rustls-platform-verifier.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
 
 [lints]
 workspace = true

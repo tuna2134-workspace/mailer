@@ -8,7 +8,8 @@ use mail_domain::{
 use mail_storage::{
     AdminRepository, ApiCredential, ApiTokenInfo, ApplicationPasswordInfo, AuditEvent, AuditRecord,
     DeliveryOutcome, IdempotencyRecord, LocalRecipient, MailRepository, MailboxAllocation,
-    MailboxInfo, QueueLease, SmtpRepository, StorageError, StoredMessage, Versioned,
+    MailboxInfo, PasswordCredential, QueueLease, SmtpRepository, StorageError, StoredMessage,
+    Versioned,
 };
 use sqlx::{PgPool, Row};
 use std::{
@@ -87,6 +88,16 @@ fn map_sqlx(error: sqlx::Error) -> StorageError {
         };
     }
     StorageError::Unavailable(error.to_string())
+}
+
+fn unix_seconds(value: Option<SystemTime>) -> Result<Option<f64>, StorageError> {
+    value
+        .map(|time| {
+            time.duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_secs_f64())
+                .map_err(|_| StorageError::Conflict)
+        })
+        .transpose()
 }
 
 #[async_trait]
@@ -196,7 +207,7 @@ impl MailRepository for PostgresRepository {
     async fn create_user_with_password(
         &self,
         user: &User,
-        password_hash: &str,
+        credential: &PasswordCredential,
     ) -> Result<(), StorageError> {
         let mut transaction = self.pool.begin().await.map_err(map_sqlx)?;
         sqlx::query("INSERT INTO users (id,tenant_id,domain_id,local_part,display_name,status,quota_bytes,password_changed_at) VALUES ($1,$2,$3,$4,$5,$6,$7,clock_timestamp())")
@@ -205,10 +216,15 @@ impl MailRepository for PostgresRepository {
             .execute(&mut *transaction).await.map_err(map_sqlx)?;
         sqlx::query("INSERT INTO password_credentials (user_id,password_hash) VALUES ($1,$2)")
             .bind(user.id.into_uuid())
-            .bind(password_hash)
+            .bind(&credential.argon2_hash)
             .execute(&mut *transaction)
             .await
             .map_err(map_sqlx)?;
+        if let Some(scram) = &credential.scram {
+            sqlx::query("INSERT INTO scram_credentials(user_id,salt,iterations,stored_key,server_key) VALUES($1,$2,$3,$4,$5)")
+                .bind(user.id.into_uuid()).bind(&scram.salt).bind(i32::try_from(scram.iterations).map_err(|_| StorageError::Conflict)?).bind(&scram.stored_key).bind(&scram.server_key)
+                .execute(&mut *transaction).await.map_err(map_sqlx)?;
+        }
         transaction.commit().await.map_err(map_sqlx)
     }
 
@@ -362,6 +378,15 @@ impl MailRepository for PostgresRepository {
              FROM candidates c WHERE q.id=c.id \
              RETURNING q.id, q.lease_token, q.message_id, q.recipient, q.destination_domain, q.attempt_count, \
                  (SELECT envelope_sender FROM messages WHERE id=q.message_id) AS envelope_sender, \
+                 (SELECT require_tls FROM messages WHERE id=q.message_id) AS require_tls, \
+                 (SELECT smtp_utf8 FROM messages WHERE id=q.message_id) AS smtp_utf8, \
+                 (SELECT dsn_ret FROM messages WHERE id=q.message_id) AS dsn_ret, \
+                 (SELECT envelope_id FROM messages WHERE id=q.message_id) AS envelope_id, \
+                 (SELECT extract(epoch FROM deliver_by_at)::bigint FROM messages WHERE id=q.message_id) AS deliver_by_at, \
+                 (SELECT deliver_by_mode FROM messages WHERE id=q.message_id) AS deliver_by_mode, \
+                 (SELECT deliver_by_trace FROM messages WHERE id=q.message_id) AS deliver_by_trace, \
+                 (SELECT dsn_notify FROM message_recipient_options WHERE message_id=q.message_id AND recipient=q.recipient) AS dsn_notify, \
+                 (SELECT original_recipient FROM message_recipient_options WHERE message_id=q.message_id AND recipient=q.recipient) AS original_recipient, \
                  extract(epoch FROM q.expires_at)::bigint AS expiry",
         ).bind(limit).bind(worker).bind(lease_seconds).fetch_all(&self.pool).await.map_err(map_sqlx)?;
 
@@ -376,6 +401,26 @@ impl MailRepository for PostgresRepository {
                     recipient: row.try_get("recipient").map_err(map_sqlx)?,
                     destination_domain: row.try_get("destination_domain").map_err(map_sqlx)?,
                     envelope_sender: row.try_get("envelope_sender").map_err(map_sqlx)?,
+                    require_tls: row.try_get("require_tls").map_err(map_sqlx)?,
+                    smtp_utf8: row.try_get("smtp_utf8").map_err(map_sqlx)?,
+                    dsn_ret: row.try_get("dsn_ret").map_err(map_sqlx)?,
+                    envelope_id: row.try_get("envelope_id").map_err(map_sqlx)?,
+                    dsn_notify: row.try_get("dsn_notify").map_err(map_sqlx)?,
+                    original_recipient: row.try_get("original_recipient").map_err(map_sqlx)?,
+                    deliver_by_at: row
+                        .try_get::<Option<i64>, _>("deliver_by_at")
+                        .map_err(map_sqlx)?
+                        .map(|seconds| {
+                            u64::try_from(seconds)
+                                .ok()
+                                .and_then(|value| {
+                                    UNIX_EPOCH.checked_add(Duration::from_secs(value))
+                                })
+                                .ok_or(StorageError::Conflict)
+                        })
+                        .transpose()?,
+                    deliver_by_mode: row.try_get("deliver_by_mode").map_err(map_sqlx)?,
+                    deliver_by_trace: row.try_get("deliver_by_trace").map_err(map_sqlx)?,
                     attempt_count: row
                         .try_get::<i32, _>("attempt_count")
                         .map_err(map_sqlx)?
@@ -580,15 +625,25 @@ impl AdminRepository for PostgresRepository {
         &self,
         tenant: TenantId,
         user: UserId,
-        hash: &str,
+        credential: &PasswordCredential,
     ) -> Result<(), StorageError> {
+        let mut transaction = self.pool.begin().await.map_err(map_sqlx)?;
         let result=sqlx::query("UPDATE password_credentials p SET password_hash=$3,created_at=clock_timestamp() FROM users u WHERE p.user_id=u.id AND u.tenant_id=$1 AND u.id=$2")
-            .bind(tenant.into_uuid()).bind(user.into_uuid()).bind(hash).execute(&self.pool).await.map_err(map_sqlx)?;
-        if result.rows_affected() == 1 {
-            Ok(())
-        } else {
-            Err(StorageError::NotFound)
+            .bind(tenant.into_uuid()).bind(user.into_uuid()).bind(&credential.argon2_hash).execute(&mut *transaction).await.map_err(map_sqlx)?;
+        if result.rows_affected() != 1 {
+            return Err(StorageError::NotFound);
         }
+        if let Some(scram) = &credential.scram {
+            sqlx::query("INSERT INTO scram_credentials(user_id,salt,iterations,stored_key,server_key) VALUES($1,$2,$3,$4,$5) ON CONFLICT(user_id) DO UPDATE SET salt=EXCLUDED.salt,iterations=EXCLUDED.iterations,stored_key=EXCLUDED.stored_key,server_key=EXCLUDED.server_key,updated_at=clock_timestamp()")
+                .bind(user.into_uuid()).bind(&scram.salt).bind(i32::try_from(scram.iterations).map_err(|_| StorageError::Conflict)?).bind(&scram.stored_key).bind(&scram.server_key).execute(&mut *transaction).await.map_err(map_sqlx)?;
+        } else {
+            sqlx::query("DELETE FROM scram_credentials WHERE user_id=$1")
+                .bind(user.into_uuid())
+                .execute(&mut *transaction)
+                .await
+                .map_err(map_sqlx)?;
+        }
+        transaction.commit().await.map_err(map_sqlx)
     }
     async fn unlock_user(&self, tenant: TenantId, user: UserId) -> Result<(), StorageError> {
         let result=sqlx::query("UPDATE users SET failed_login_count=0,locked_until=NULL,version=version+1 WHERE tenant_id=$1 AND id=$2").bind(tenant.into_uuid()).bind(user.into_uuid()).execute(&self.pool).await.map_err(map_sqlx)?;
@@ -720,9 +775,9 @@ impl AdminRepository for PostgresRepository {
         user: UserId,
         id: Uuid,
         name: &str,
-        hash: &str,
+        credential: &PasswordCredential,
     ) -> Result<ApplicationPasswordInfo, StorageError> {
-        sqlx::query("INSERT INTO application_passwords(id,tenant_id,user_id,display_name,secret_hash)VALUES($1,$2,$3,$4,$5)").bind(id).bind(tenant.into_uuid()).bind(user.into_uuid()).bind(name).bind(hash).execute(&self.pool).await.map_err(map_sqlx)?;
+        sqlx::query("INSERT INTO application_passwords(id,tenant_id,user_id,display_name,secret_hash)VALUES($1,$2,$3,$4,$5)").bind(id).bind(tenant.into_uuid()).bind(user.into_uuid()).bind(name).bind(&credential.argon2_hash).execute(&self.pool).await.map_err(map_sqlx)?;
         Ok(ApplicationPasswordInfo {
             id,
             display_name: name.into(),
@@ -885,6 +940,8 @@ impl SmtpRepository for PostgresRepository {
                 address: address.to_owned(),
                 tenant_id: TenantId::new(row.try_get("tenant_id").map_err(map_sqlx)?),
                 mailbox_id: MailboxId::new(row.try_get("mailbox_id").map_err(map_sqlx)?),
+                dsn_notify: None,
+                original_recipient: None,
             })
         })
         .transpose()
@@ -920,6 +977,7 @@ impl SmtpRepository for PostgresRepository {
         envelope_sender: &str,
         recipients: &[LocalRecipient],
         received_header: &[u8],
+        options: &mail_storage::SmtpMailOptions,
     ) -> Result<StoredMessage, StorageError> {
         if recipients.is_empty() {
             return Err(StorageError::Conflict);
@@ -951,10 +1009,12 @@ impl SmtpRepository for PostgresRepository {
                 .iter()
                 .map(|recipient| recipient.address.as_str())
                 .collect();
-            let size: i64 = sqlx::query_scalar("INSERT INTO messages(id,tenant_id,raw_message,envelope_sender,envelope_recipients,received_at,message_size,content_hash,storage_state) SELECT $1,$2,$3::bytea || mail_bytea_concat(content),$4,$5,clock_timestamp(),octet_length($3::bytea || mail_bytea_concat(content)),digest($3::bytea || mail_bytea_concat(content),'sha256'),'committed' FROM smtp_ingestion_chunks WHERE ingestion_id=$6 RETURNING message_size")
-                .bind(message_id).bind(tenant_id.into_uuid()).bind(&prefix).bind(envelope_sender).bind(addresses).bind(ingestion_id)
+            let size: i64 = sqlx::query_scalar("INSERT INTO messages(id,tenant_id,raw_message,envelope_sender,envelope_recipients,received_at,message_size,content_hash,storage_state,smtp_utf8,require_tls,dsn_ret,envelope_id,deliver_by_at,deliver_by_mode,deliver_by_trace,release_at) SELECT $1,$2,$3::bytea || mail_bytea_concat(content),$4,$5,clock_timestamp(),octet_length($3::bytea || mail_bytea_concat(content)),digest($3::bytea || mail_bytea_concat(content),'sha256'),'committed',$7,$8,$9,$10,to_timestamp($11),$12,$13,to_timestamp($14) FROM smtp_ingestion_chunks WHERE ingestion_id=$6 RETURNING message_size")
+                .bind(message_id).bind(tenant_id.into_uuid()).bind(&prefix).bind(envelope_sender).bind(addresses).bind(ingestion_id).bind(options.smtp_utf8).bind(options.require_tls).bind(&options.dsn_ret).bind(&options.envelope_id).bind(unix_seconds(options.deliver_by_at)?).bind(&options.deliver_by_mode).bind(options.deliver_by_trace).bind(unix_seconds(options.release_at)?)
                 .fetch_one(&mut *transaction).await.map_err(map_sqlx)?;
             for recipient in tenant_recipients {
+                sqlx::query("INSERT INTO message_recipient_options(message_id,recipient,dsn_notify,original_recipient) VALUES($1,$2,$3,$4)")
+                    .bind(message_id).bind(&recipient.address).bind(&recipient.dsn_notify).bind(&recipient.original_recipient).execute(&mut *transaction).await.map_err(map_sqlx)?;
                 let quota = sqlx::query("UPDATE users u SET used_bytes=used_bytes+$1 WHERE u.tenant_id=$2 AND u.id=(SELECT user_id FROM mailboxes WHERE id=$3 AND tenant_id=$2) AND u.status='active' AND used_bytes+$1<=quota_bytes")
                     .bind(size).bind(tenant_id.into_uuid()).bind(recipient.mailbox_id.into_uuid()).execute(&mut *transaction).await.map_err(map_sqlx)?;
                 if quota.rows_affected() != 1 {
@@ -1020,9 +1080,27 @@ impl SmtpRepository for PostgresRepository {
                     .or_else(|| row.try_get::<Option<String>, _>("app_hash").ok().flatten())
             })
             .collect();
+        let scram = sqlx::query(
+            "SELECT salt,iterations,stored_key,server_key FROM scram_credentials WHERE user_id=$1",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .map(|row| {
+            Ok(mail_storage::SmtpScramCredential {
+                salt: row.try_get("salt").map_err(map_sqlx)?,
+                iterations: u32::try_from(row.try_get::<i32, _>("iterations").map_err(map_sqlx)?)
+                    .map_err(|_| StorageError::Conflict)?,
+                stored_key: row.try_get("stored_key").map_err(map_sqlx)?,
+                server_key: row.try_get("server_key").map_err(map_sqlx)?,
+            })
+        })
+        .transpose()?;
         Ok(Some(mail_storage::SmtpAuthAccount {
             user_id,
             password_hashes,
+            scram,
         }))
     }
 
@@ -1035,6 +1113,101 @@ impl SmtpRepository for PostgresRepository {
                 .bind(user_id).execute(&self.pool).await.map_err(map_sqlx)?;
         }
         Ok(())
+    }
+
+    async fn authorize_smtp_sender(
+        &self,
+        user_id: Uuid,
+        sender: &str,
+    ) -> Result<bool, StorageError> {
+        if sender.is_empty() {
+            return Ok(false);
+        }
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users u JOIN domains d ON d.id=u.domain_id WHERE u.id=$1 AND u.status='active' AND d.status='active' AND (lower(u.local_part || '@' || d.name)=lower($2) OR EXISTS(SELECT 1 FROM aliases a JOIN alias_targets t ON t.alias_id=a.id WHERE a.tenant_id=u.tenant_id AND lower(a.source)=lower($2) AND lower(t.target)=lower(u.local_part || '@' || d.name))))")
+            .bind(user_id).bind(sender).fetch_one(&self.pool).await.map_err(map_sqlx)
+    }
+
+    async fn commit_submission_ingestion(
+        &self,
+        ingestion_id: Uuid,
+        user_id: Uuid,
+        envelope_sender: &str,
+        recipients: &[mail_storage::SubmissionRecipient],
+        received_header: &[u8],
+        options: &mail_storage::SmtpMailOptions,
+    ) -> Result<StoredMessage, StorageError> {
+        if recipients.is_empty() {
+            return Err(StorageError::Conflict);
+        }
+        let mut transaction = self.pool.begin().await.map_err(map_sqlx)?;
+        let state: Option<String> =
+            sqlx::query_scalar("SELECT state FROM smtp_ingestions WHERE id=$1 FOR UPDATE")
+                .bind(ingestion_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(map_sqlx)?;
+        if state.as_deref() != Some("receiving") {
+            return Err(StorageError::Conflict);
+        }
+        let tenant_id: Uuid = sqlx::query_scalar(
+            "SELECT tenant_id FROM users WHERE id=$1 AND status='active' FOR SHARE",
+        )
+        .bind(user_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(map_sqlx)?
+        .ok_or(StorageError::NotFound)?;
+        let message_id = Uuid::new_v4();
+        let return_path = format!("Return-Path: <{envelope_sender}>\r\n");
+        let prefix = [return_path.as_bytes(), received_header].concat();
+        let addresses: Vec<&str> = recipients
+            .iter()
+            .map(|value| value.address.as_str())
+            .collect();
+        let size: i64 = sqlx::query_scalar("INSERT INTO messages(id,tenant_id,raw_message,envelope_sender,envelope_recipients,received_at,message_size,content_hash,storage_state,smtp_utf8,require_tls,dsn_ret,envelope_id,deliver_by_at,deliver_by_mode,deliver_by_trace,release_at) SELECT $1,$2,$3::bytea || mail_bytea_concat(content),$4,$5,clock_timestamp(),octet_length($3::bytea || mail_bytea_concat(content)),digest($3::bytea || mail_bytea_concat(content),'sha256'),'committed',$7,$8,$9,$10,to_timestamp($11),$12,$13,to_timestamp($14) FROM smtp_ingestion_chunks WHERE ingestion_id=$6 RETURNING message_size")
+            .bind(message_id).bind(tenant_id).bind(&prefix).bind(envelope_sender).bind(addresses).bind(ingestion_id).bind(options.smtp_utf8).bind(options.require_tls).bind(&options.dsn_ret).bind(&options.envelope_id).bind(unix_seconds(options.deliver_by_at)?).bind(&options.deliver_by_mode).bind(options.deliver_by_trace).bind(unix_seconds(options.release_at)?)
+            .fetch_one(&mut *transaction).await.map_err(map_sqlx)?;
+        for recipient in recipients {
+            sqlx::query("INSERT INTO message_recipient_options(message_id,recipient,dsn_notify,original_recipient) VALUES($1,$2,$3,$4)")
+                .bind(message_id).bind(&recipient.address).bind(&recipient.dsn_notify).bind(&recipient.original_recipient).execute(&mut *transaction).await.map_err(map_sqlx)?;
+            let mailbox: Option<Uuid> = sqlx::query_scalar("SELECT m.id FROM users u JOIN domains d ON d.id=u.domain_id JOIN mailboxes m ON m.user_id=u.id AND m.tenant_id=u.tenant_id AND m.name='INBOX' WHERE u.tenant_id=$1 AND lower(u.local_part || '@' || d.name)=lower($2) AND u.status='active' AND d.status='active'")
+                .bind(tenant_id).bind(&recipient.address).fetch_optional(&mut *transaction).await.map_err(map_sqlx)?;
+            if let Some(mailbox_id) = mailbox {
+                let quota = sqlx::query("UPDATE users u SET used_bytes=used_bytes+$1 WHERE u.tenant_id=$2 AND u.id=(SELECT user_id FROM mailboxes WHERE id=$3 AND tenant_id=$2) AND u.status='active' AND used_bytes+$1<=quota_bytes")
+                    .bind(size).bind(tenant_id).bind(mailbox_id).execute(&mut *transaction).await.map_err(map_sqlx)?;
+                if quota.rows_affected() != 1 {
+                    return Err(StorageError::QuotaExceeded);
+                }
+                let allocation = sqlx::query("UPDATE mailboxes SET uid_next=uid_next+1,highest_modseq=highest_modseq+1,message_count=message_count+1,unseen_count=unseen_count+1 WHERE id=$1 AND tenant_id=$2 AND uid_next<4294967295 RETURNING uid_next-1 AS uid,highest_modseq")
+                    .bind(mailbox_id).bind(tenant_id).fetch_optional(&mut *transaction).await.map_err(map_sqlx)?.ok_or(StorageError::Conflict)?;
+                sqlx::query("INSERT INTO mailbox_messages(mailbox_id,message_id,uid,modseq,internal_date,object_id) VALUES($1,$2,$3,$4,clock_timestamp(),$5)")
+                    .bind(mailbox_id).bind(message_id).bind(allocation.try_get::<i64,_>("uid").map_err(map_sqlx)?).bind(allocation.try_get::<i64,_>("highest_modseq").map_err(map_sqlx)?).bind(Uuid::new_v4()).execute(&mut *transaction).await.map_err(map_sqlx)?;
+            } else {
+                let domain = recipient
+                    .address
+                    .rsplit_once('@')
+                    .map(|(_, domain)| domain)
+                    .filter(|value| !value.is_empty() && value.is_ascii())
+                    .ok_or(StorageError::Conflict)?;
+                sqlx::query("INSERT INTO queue_recipients(id,tenant_id,message_id,recipient,destination_domain,state,next_attempt_at,expires_at) VALUES($1,$2,$3,$4,$5,'pending',COALESCE(to_timestamp($6),clock_timestamp()),COALESCE(to_timestamp($7),clock_timestamp()+interval '5 days'))")
+                    .bind(Uuid::new_v4()).bind(tenant_id).bind(message_id).bind(&recipient.address).bind(domain.to_ascii_lowercase()).bind(unix_seconds(options.release_at)?).bind(unix_seconds(options.deliver_by_at)?).execute(&mut *transaction).await.map_err(map_sqlx)?;
+            }
+        }
+        sqlx::query("DELETE FROM smtp_ingestion_chunks WHERE ingestion_id=$1")
+            .bind(ingestion_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(map_sqlx)?;
+        sqlx::query("UPDATE smtp_ingestions SET state='committed' WHERE id=$1")
+            .bind(ingestion_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(map_sqlx)?;
+        transaction.commit().await.map_err(map_sqlx)?;
+        Ok(StoredMessage {
+            message_ids: vec![message_id],
+            octets: u64::try_from(size).map_err(|_| StorageError::Conflict)?,
+        })
     }
 }
 

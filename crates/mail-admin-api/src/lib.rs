@@ -690,15 +690,7 @@ async fn create_user<R: MailRepository + 'static>(
             request_id: id,
         });
     }
-    let password = input.password;
-    let hash = tokio::task::spawn_blocking(move || {
-        Argon2::default()
-            .hash_password(password.as_bytes(), &SaltString::generate(&mut OsRng))
-            .map(|value| value.to_string())
-    })
-    .await
-    .map_err(|_| application_error(ApplicationError::Unavailable, id))?
-    .map_err(|_| application_error(ApplicationError::Unavailable, id))?;
+    let credential = hash_password(input.password, id).await?;
     let user = User {
         id: UserId::new(Uuid::new_v4()),
         tenant_id,
@@ -721,7 +713,7 @@ async fn create_user<R: MailRepository + 'static>(
     };
     state
         .service
-        .create_user_with_password(&user, &hash)
+        .create_user_with_password(&user, &credential)
         .await
         .map_err(|error| application_error(error, id))?;
     state
@@ -1290,7 +1282,10 @@ async fn unlock_user<R: AdminRepository>(
 struct PasswordInput {
     password: String,
 }
-async fn hash_password(password: String, req: Uuid) -> Result<String, ApiError> {
+async fn hash_password(
+    password: String,
+    req: Uuid,
+) -> Result<mail_storage::PasswordCredential, ApiError> {
     if password.len() < 12 || password.len() > 1024 {
         return Err(invalid(
             req,
@@ -1299,13 +1294,28 @@ async fn hash_password(password: String, req: Uuid) -> Result<String, ApiError> 
         ));
     }
     tokio::task::spawn_blocking(move || {
-        Argon2::default()
+        use ring::rand::{SecureRandom as _, SystemRandom};
+        let argon2_hash = Argon2::default()
             .hash_password(password.as_bytes(), &SaltString::generate(&mut OsRng))
             .map(|v| v.to_string())
+            .map_err(|_| ())?;
+        let mut salt = [0_u8; 16];
+        SystemRandom::new().fill(&mut salt).map_err(|_| ())?;
+        let iterations = std::num::NonZeroU32::new(4096).ok_or(())?;
+        let scram = mail_sasl::derive_credential(password.as_bytes(), &salt, iterations);
+        Ok::<_, ()>(mail_storage::PasswordCredential {
+            argon2_hash,
+            scram: Some(mail_storage::SmtpScramCredential {
+                salt: scram.salt,
+                iterations: scram.iterations.get(),
+                stored_key: scram.stored_key.to_vec(),
+                server_key: scram.server_key.to_vec(),
+            }),
+        })
     })
     .await
     .map_err(|_| application_error(ApplicationError::Unavailable, req))?
-    .map_err(|_| application_error(ApplicationError::Unavailable, req))
+    .map_err(|()| application_error(ApplicationError::Unavailable, req))
 }
 async fn set_password<R: AdminRepository>(
     State(state): State<AppState<R>>,
@@ -1318,10 +1328,10 @@ async fn set_password<R: AdminRepository>(
     let actor = principal(&headers, &state, req).await?;
     let tenant = tenant_for(&actor, q.tenant_id, req)?;
     authorize(&actor, "users:write", Some(tenant)).map_err(|e| application_error(e, req))?;
-    let hash = hash_password(input.password, req).await?;
+    let credential = hash_password(input.password, req).await?;
     state
         .service
-        .set_user_password(tenant, UserId::new(id), &hash)
+        .set_user_password(tenant, UserId::new(id), &credential)
         .await
         .map_err(|e| application_error(e, req))?;
     Ok(StatusCode::NO_CONTENT)
@@ -1417,7 +1427,7 @@ async fn create_app_password<R: AdminRepository>(
         Uuid::new_v4().simple(),
         Uuid::new_v4().simple()
     );
-    let hash = hash_password(secret.clone(), req).await?;
+    let credential = hash_password(secret.clone(), req).await?;
     let info = state
         .service
         .create_application_password(
@@ -1425,7 +1435,7 @@ async fn create_app_password<R: AdminRepository>(
             UserId::new(id),
             Uuid::new_v4(),
             &input.display_name,
-            &hash,
+            &credential,
         )
         .await
         .map_err(|e| application_error(e, req))?;

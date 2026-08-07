@@ -1478,8 +1478,10 @@ dependencies = [
  "mail-domain",
  "mail-migrations",
  "mail-postgres",
+ "mail-sasl",
  "mail-storage",
  "mail-testkit",
+ "ring",
  "serde",
  "serde_json",
  "sha2",
@@ -1605,13 +1607,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "mail-sasl"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "ring",
+ "subtle",
+ "thiserror",
+]
+
+[[package]]
 name = "mail-smtp-client"
 version = "0.1.0"
 dependencies = [
  "mail-dns",
  "mail-storage",
+ "rustls",
+ "rustls-platform-verifier",
  "thiserror",
  "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]
@@ -1619,6 +1634,7 @@ name = "mail-smtp-proto"
 version = "0.1.0"
 dependencies = [
  "thiserror",
+ "time",
 ]
 
 [[package]]
@@ -1629,8 +1645,11 @@ dependencies = [
  "async-trait",
  "base64",
  "mail-domain",
+ "mail-sasl",
  "mail-smtp-proto",
  "mail-storage",
+ "rcgen",
+ "ring",
  "rustls",
  "thiserror",
  "time",

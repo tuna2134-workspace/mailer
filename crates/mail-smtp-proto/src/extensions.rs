@@ -1,4 +1,6 @@
 use crate::ParseError;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum BodyKind {
@@ -6,6 +8,25 @@ pub enum BodyKind {
     SevenBit,
     EightBitMime,
     BinaryMime,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeliverByMode {
+    Notify,
+    Return,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeliverBy {
+    pub seconds: i32,
+    pub mode: DeliverByMode,
+    pub trace: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FutureRelease {
+    HoldFor(u32),
+    HoldUntil(SystemTime),
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -16,6 +37,8 @@ pub struct MailParameters {
     pub require_tls: bool,
     pub ret: Option<String>,
     pub envid: Option<String>,
+    pub deliver_by: Option<DeliverBy>,
+    pub future_release: Option<FutureRelease>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -65,6 +88,19 @@ pub fn parse_mail(argument: Option<&str>) -> Result<(String, MailParameters), Pa
             "ENVID" if parameters.envid.is_none() => {
                 parameters.envid = Some(xtext(value.ok_or(ParseError::InvalidSyntax)?)?);
             }
+            "BY" if parameters.deliver_by.is_none() => {
+                parameters.deliver_by =
+                    Some(parse_deliver_by(value.ok_or(ParseError::InvalidSyntax)?)?);
+            }
+            "HOLDFOR" if parameters.future_release.is_none() => {
+                let seconds = positive_nine_digits(value.ok_or(ParseError::InvalidSyntax)?)?;
+                parameters.future_release = Some(FutureRelease::HoldFor(seconds));
+            }
+            "HOLDUNTIL" if parameters.future_release.is_none() => {
+                parameters.future_release = Some(FutureRelease::HoldUntil(parse_utc_time(
+                    value.ok_or(ParseError::InvalidSyntax)?,
+                )?));
+            }
             _ => return Err(ParseError::InvalidSyntax),
         }
     }
@@ -72,6 +108,57 @@ pub fn parse_mail(argument: Option<&str>) -> Result<(String, MailParameters), Pa
         return Err(ParseError::InvalidSyntax);
     }
     Ok((path, parameters))
+}
+
+fn parse_deliver_by(value: &str) -> Result<DeliverBy, ParseError> {
+    let mut parts = value.split(';');
+    let seconds = parts
+        .next()
+        .filter(|value| !value.is_empty() && value.len() <= 10)
+        .ok_or(ParseError::InvalidSyntax)?
+        .parse::<i32>()
+        .map_err(|_| ParseError::InvalidSyntax)?;
+    if seconds.unsigned_abs() > 999_999_999 {
+        return Err(ParseError::InvalidSyntax);
+    }
+    let mode = match parts.next().map(str::to_ascii_uppercase).as_deref() {
+        Some("N") => DeliverByMode::Notify,
+        Some("R") if seconds > 0 => DeliverByMode::Return,
+        _ => return Err(ParseError::InvalidSyntax),
+    };
+    let trace = match parts.next() {
+        None => false,
+        Some(value) if value.eq_ignore_ascii_case("T") => true,
+        Some(_) => return Err(ParseError::InvalidSyntax),
+    };
+    if parts.next().is_some() {
+        return Err(ParseError::InvalidSyntax);
+    }
+    Ok(DeliverBy {
+        seconds,
+        mode,
+        trace,
+    })
+}
+
+fn positive_nine_digits(value: &str) -> Result<u32, ParseError> {
+    if value.is_empty()
+        || value.len() > 9
+        || value.starts_with('0')
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(ParseError::InvalidSyntax);
+    }
+    value.parse().map_err(|_| ParseError::InvalidSyntax)
+}
+
+fn parse_utc_time(value: &str) -> Result<SystemTime, ParseError> {
+    let parsed = OffsetDateTime::parse(value, &Rfc3339).map_err(|_| ParseError::InvalidSyntax)?;
+    if parsed.offset() != time::UtcOffset::UTC || !value.ends_with('Z') {
+        return Err(ParseError::InvalidSyntax);
+    }
+    let seconds = u64::try_from(parsed.unix_timestamp()).map_err(|_| ParseError::InvalidSyntax)?;
+    Ok(UNIX_EPOCH + Duration::from_secs(seconds))
 }
 
 pub fn parse_rcpt(argument: Option<&str>) -> Result<(String, RcptParameters), ParseError> {

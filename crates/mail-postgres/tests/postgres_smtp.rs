@@ -3,7 +3,7 @@ use mail_domain::{
     TenantId, User, UserId,
 };
 use mail_postgres::PostgresRepository;
-use mail_storage::{MailRepository, SmtpRepository};
+use mail_storage::{MailRepository, SmtpMailOptions, SmtpRepository};
 use sqlx::{Row, postgres::PgPoolOptions};
 use uuid::Uuid;
 
@@ -54,7 +54,7 @@ async fn streaming_ingestion_and_atomic_local_delivery() -> Result<(), Box<dyn s
                 quota: QuotaBytes::new(1_000_000)?,
                 status: EntityStatus::Active,
             },
-            "$argon2id$test-fixture",
+            &mail_storage::PasswordCredential::argon2_only("$argon2id$test-fixture"),
         )
         .await?;
     repository
@@ -108,6 +108,7 @@ async fn streaming_ingestion_and_atomic_local_delivery() -> Result<(), Box<dyn s
             "sender@example.net",
             &[recipient],
             b"Received: from test by mx.example.test; Thu, 01 Jan 1970 00:00:00 +0000\r\n",
+            &SmtpMailOptions::default(),
         )
         .await?;
     assert_eq!(stored.message_ids.len(), 1);

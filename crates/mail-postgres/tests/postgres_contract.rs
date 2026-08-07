@@ -93,14 +93,18 @@ async fn constraints_counters_quota_and_leases() -> Result<(), Box<dyn std::erro
                 quota: QuotaBytes::new(10)?,
                 status: EntityStatus::Active,
             },
-            "$argon2id$initial",
+            &mail_storage::PasswordCredential::argon2_only("$argon2id$initial"),
         )
         .await?;
     let mut stored_user = repository.get_user(tenant_id, user_id).await?.value;
     stored_user.display_name = "Updated".into();
     assert_eq!(repository.update_user(&stored_user, 1).await?, 2);
     repository
-        .set_user_password(tenant_id, user_id, "$argon2id$test")
+        .set_user_password(
+            tenant_id,
+            user_id,
+            &mail_storage::PasswordCredential::argon2_only("$argon2id$test"),
+        )
         .await?;
     repository.unlock_user(tenant_id, user_id).await?;
 
@@ -123,7 +127,13 @@ async fn constraints_counters_quota_and_leases() -> Result<(), Box<dyn std::erro
 
     let app_id = Uuid::new_v4();
     repository
-        .create_application_password(tenant_id, user_id, app_id, "phone", "hash")
+        .create_application_password(
+            tenant_id,
+            user_id,
+            app_id,
+            "phone",
+            &mail_storage::PasswordCredential::argon2_only("hash"),
+        )
         .await?;
     assert_eq!(
         repository
