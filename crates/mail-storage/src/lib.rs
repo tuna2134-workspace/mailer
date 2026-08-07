@@ -128,6 +128,12 @@ pub struct StoredMessage {
     pub octets: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SmtpAuthAccount {
+    pub user_id: Uuid,
+    pub password_hashes: Vec<String>,
+}
+
 #[async_trait]
 pub trait MailRepository: Send + Sync {
     async fn authenticate_api_token(
@@ -407,4 +413,15 @@ pub trait SmtpRepository: Send + Sync {
         received_header: &[u8],
     ) -> Result<StoredMessage, StorageError>;
     async fn abort_smtp_ingestion(&self, ingestion_id: Uuid) -> Result<(), StorageError>;
+
+    async fn smtp_auth_account(
+        &self,
+        _identity: &str,
+    ) -> Result<Option<SmtpAuthAccount>, StorageError> {
+        Ok(None)
+    }
+
+    async fn record_smtp_auth(&self, _user_id: Uuid, _success: bool) -> Result<(), StorageError> {
+        Ok(())
+    }
 }

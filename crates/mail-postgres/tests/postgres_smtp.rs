@@ -44,15 +44,18 @@ async fn streaming_ingestion_and_atomic_local_delivery() -> Result<(), Box<dyn s
         })
         .await?;
     repository
-        .create_user(&User {
-            id: user,
-            tenant_id: tenant,
-            domain_id: domain,
-            local_part: LocalPart::parse("alice")?,
-            display_name: "Alice".into(),
-            quota: QuotaBytes::new(1_000_000)?,
-            status: EntityStatus::Active,
-        })
+        .create_user_with_password(
+            &User {
+                id: user,
+                tenant_id: tenant,
+                domain_id: domain,
+                local_part: LocalPart::parse("alice")?,
+                display_name: "Alice".into(),
+                quota: QuotaBytes::new(1_000_000)?,
+                status: EntityStatus::Active,
+            },
+            "$argon2id$test-fixture",
+        )
         .await?;
     repository
         .create_mailbox(&Mailbox {
@@ -70,6 +73,22 @@ async fn streaming_ingestion_and_atomic_local_delivery() -> Result<(), Box<dyn s
         .resolve_local_recipient("alice@example.test")
         .await?
         .ok_or("recipient missing")?;
+    let account = repository
+        .smtp_auth_account("ALICE@example.test")
+        .await?
+        .ok_or("authentication account missing")?;
+    assert_eq!(account.user_id, user.into_uuid());
+    assert_eq!(account.password_hashes, ["$argon2id$test-fixture"]);
+    for _ in 0..5 {
+        repository.record_smtp_auth(account.user_id, false).await?;
+    }
+    assert!(
+        repository
+            .smtp_auth_account("alice@example.test")
+            .await?
+            .is_none()
+    );
+    repository.record_smtp_auth(account.user_id, true).await?;
     assert!(
         repository
             .resolve_local_recipient("alice@remote.test")

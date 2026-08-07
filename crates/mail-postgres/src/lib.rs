@@ -997,6 +997,45 @@ impl SmtpRepository for PostgresRepository {
         .map_err(map_sqlx)?;
         Ok(())
     }
+
+    async fn smtp_auth_account(
+        &self,
+        identity: &str,
+    ) -> Result<Option<mail_storage::SmtpAuthAccount>, StorageError> {
+        let rows = sqlx::query("SELECT u.id,p.password_hash,NULL::text AS app_hash FROM users u JOIN domains d ON d.id=u.domain_id JOIN password_credentials p ON p.user_id=u.id WHERE lower(u.local_part || '@' || d.name)=lower($1) AND u.status='active' AND d.status='active' AND (u.locked_until IS NULL OR u.locked_until<=clock_timestamp()) UNION ALL SELECT u.id,NULL::text,a.secret_hash FROM users u JOIN domains d ON d.id=u.domain_id JOIN application_passwords a ON a.user_id=u.id WHERE lower(u.local_part || '@' || d.name)=lower($1) AND u.status='active' AND d.status='active' AND (u.locked_until IS NULL OR u.locked_until<=clock_timestamp()) AND a.revoked_at IS NULL AND (a.expires_at IS NULL OR a.expires_at>clock_timestamp())")
+            .bind(identity)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        let Some(first) = rows.first() else {
+            return Ok(None);
+        };
+        let user_id = first.try_get("id").map_err(map_sqlx)?;
+        let password_hashes = rows
+            .into_iter()
+            .filter_map(|row| {
+                row.try_get::<Option<String>, _>("password_hash")
+                    .ok()
+                    .flatten()
+                    .or_else(|| row.try_get::<Option<String>, _>("app_hash").ok().flatten())
+            })
+            .collect();
+        Ok(Some(mail_storage::SmtpAuthAccount {
+            user_id,
+            password_hashes,
+        }))
+    }
+
+    async fn record_smtp_auth(&self, user_id: Uuid, success: bool) -> Result<(), StorageError> {
+        if success {
+            sqlx::query("UPDATE users SET failed_login_count=0,locked_until=NULL,last_login_at=clock_timestamp() WHERE id=$1")
+                .bind(user_id).execute(&self.pool).await.map_err(map_sqlx)?;
+        } else {
+            sqlx::query("UPDATE users SET failed_login_count=failed_login_count+1,locked_until=CASE WHEN failed_login_count+1>=5 THEN clock_timestamp()+interval '15 minutes' ELSE locked_until END WHERE id=$1")
+                .bind(user_id).execute(&self.pool).await.map_err(map_sqlx)?;
+        }
+        Ok(())
+    }
 }
 
 fn mailbox_info(

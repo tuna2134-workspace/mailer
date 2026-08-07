@@ -1,7 +1,10 @@
 #![forbid(unsafe_code)]
 
+mod auth;
+
 use mail_smtp_proto::{
-    Action, Command, DataError, ParseError, Reply, Session, parse_command, unstuff_data_line,
+    Action, Command, DataError, ParseError, Reply, Session, SessionExtensions, Transaction,
+    parse_command, unstuff_data_line,
 };
 use mail_storage::{LocalRecipient, SmtpRepository, StorageError};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
@@ -17,7 +20,18 @@ use tokio::{
 const DATA_LINE_LIMIT: usize = 1000;
 const CHUNK_SIZE: usize = 64 * 1024;
 
-#[derive(Clone, Debug)]
+trait SmtpIo: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> SmtpIo for T {}
+
+struct BdatIngestion {
+    id: uuid::Uuid,
+    position: u32,
+    size: u64,
+    transaction: Transaction,
+    recipients: Vec<LocalRecipient>,
+}
+
+#[derive(Clone)]
 pub struct SmtpConfig {
     pub hostname: String,
     pub max_message_size: u64,
@@ -26,6 +40,9 @@ pub struct SmtpConfig {
     pub command_timeout: Duration,
     pub data_timeout: Duration,
     pub allow_bare_lf: bool,
+    pub tls: Option<Arc<rustls::ServerConfig>>,
+    pub auth_plain: bool,
+    pub chunking: bool,
 }
 
 impl Default for SmtpConfig {
@@ -38,6 +55,9 @@ impl Default for SmtpConfig {
             command_timeout: Duration::from_secs(300),
             data_timeout: Duration::from_secs(600),
             allow_bare_lf: false,
+            tls: None,
+            auth_plain: false,
+            chunking: false,
         }
     }
 }
@@ -82,15 +102,16 @@ async fn reject_busy(mut stream: TcpStream) {
 
 #[allow(clippy::too_many_lines, clippy::semicolon_if_nothing_returned)]
 pub async fn run_session<S, R>(
-    mut stream: S,
+    stream: S,
     peer: SocketAddr,
     repository: &R,
     config: &SmtpConfig,
 ) -> Result<(), SmtpError>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     R: SmtpRepository,
 {
+    let mut stream: Box<dyn SmtpIo> = Box::new(stream);
     write_reply(
         &mut stream,
         &Reply {
@@ -100,8 +121,22 @@ where
         },
     )
     .await?;
-    let mut session = Session::new(config.max_recipients);
+    let mut session = Session::with_extensions(
+        config.max_recipients,
+        SessionExtensions {
+            hostname: config.hostname.clone(),
+            max_message_size: config.max_message_size,
+            starttls: config.tls.is_some(),
+            auth_plain: config.auth_plain,
+            dsn: false,
+            chunking: config.chunking,
+            smtp_utf8: false,
+            require_tls: false,
+        },
+    );
     let mut resolved = HashMap::<String, LocalRecipient>::new();
+    let mut auth_attempts = 0_u8;
+    let mut bdat: Option<BdatIngestion> = None;
     loop {
         let line = timeout(
             config.command_timeout,
@@ -119,15 +154,185 @@ where
                 continue;
             }
         };
+        if bdat.is_some()
+            && !matches!(
+                command,
+                Command::Bdat { .. } | Command::Rset | Command::Quit
+            )
+        {
+            write_reply(
+                &mut stream,
+                &Reply {
+                    code: 503,
+                    enhanced: Some("5.5.1"),
+                    text: "BDAT transaction in progress",
+                },
+            )
+            .await?;
+            continue;
+        }
         if matches!(
             command,
-            Command::Ehlo(_) | Command::Helo(_) | Command::Mail { .. } | Command::Rset
+            Command::Ehlo(_)
+                | Command::Helo(_)
+                | Command::Mail { .. }
+                | Command::Rset
+                | Command::Quit
         ) {
+            if let Some(ingestion) = bdat.take() {
+                repository
+                    .abort_smtp_ingestion(ingestion.id)
+                    .await
+                    .map_err(storage)?;
+            }
             resolved.clear();
         }
         let action = session.command(command);
         match action {
             Action::Reply(reply) => write_reply(&mut stream, &reply).await?,
+            Action::Ehlo {
+                greeting,
+                capabilities,
+            } => write_ehlo(&mut stream, &greeting, &capabilities).await?,
+            Action::StartTls(reply) => {
+                write_reply(&mut stream, &reply).await?;
+                let tls = config.tls.clone().ok_or(SmtpError::Storage)?;
+                stream = timeout(
+                    config.command_timeout,
+                    tokio_rustls::TlsAcceptor::from(tls).accept(stream),
+                )
+                .await
+                .map_err(|_| SmtpError::Timeout)?
+                .map(|value| Box::new(value) as Box<dyn SmtpIo>)
+                .map_err(io)?;
+                session.reset_after_tls();
+                resolved.clear();
+            }
+            Action::Authenticate {
+                mechanism,
+                initial_response,
+            } => {
+                auth_attempts = auth_attempts.saturating_add(1);
+                if mechanism != "PLAIN" || auth_attempts > 3 {
+                    write_reply(&mut stream, &auth_failed()).await?;
+                    continue;
+                }
+                let response = match initial_response {
+                    Some(value) if value != "=" => value,
+                    _ => {
+                        stream.write_all(b"334 \r\n").await.map_err(io)?;
+                        let Some(line) =
+                            timeout(config.command_timeout, read_line_bounded(&mut stream, 4096))
+                                .await
+                                .map_err(|_| SmtpError::Timeout)??
+                        else {
+                            return Ok(());
+                        };
+                        String::from_utf8(line)
+                            .map_err(|_| SmtpError::Storage)?
+                            .trim_end_matches(['\r', '\n'])
+                            .to_owned()
+                    }
+                };
+                if response == "*" {
+                    write_reply(
+                        &mut stream,
+                        &Reply {
+                            code: 501,
+                            enhanced: Some("5.7.0"),
+                            text: "Authentication cancelled",
+                        },
+                    )
+                    .await?;
+                } else if auth::authenticate(repository, &response).await? {
+                    session.authentication_succeeded();
+                    write_reply(
+                        &mut stream,
+                        &Reply {
+                            code: 235,
+                            enhanced: Some("2.7.0"),
+                            text: "Authentication successful",
+                        },
+                    )
+                    .await?;
+                } else {
+                    write_reply(&mut stream, &auth_failed()).await?;
+                }
+            }
+            Action::BeginBdat {
+                transaction,
+                size,
+                last,
+            } => {
+                if bdat.is_none() {
+                    let recipients = transaction
+                        .recipients
+                        .iter()
+                        .filter_map(|address| resolved.get(address).cloned())
+                        .collect();
+                    bdat = Some(BdatIngestion {
+                        id: repository.begin_smtp_ingestion().await.map_err(storage)?,
+                        position: 0,
+                        size: 0,
+                        transaction,
+                        recipients,
+                    });
+                }
+                let ingestion = bdat.as_mut().ok_or(SmtpError::Storage)?;
+                let Ok(result) = timeout(
+                    config.data_timeout,
+                    receive_bdat_piece(&mut stream, repository, config, ingestion, size),
+                )
+                .await
+                else {
+                    let ingestion = bdat.take().ok_or(SmtpError::Storage)?;
+                    repository
+                        .abort_smtp_ingestion(ingestion.id)
+                        .await
+                        .map_err(storage)?;
+                    return Err(SmtpError::Timeout);
+                };
+                if let Err(error) = result {
+                    let ingestion = bdat.take().ok_or(SmtpError::Storage)?;
+                    repository
+                        .abort_smtp_ingestion(ingestion.id)
+                        .await
+                        .map_err(storage)?;
+                    session.finish_data();
+                    resolved.clear();
+                    write_reply(&mut stream, &data_failure_reply(&error)).await?;
+                    continue;
+                }
+                if last {
+                    let ingestion = bdat.take().ok_or(SmtpError::Storage)?;
+                    let received =
+                        received_header(&config.hostname, peer, session.peer_name.as_deref());
+                    repository
+                        .commit_smtp_ingestion(
+                            ingestion.id,
+                            &ingestion.transaction.reverse_path,
+                            &ingestion.recipients,
+                            received.as_bytes(),
+                        )
+                        .await
+                        .map_err(storage)?;
+                    session.finish_data();
+                    resolved.clear();
+                }
+                write_reply(
+                    &mut stream,
+                    &Reply {
+                        code: 250,
+                        enhanced: Some("2.0.0"),
+                        text: if last {
+                            "Message accepted for delivery"
+                        } else {
+                            "BDAT chunk accepted"
+                        },
+                    },
+                )
+                .await?;
+            }
             Action::Quit(reply) => {
                 write_reply(&mut stream, &reply).await?;
                 return Ok(());
@@ -304,6 +509,46 @@ async fn receive_data<S: AsyncRead + AsyncWrite + Unpin, R: SmtpRepository>(
     Ok(())
 }
 
+async fn receive_bdat_piece<S: AsyncRead + Unpin, R: SmtpRepository>(
+    stream: &mut S,
+    repository: &R,
+    config: &SmtpConfig,
+    ingestion: &mut BdatIngestion,
+    octets: u64,
+) -> Result<(), SmtpError> {
+    let too_large = ingestion.size.saturating_add(octets) > config.max_message_size;
+    if octets == 0 && ingestion.position == 0 {
+        repository
+            .append_smtp_chunk(ingestion.id, 0, &[])
+            .await
+            .map_err(storage)?;
+        ingestion.position = 1;
+    }
+    let mut remaining = octets;
+    let mut buffer = vec![0_u8; CHUNK_SIZE];
+    while remaining != 0 {
+        let length =
+            usize::try_from(remaining.min(CHUNK_SIZE as u64)).map_err(|_| DataError::TooLarge)?;
+        stream.read_exact(&mut buffer[..length]).await.map_err(io)?;
+        if !too_large {
+            repository
+                .append_smtp_chunk(ingestion.id, ingestion.position, &buffer[..length])
+                .await
+                .map_err(storage)?;
+            ingestion.position = ingestion
+                .position
+                .checked_add(1)
+                .ok_or(SmtpError::Storage)?;
+        }
+        remaining -= length as u64;
+    }
+    if too_large {
+        return Err(DataError::TooLarge.into());
+    }
+    ingestion.size += octets;
+    Ok(())
+}
+
 async fn receive_data_inner<S: AsyncRead + Unpin, R: SmtpRepository>(
     stream: &mut S,
     repository: &R,
@@ -413,6 +658,37 @@ async fn write_reply<S: AsyncWrite + Unpin>(
     stream.write_all(reply.line().as_bytes()).await.map_err(io)
 }
 
+async fn write_ehlo<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    greeting: &Reply,
+    capabilities: &[String],
+) -> Result<(), SmtpError> {
+    stream
+        .write_all(format!("{}-{}\r\n", greeting.code, greeting.text).as_bytes())
+        .await
+        .map_err(io)?;
+    for (index, capability) in capabilities.iter().enumerate() {
+        let separator = if index + 1 == capabilities.len() {
+            ' '
+        } else {
+            '-'
+        };
+        stream
+            .write_all(format!("{}{separator}{capability}\r\n", greeting.code).as_bytes())
+            .await
+            .map_err(io)?;
+    }
+    Ok(())
+}
+
+const fn auth_failed() -> Reply {
+    Reply {
+        code: 535,
+        enhanced: Some("5.7.8"),
+        text: "Authentication credentials invalid",
+    }
+}
+
 fn parse_reply(error: ParseError) -> Reply {
     match error {
         ParseError::LineTooLong => Reply {
@@ -429,6 +705,26 @@ fn parse_reply(error: ParseError) -> Reply {
             code: 501,
             enhanced: Some("5.5.2"),
             text: "Syntax error in parameters",
+        },
+    }
+}
+
+fn data_failure_reply(error: &SmtpError) -> Reply {
+    match error {
+        SmtpError::Data(DataError::TooLarge) => Reply {
+            code: 552,
+            enhanced: Some("5.3.4"),
+            text: "Message size exceeds fixed maximum",
+        },
+        SmtpError::Storage => Reply {
+            code: 451,
+            enhanced: Some("4.3.0"),
+            text: "Temporary local storage failure",
+        },
+        _ => Reply {
+            code: 554,
+            enhanced: Some("5.6.0"),
+            text: "BDAT rejected",
         },
     }
 }
@@ -519,6 +815,15 @@ mod tests {
     async fn response<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<String, std::io::Error> {
         let mut line = String::new();
         reader.read_line(&mut line).await?;
+        if line.starts_with("250-") {
+            loop {
+                let mut continuation = String::new();
+                reader.read_line(&mut continuation).await?;
+                if continuation.starts_with("250 ") {
+                    break;
+                }
+            }
+        }
         Ok(line)
     }
 
@@ -581,6 +886,41 @@ mod tests {
         let count = client.read(&mut greeting).await?;
         assert!(greeting[..count].starts_with(b"220 "));
         assert!(matches!(task.await?, Err(SmtpError::Timeout)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bdat_streams_exact_octets() -> Result<(), Box<dyn std::error::Error>> {
+        let (client, server) = duplex(16 * 1024);
+        let repository = Arc::new(Repository::default());
+        let task_repository = Arc::clone(&repository);
+        let peer: SocketAddr = "192.0.2.3:2525".parse()?;
+        let config = SmtpConfig {
+            chunking: true,
+            ..SmtpConfig::default()
+        };
+        let task = tokio::spawn(async move {
+            run_session(server, peer, task_repository.as_ref(), &config).await
+        });
+        let (read, mut write) = tokio::io::split(client);
+        let mut reader = BufReader::new(read);
+        assert!(response(&mut reader).await?.starts_with("220 "));
+        for command in [
+            "EHLO client.example\r\n",
+            "MAIL FROM:<sender@example.net> BODY=BINARYMIME\r\n",
+            "RCPT TO:<alice@example.test>\r\n",
+        ] {
+            write.write_all(command.as_bytes()).await?;
+            assert!(response(&mut reader).await?.starts_with("250"));
+        }
+        write.write_all(b"BDAT 3\r\nabc").await?;
+        assert!(response(&mut reader).await?.starts_with("250"));
+        write.write_all(b"BDAT 3 LAST\r\ndef").await?;
+        assert!(response(&mut reader).await?.starts_with("250"));
+        write.write_all(b"QUIT\r\n").await?;
+        assert!(response(&mut reader).await?.starts_with("221"));
+        task.await??;
+        assert_eq!(*repository.chunks.lock().map_err(|_| "lock")?, b"abcdef");
         Ok(())
     }
 }

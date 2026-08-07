@@ -13,6 +13,7 @@ use tokio::{net::TcpListener, sync::mpsc};
 const RENEWAL_LOCK_ID: i64 = 0x4d41_494c_4143_4d45;
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
     let database_url = required("MAIL_DATABASE_URL")?;
     let domains = csv("MAIL_ACME_DOMAINS")?;
@@ -50,6 +51,12 @@ async fn main() -> Result<()> {
     let cache = PostgresAcmeCache::new(pool.clone(), &cache_key)?;
     let acme_state = state(&settings, cache);
     let resolver = acme_state.resolver();
+    let smtp_resolver: Arc<dyn rustls::server::ResolvesServerCert> = resolver.clone();
+    let smtp_tls = Arc::new(
+        ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(smtp_resolver),
+    );
     let mut admin_tls = ServerConfig::builder()
         .with_no_client_auth()
         .with_cert_resolver(resolver);
@@ -84,6 +91,9 @@ async fn main() -> Result<()> {
             smtp_repository,
             mail_smtp_server::SmtpConfig {
                 hostname,
+                tls: Some(smtp_tls),
+                auth_plain: true,
+                chunking: true,
                 ..mail_smtp_server::SmtpConfig::default()
             },
         )
