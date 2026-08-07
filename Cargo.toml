@@ -16,6 +16,9 @@ members = [
     "crates/mail-dns",
     "crates/mail-smtp-client",
     "crates/mail-delivery",
+    "crates/mail-address",
+    "crates/mail-message",
+    "crates/mail-mime",
     "bins/mail-migrate",
     "bins/mailctl",
     "bins/maild",
@@ -31,9 +34,12 @@ license = "MIT OR Apache-2.0"
 anyhow = "1.0.104"
 argon2 = "0.5.3"
 async-trait = "0.1.91"
+base64 = "0.22.1"
 bytes = "1.12.1"
 futures = "0.3.31"
 hickory-resolver = { version = "0.25.2", features = ["system-config", "tokio"] }
+quoted_printable = "0.5.2"
+proptest = "1.11.0"
 axum = "0.8.9"
 axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
 clap = { version = "4.6.6", features = ["derive", "env"] }

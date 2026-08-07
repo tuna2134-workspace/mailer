@@ -472,7 +472,7 @@ impl MailRepository for PostgresRepository {
                 if let Some(domain) = sender
                     .rsplit_once('@')
                     .map(|(_, domain)| domain)
-                    .filter(|domain| !domain.is_empty())
+                    .filter(|domain| !domain.is_empty() && !sender.contains(['\r', '\n']))
                 {
                     let message_id = Uuid::new_v4();
                     let bounce = format!(

@@ -39,7 +39,7 @@ impl MailResolver {
         if domain.is_empty() {
             return Err(DnsError::Permanent);
         }
-        let mut exchanges = match self.0.mx_lookup(domain).await {
+        let exchanges = match self.0.mx_lookup(domain).await {
             Ok(records) => records
                 .iter()
                 .map(|mx| (mx.preference(), mx.exchange().to_utf8()))
@@ -49,13 +49,9 @@ impl MailResolver {
             }
             Err(error) => return Err(DnsError::Temporary(error.to_string())),
         };
-        exchanges.sort_by_key(|(preference, _)| *preference);
-        if exchanges.len() == 1 && exchanges[0].1 == "." {
+        let Some(exchanges) = normalize_exchanges(exchanges)? else {
             return Ok(MailRoute::NullMx);
-        }
-        if exchanges.iter().any(|(_, exchange)| exchange == ".") {
-            return Err(DnsError::Permanent);
-        }
+        };
 
         let mut hosts = Vec::with_capacity(exchanges.len());
         for (preference, exchange) in exchanges {
@@ -79,12 +75,32 @@ impl MailResolver {
     }
 }
 
+fn normalize_exchanges(
+    mut exchanges: Vec<(u16, String)>,
+) -> Result<Option<Vec<(u16, String)>>, DnsError> {
+    exchanges.sort_by_key(|(preference, _)| *preference);
+    if exchanges.len() == 1 && exchanges[0] == (0, ".".into()) {
+        return Ok(None);
+    }
+    if exchanges.iter().any(|(_, exchange)| exchange == ".") {
+        return Err(DnsError::Permanent);
+    }
+    Ok(Some(exchanges))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn route_types_do_not_confuse_null_mx_with_an_empty_host_list() {
-        assert_ne!(MailRoute::NullMx, MailRoute::Hosts(Vec::new()));
+    fn null_mx_suppresses_fallback_and_preferences_are_sorted() -> Result<(), DnsError> {
+        assert!(normalize_exchanges(vec![(0, ".".into())])?.is_none());
+        assert!(normalize_exchanges(vec![(0, ".".into()), (10, "mx.test.".into())]).is_err());
+        assert_eq!(
+            normalize_exchanges(vec![(20, "b.".into()), (10, "a.".into())])?.unwrap_or_default()[0]
+                .1,
+            "a."
+        );
+        Ok(())
     }
 }

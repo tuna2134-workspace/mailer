@@ -18,7 +18,7 @@ Workspace and lockfile; `mail-dns`, `mail-smtp-client`, `mail-delivery`, `mail-q
 
 ## Tests and security
 
-Unit tests cover dot-stuffing across chunks, enhanced codes and retry bounds. The PostgreSQL contract covers streaming, exclusive leases, stale-token rejection, defer/fail transitions and bounce creation. Envelope CR/LF injection is rejected; reply and chunk sizes and all network waits are bounded; DB locks are not held across DNS or SMTP I/O; bounces use a null reverse-path.
+Unit tests cover dot-stuffing across chunks, reply lines, enhanced codes and retry bounds; `smtp_reply` fuzzes arbitrary reply bytes. The PostgreSQL contract covers streaming, exclusive leases, stale-token rejection, defer/fail transitions and bounce creation. Envelope CR/LF injection is rejected; reply and chunk sizes and all network waits are bounded; DB locks are not held across DNS or SMTP I/O; bounces use a null reverse-path.
 
 ## Known limitations
 

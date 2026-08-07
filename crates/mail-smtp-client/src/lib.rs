@@ -4,7 +4,7 @@ use mail_dns::{MailHost, MailRoute};
 use mail_storage::{MailRepository, QueueLease, StorageError};
 use thiserror::Error;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
     time::timeout,
 };
@@ -281,18 +281,18 @@ async fn read_reply<R: tokio::io::AsyncBufRead + Unpin>(read: &mut R) -> io::Res
     let mut expected = None;
     let mut text = String::new();
     loop {
-        let mut line = String::new();
-        let bytes = read.read_line(&mut line).await?;
+        let mut line = Vec::new();
+        let remaining = REPLY_LIMIT.saturating_sub(total).saturating_add(1) as u64;
+        let bytes = read.take(remaining).read_until(b'\n', &mut line).await?;
         total += bytes;
-        if bytes == 0 || total > REPLY_LIMIT || !line.ends_with("\r\n") || line.len() < 5 {
+        if bytes == 0 || total > REPLY_LIMIT {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "invalid SMTP reply",
+                "SMTP reply too large or incomplete",
             ));
         }
-        let code = line[..3]
-            .parse::<u16>()
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid SMTP reply code"))?;
+        let (code, continued) = parse_reply_line(&line)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid SMTP reply"))?;
         if expected.replace(code).is_some_and(|first| first != code) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -302,17 +302,26 @@ async fn read_reply<R: tokio::io::AsyncBufRead + Unpin>(read: &mut R) -> io::Res
         if !text.is_empty() {
             text.push(' ');
         }
-        text.push_str(line[4..].trim_end());
-        match line.as_bytes()[3] {
-            b'-' => {}
-            b' ' => return Ok((code, text)),
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid SMTP reply separator",
-                ));
-            }
+        text.push_str(&String::from_utf8_lossy(&line[4..line.len() - 2]));
+        if !continued {
+            return Ok((code, text));
         }
+    }
+}
+
+/// Parses one complete, CRLF-terminated SMTP reply line.
+#[must_use]
+pub fn parse_reply_line(line: &[u8]) -> Option<(u16, bool)> {
+    if line.len() < 5 || !line.ends_with(b"\r\n") || !line[..3].iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let code = u16::from(line[0] - b'0') * 100
+        + u16::from(line[1] - b'0') * 10
+        + u16::from(line[2] - b'0');
+    match line[3] {
+        b'-' => Some((code, true)),
+        b' ' => Some((code, false)),
+        _ => None,
     }
 }
 
@@ -343,5 +352,13 @@ mod tests {
     fn enhanced_status_is_strict() {
         assert_eq!(enhanced("5.1.1 no such user"), Some("5.1.1".into()));
         assert_eq!(enhanced("5.1.x invalid"), None);
+    }
+
+    #[test]
+    fn reply_line_requires_crlf_and_valid_separator() {
+        assert_eq!(parse_reply_line(b"250-ok\r\n"), Some((250, true)));
+        assert_eq!(parse_reply_line(b"250 ok\r\n"), Some((250, false)));
+        assert_eq!(parse_reply_line(b"250?bad\r\n"), None);
+        assert_eq!(parse_reply_line(b"250 bare\n"), None);
     }
 }

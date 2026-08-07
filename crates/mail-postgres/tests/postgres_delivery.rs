@@ -35,9 +35,11 @@ async fn queue_lease_stream_result_and_bounce_are_atomic() -> Result<(), Box<dyn
         .bind(queue).bind(tenant.into_uuid()).bind(message).execute(&pool).await?;
 
     let lease = repository
-        .lease_queue(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .lease_queue(Uuid::new_v4(), 100, Duration::from_secs(30))
         .await?
-        .remove(0);
+        .into_iter()
+        .find(|lease| lease.queue_id.into_uuid() == queue)
+        .ok_or("inserted queue item was not leased")?;
     assert_eq!(
         repository.read_message_chunk(message, 0, 8).await?,
         &raw[..8]
@@ -70,9 +72,11 @@ async fn queue_lease_stream_result_and_bounce_are_atomic() -> Result<(), Box<dyn
         .execute(&pool)
         .await?;
     let lease = repository
-        .lease_queue(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .lease_queue(Uuid::new_v4(), 100, Duration::from_secs(30))
         .await?
-        .remove(0);
+        .into_iter()
+        .find(|lease| lease.queue_id.into_uuid() == queue)
+        .ok_or("deferred queue item was not leased")?;
     repository
         .finish_delivery(
             lease.queue_id,

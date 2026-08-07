@@ -2,7 +2,7 @@ RFC: RFC 5321
 Section: 5
 Requirement: Resolve destination MX records in preference order and use implicit MX when MX records are absent.
 Implementation: crates/mail-dns/src/lib.rs
-Test: route_types_do_not_confuse_null_mx_with_an_empty_host_list; manual resolver interoperability remains
+Test: null_mx_suppresses_fallback_and_preferences_are_sorted; manual resolver interoperability remains
 Status: partial
 Notes: A/AAAA and IPv4/IPv6 are supported; DNSSEC policy is Phase 15.
 
@@ -26,6 +26,6 @@ RFC: RFC 7505
 Section: 3
 Requirement: A single preference-zero MX whose exchange is the root label means the domain accepts no mail.
 Implementation: crates/mail-dns/src/lib.rs
-Test: route_types_do_not_confuse_null_mx_with_an_empty_host_list
+Test: null_mx_suppresses_fallback_and_preferences_are_sorted
 Status: implemented
 Notes: No A/AAAA fallback is performed for null MX.
