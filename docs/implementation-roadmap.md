@@ -12,6 +12,8 @@ Phase 4 SMTP receiving and transactional local delivery are implemented; see `do
 
 Phase 5 SMTP routing, sending and queue processing are implemented as a bounded baseline; see `docs/phase-5-report.md`. Outbound STARTTLS belongs to Phase 7 and advanced TLS policy to Phase 15.
 
+Phase 6 bounded IMF, address and MIME parsing is implemented as a partial RFC baseline; see `docs/phase-6-report.md`. Unsupported obsolete/EAI/RFC 2231 forms remain explicit rather than silently normalized.
+
 ## Phase 1 detailed plan
 
 1. Create only domain/application/storage/PostgreSQL/migration/testkit crates and migration binary.

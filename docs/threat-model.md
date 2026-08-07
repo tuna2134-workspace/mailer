@@ -19,4 +19,3 @@ Protected assets: message confidentiality/integrity/availability, credentials, t
 | PostgreSQL failure/data loss | constraints/transactions, bounded retries, PITR, restore drills, readiness fail-closed |
 
 Residual risks: SMTP remote delivery is not exactly-once; external DNS/CA/scanner availability; traffic analysis; endpoint compromise; accepted malformed legacy mail. Each Phase performs an abuse-case review before completion.
-

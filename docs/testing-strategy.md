@@ -6,3 +6,4 @@ Phase gates run fmt, clippy, unit/integration tests, PostgreSQL contract tests, 
 
 Fuzz targets are added when parsers appear, not as empty Phase 0 scaffolding. Interoperability tests record product/version and transcript with secrets removed. Benchmarks establish limits; they are not conformance evidence.
 
+Phase 6 adds property tests over arbitrary byte strings and the `message_mime_address` fuzz target. Split tests exercise every chunk boundary for IMF termination and multipart boundary recognition. Corpus growth should prioritize real malformed messages without treating permissive recovery as standards conformance.
