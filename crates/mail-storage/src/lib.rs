@@ -97,6 +97,28 @@ pub struct MailboxMessageState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImapMailbox {
+    pub id: MailboxId,
+    pub name: String,
+    pub uid_validity: u32,
+    pub uid_next: u32,
+    pub highest_modseq: u64,
+    pub message_count: u64,
+    pub unseen_count: u64,
+    pub subscribed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImapMessage {
+    pub sequence: u32,
+    pub uid: u32,
+    pub modseq: u64,
+    pub flags: Vec<String>,
+    pub internal_date: SystemTime,
+    pub raw: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoreFlags {
     pub mode: StoreMode,
     pub values: FlagSet,
@@ -547,4 +569,103 @@ pub trait ImapRepository: Send + Sync {
     ) -> Result<Option<SmtpAuthAccount>, StorageError>;
 
     async fn record_imap_auth(&self, user_id: Uuid, success: bool) -> Result<(), StorageError>;
+
+    async fn imap_mailboxes(&self, _user_id: Uuid) -> Result<Vec<ImapMailbox>, StorageError> {
+        Err(StorageError::Unavailable(
+            "IMAP mailbox operations are unsupported".into(),
+        ))
+    }
+
+    async fn imap_create_mailbox(
+        &self,
+        _user_id: Uuid,
+        _name: &str,
+    ) -> Result<ImapMailbox, StorageError> {
+        Err(StorageError::Unavailable(
+            "IMAP mailbox operations are unsupported".into(),
+        ))
+    }
+
+    async fn imap_rename_mailbox(
+        &self,
+        _user_id: Uuid,
+        _from: &str,
+        _to: &str,
+    ) -> Result<(), StorageError> {
+        Err(StorageError::Unavailable(
+            "IMAP mailbox operations are unsupported".into(),
+        ))
+    }
+
+    async fn imap_delete_mailbox(&self, _user_id: Uuid, _name: &str) -> Result<(), StorageError> {
+        Err(StorageError::Unavailable(
+            "IMAP mailbox operations are unsupported".into(),
+        ))
+    }
+
+    async fn imap_subscribe(
+        &self,
+        _user_id: Uuid,
+        _name: &str,
+        _subscribe: bool,
+    ) -> Result<(), StorageError> {
+        Err(StorageError::Unavailable(
+            "IMAP mailbox operations are unsupported".into(),
+        ))
+    }
+
+    async fn imap_messages(
+        &self,
+        _user_id: Uuid,
+        _mailbox_id: MailboxId,
+    ) -> Result<Vec<ImapMessage>, StorageError> {
+        Err(StorageError::Unavailable(
+            "IMAP message operations are unsupported".into(),
+        ))
+    }
+
+    async fn imap_append(
+        &self,
+        _user_id: Uuid,
+        _mailbox: &str,
+        _raw: &[u8],
+    ) -> Result<(u32, u32), StorageError> {
+        Err(StorageError::Unavailable(
+            "IMAP APPEND is unsupported".into(),
+        ))
+    }
+
+    async fn imap_copy(
+        &self,
+        _user_id: Uuid,
+        _source: MailboxId,
+        _uids: &[u32],
+        _destination: &str,
+        _move_messages: bool,
+    ) -> Result<Vec<u32>, StorageError> {
+        Err(StorageError::Unavailable("IMAP COPY is unsupported".into()))
+    }
+
+    async fn imap_store_flags(
+        &self,
+        _user_id: Uuid,
+        _mailbox: MailboxId,
+        _uids: &[u32],
+        _update: &StoreFlags,
+    ) -> Result<Vec<MailboxMessageState>, StorageError> {
+        Err(StorageError::Unavailable(
+            "IMAP STORE is unsupported".into(),
+        ))
+    }
+
+    async fn imap_expunge(
+        &self,
+        _user_id: Uuid,
+        _mailbox: MailboxId,
+        _uids: Option<&[u32]>,
+    ) -> Result<Vec<u32>, StorageError> {
+        Err(StorageError::Unavailable(
+            "IMAP EXPUNGE is unsupported".into(),
+        ))
+    }
 }

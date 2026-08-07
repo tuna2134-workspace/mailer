@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod auth;
+mod commands;
 mod frame;
 
 use mail_imap_proto::{Action, Session, Status, greeting, parse_command, tagged};
@@ -13,6 +14,7 @@ use tokio::{
     sync::Semaphore,
     time::timeout,
 };
+use uuid::Uuid;
 
 trait ImapIo: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> ImapIo for T {}
@@ -102,6 +104,8 @@ where
     };
     let mut session = Session::new(config.implicit_tls, config.tls.is_some());
     let mut auth_failures = 0_u8;
+    let mut authenticated_user = None;
+    let mut selected = None;
     stream
         .write_all(greeting(&session.capabilities()).as_bytes())
         .await?;
@@ -127,9 +131,21 @@ where
         };
         let Some(frame) = frame else { return Ok(()) };
         let Ok(command) = parse_command(&frame.line, &frame.literals) else {
-            stream
-                .write_all(b"* BAD invalid command syntax\r\n")
-                .await?;
+            let tag = frame
+                .line
+                .split(|byte| *byte == b' ')
+                .next()
+                .filter(|tag| valid_recovery_tag(tag))
+                .and_then(|tag| std::str::from_utf8(tag).ok());
+            if let Some(tag) = tag {
+                stream
+                    .write_all(tagged(tag, Status::Bad, "invalid command syntax").as_bytes())
+                    .await?;
+            } else {
+                stream
+                    .write_all(b"* BAD invalid command syntax\r\n")
+                    .await?;
+            }
             continue;
         };
         match session.command(command) {
@@ -151,7 +167,7 @@ where
                 password,
             } => {
                 let identity = String::from_utf8(username).ok();
-                if !finish_auth(
+                if let Some(user) = finish_auth(
                     &mut stream,
                     &mut session,
                     repository,
@@ -160,6 +176,8 @@ where
                 )
                 .await?
                 {
+                    authenticated_user = Some(user);
+                } else {
                     auth_failures += 1;
                 }
             }
@@ -197,8 +215,49 @@ where
                 } else {
                     auth::decode_plain(&response)
                 };
-                if !finish_auth(&mut stream, &mut session, repository, tag, credentials).await? {
+                if let Some(user) =
+                    finish_auth(&mut stream, &mut session, repository, tag, credentials).await?
+                {
+                    authenticated_user = Some(user);
+                } else {
                     auth_failures += 1;
+                }
+            }
+            Action::Execute { tag, command } => {
+                let Some(user) = authenticated_user else {
+                    stream
+                        .write_all(tagged(&tag, Status::No, "authentication required").as_bytes())
+                        .await?;
+                    continue;
+                };
+                let outcome = commands::execute(repository, user, selected.as_ref(), command).await;
+                match outcome {
+                    Ok(result) => {
+                        for response in result.responses {
+                            stream.write_all(&response).await?;
+                        }
+                        if result.select.is_some() {
+                            selected = result.select;
+                            session.mailbox_selected();
+                        }
+                        if result.unselect {
+                            selected = None;
+                            session.mailbox_unselected();
+                        }
+                        stream
+                            .write_all(tagged(&tag, Status::Ok, &result.completion).as_bytes())
+                            .await?;
+                    }
+                    Err(commands::CommandError::Bad(message)) => {
+                        stream
+                            .write_all(tagged(&tag, Status::Bad, message).as_bytes())
+                            .await?;
+                    }
+                    Err(commands::CommandError::No(message)) => {
+                        stream
+                            .write_all(tagged(&tag, Status::No, message).as_bytes())
+                            .await?;
+                    }
                 }
             }
         }
@@ -211,13 +270,25 @@ where
     }
 }
 
+fn valid_recovery_tag(tag: &[u8]) -> bool {
+    !tag.is_empty()
+        && tag.len() <= mail_imap_proto::MAX_TAG_BYTES
+        && tag.iter().all(|byte| {
+            (0x21..=0x7e).contains(byte)
+                && !matches!(
+                    byte,
+                    b'(' | b')' | b'{' | b' ' | b'%' | b'*' | b'"' | b'\\' | b']'
+                )
+        })
+}
+
 async fn finish_auth<S: AsyncWrite + Unpin, R: ImapRepository>(
     stream: &mut S,
     session: &mut Session,
     repository: &R,
     tag: String,
     credentials: Option<(String, Vec<u8>)>,
-) -> Result<bool, ImapError> {
+) -> Result<Option<Uuid>, ImapError> {
     let authenticated = match credentials {
         Some((identity, password)) => auth::authenticate(repository, identity, password).await?,
         None => None,
@@ -232,7 +303,7 @@ async fn finish_auth<S: AsyncWrite + Unpin, R: ImapRepository>(
             .write_all(tagged(&tag, Status::No, "authentication failed").as_bytes())
             .await?;
     }
-    Ok(authenticated.is_some())
+    Ok(authenticated)
 }
 
 async fn accept_tls(

@@ -24,6 +24,10 @@ pub enum Action {
         username: Vec<u8>,
         password: Vec<u8>,
     },
+    Execute {
+        tag: String,
+        command: CommandBody,
+    },
     Close(Vec<String>),
 }
 
@@ -51,7 +55,15 @@ impl Session {
 
     #[must_use]
     pub fn capabilities(&self) -> Vec<String> {
-        let mut values = vec!["IMAP4rev2".into(), "IMAP4rev1".into(), "ENABLE".into()];
+        let mut values = vec![
+            "IMAP4rev2".into(),
+            "IMAP4rev1".into(),
+            "ENABLE".into(),
+            "LITERAL+".into(),
+            "NAMESPACE".into(),
+            "UIDPLUS".into(),
+            "MOVE".into(),
+        ];
         if self.tls_available && !self.tls_active && self.state == State::NotAuthenticated {
             values.extend(["STARTTLS".into(), "LOGINDISABLED".into()]);
         }
@@ -102,7 +114,9 @@ impl Session {
                     password: password.0,
                 }
             }
-            CommandBody::Enable(_) if self.state == State::Authenticated => {
+            CommandBody::Enable(_)
+                if matches!(self.state, State::Authenticated | State::Selected) =>
+            {
                 let enabled: Vec<String> = Vec::new();
                 let response = if enabled.is_empty() {
                     untagged("ENABLED")
@@ -110,6 +124,31 @@ impl Session {
                     untagged(&format!("ENABLED {}", enabled.join(" ")))
                 };
                 Action::Responses(vec![response, tagged(&tag, Status::Ok, "ENABLE completed")])
+            }
+            command @ (CommandBody::Select { .. }
+            | CommandBody::Create(_)
+            | CommandBody::Delete(_)
+            | CommandBody::Rename { .. }
+            | CommandBody::Subscribe { .. }
+            | CommandBody::List { .. }
+            | CommandBody::Status { .. }
+            | CommandBody::Namespace
+            | CommandBody::Append { .. })
+                if matches!(self.state, State::Authenticated | State::Selected) =>
+            {
+                Action::Execute { tag, command }
+            }
+            command @ (CommandBody::Close
+            | CommandBody::Unselect
+            | CommandBody::Check
+            | CommandBody::Fetch { .. }
+            | CommandBody::Store { .. }
+            | CommandBody::Search { .. }
+            | CommandBody::Copy { .. }
+            | CommandBody::Expunge { .. })
+                if self.state == State::Selected =>
+            {
+                Action::Execute { tag, command }
             }
             CommandBody::Unknown(_) => {
                 Action::Responses(vec![tagged(&tag, Status::Bad, "unknown command")])

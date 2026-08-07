@@ -5,7 +5,8 @@ mod response;
 mod session;
 
 pub use parser::{
-    AString, Command, CommandBody, MailboxName, ParseError, SequenceSet, parse_command,
+    AString, Command, CommandBody, MailboxName, ParseError, SequenceRange, SequenceSet,
+    SequenceValue, parse_command,
 };
 pub use response::{Status, continuation, greeting, tagged, untagged};
 pub use session::{Action, Session, State};

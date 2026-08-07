@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod imap;
+
 use async_trait::async_trait;
 use mail_domain::{
     Alias, AliasId, AliasKind, Domain, DomainId, DomainName, EntityStatus, LocalPart, Mailbox,
@@ -8,9 +10,9 @@ use mail_domain::{
 use mail_mailbox::{FlagSet, StoreMode, SystemFlag};
 use mail_storage::{
     AdminRepository, ApiCredential, ApiTokenInfo, ApplicationPasswordInfo, AuditEvent, AuditRecord,
-    DeliveryOutcome, IdempotencyRecord, ImapRepository, LocalRecipient, MailRepository,
-    MailboxInfo, MailboxMessageState, MailboxRepository, PasswordCredential, QueueLease,
-    SmtpRepository, StorageError, StoreFlags, StoredMessage, Versioned,
+    DeliveryOutcome, IdempotencyRecord, LocalRecipient, MailRepository, MailboxInfo,
+    MailboxMessageState, MailboxRepository, PasswordCredential, QueueLease, SmtpRepository,
+    StorageError, StoreFlags, StoredMessage, Versioned,
 };
 use sqlx::{PgPool, Row};
 use std::{
@@ -1278,20 +1280,6 @@ impl MailboxRepository for PostgresRepository {
             .execute(&mut *transaction).await.map_err(map_sqlx)?;
         transaction.commit().await.map_err(map_sqlx)?;
         u64::try_from(modseq).map_err(|_| StorageError::Conflict)
-    }
-}
-
-#[async_trait]
-impl ImapRepository for PostgresRepository {
-    async fn imap_auth_account(
-        &self,
-        identity: &str,
-    ) -> Result<Option<mail_storage::SmtpAuthAccount>, StorageError> {
-        SmtpRepository::smtp_auth_account(self, identity).await
-    }
-
-    async fn record_imap_auth(&self, user_id: Uuid, success: bool) -> Result<(), StorageError> {
-        SmtpRepository::record_smtp_auth(self, user_id, success).await
     }
 }
 

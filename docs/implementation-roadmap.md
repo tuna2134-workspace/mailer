@@ -18,7 +18,9 @@ Phase 7 SMTP extensions, TLS-only authentication, authenticated submission, and 
 
 Phase 8 mailbox storage state, UID/UIDVALIDITY/MODSEQ allocation, flags, expunge tombstones, quota accounting, and concurrent mutation control are implemented; see `docs/phase-8-report.md`. IMAP wire and sequence-number behavior begins in Phase 9.
 
-Phase 9 IMAP4rev2 framing, parser/serializer, connection states, STARTTLS/implicit TLS, TLS-only authentication, and basic commands are implemented; see `docs/phase-9-report.md`. Persistent mailbox selection and message commands remain Phase 10.
+Phase 9 IMAP4rev2 framing, parser/serializer, connection states, STARTTLS/implicit TLS, TLS-only authentication, and basic commands are implemented; see `docs/phase-9-report.md`.
+
+Phase 10 now has a PostgreSQL-backed core command path for mailbox and message operations, including sequence/UID separation, UIDPLUS response codes, COPY/MOVE, and EXPUNGE; see `docs/phase-10-report.md`. Its recorded SEARCH, FETCH section, APPEND-option, and command-wide STORE transaction gaps must be closed before Phase 10 is marked complete and Phase 11 begins.
 
 ## Phase 1 detailed plan
 

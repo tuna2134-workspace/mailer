@@ -42,6 +42,61 @@ pub enum CommandBody {
         password: AString,
     },
     Enable(Vec<String>),
+    Select {
+        mailbox: MailboxName,
+        examine: bool,
+    },
+    Create(MailboxName),
+    Delete(MailboxName),
+    Rename {
+        from: MailboxName,
+        to: MailboxName,
+    },
+    Subscribe {
+        mailbox: MailboxName,
+        subscribe: bool,
+    },
+    List {
+        reference: MailboxName,
+        pattern: MailboxName,
+        subscribed_only: bool,
+    },
+    Status {
+        mailbox: MailboxName,
+        items: String,
+    },
+    Namespace,
+    Close,
+    Unselect,
+    Check,
+    Append {
+        mailbox: MailboxName,
+        message: Vec<u8>,
+    },
+    Fetch {
+        set: SequenceSet,
+        items: String,
+        uid: bool,
+    },
+    Store {
+        set: SequenceSet,
+        operation: String,
+        flags: String,
+        uid: bool,
+    },
+    Search {
+        criteria: String,
+        uid: bool,
+    },
+    Copy {
+        set: SequenceSet,
+        mailbox: MailboxName,
+        move_messages: bool,
+        uid: bool,
+    },
+    Expunge {
+        uid_set: Option<SequenceSet>,
+    },
     Unknown(String),
 }
 
@@ -116,9 +171,123 @@ pub fn parse_command(line: &[u8], literals: &[Vec<u8>]) -> Result<Command, Parse
                 .map(|value| ascii(value).map(|item| item.to_ascii_uppercase()))
                 .collect::<Result<_, _>>()?,
         ),
+        "SELECT" if args.len() == 1 => select(args, false)?,
+        "EXAMINE" if args.len() == 1 => select(args, true)?,
+        "CREATE" if args.len() == 1 => CommandBody::Create(mailbox(&args[0])?),
+        "DELETE" if args.len() == 1 => CommandBody::Delete(mailbox(&args[0])?),
+        "RENAME" if args.len() == 2 => CommandBody::Rename {
+            from: mailbox(&args[0])?,
+            to: mailbox(&args[1])?,
+        },
+        "SUBSCRIBE" if args.len() == 1 => CommandBody::Subscribe {
+            mailbox: mailbox(&args[0])?,
+            subscribe: true,
+        },
+        "UNSUBSCRIBE" if args.len() == 1 => CommandBody::Subscribe {
+            mailbox: mailbox(&args[0])?,
+            subscribe: false,
+        },
+        "LIST" | "LSUB" if args.len() == 2 => CommandBody::List {
+            reference: mailbox_reference(&args[0])?,
+            pattern: mailbox_reference(&args[1])?,
+            subscribed_only: name == "LSUB",
+        },
+        "STATUS" if args.len() >= 2 => CommandBody::Status {
+            mailbox: mailbox(&args[0])?,
+            items: join_ascii(&args[1..])?,
+        },
+        "NAMESPACE" if args.is_empty() => CommandBody::Namespace,
+        "CLOSE" if args.is_empty() => CommandBody::Close,
+        "UNSELECT" if args.is_empty() => CommandBody::Unselect,
+        "CHECK" if args.is_empty() => CommandBody::Check,
+        "APPEND" if args.len() >= 2 && literals.len() == 1 && args.last() == literals.first() => {
+            CommandBody::Append {
+                mailbox: mailbox(&args[0])?,
+                message: args.last().cloned().ok_or(ParseError::InvalidSyntax)?,
+            }
+        }
+        "FETCH" if args.len() >= 2 => fetch(args, false)?,
+        "STORE" if args.len() >= 3 => store(args, false)?,
+        "SEARCH" if !args.is_empty() => CommandBody::Search {
+            criteria: join_ascii(args)?,
+            uid: false,
+        },
+        "COPY" | "MOVE" if args.len() == 2 => copy(args, name == "MOVE", false)?,
+        "EXPUNGE" if args.is_empty() => CommandBody::Expunge { uid_set: None },
+        "UID" if !args.is_empty() => uid_command(args)?,
         _ => CommandBody::Unknown(name),
     };
     Ok(Command { tag, body })
+}
+
+fn mailbox(value: &[u8]) -> Result<MailboxName, ParseError> {
+    MailboxName::new(value.to_vec())
+}
+
+fn mailbox_reference(value: &[u8]) -> Result<MailboxName, ParseError> {
+    if value.len() > 4096 || value.contains(&0) {
+        return Err(ParseError::InvalidSyntax);
+    }
+    Ok(MailboxName(value.to_vec()))
+}
+
+fn select(args: &[Vec<u8>], examine: bool) -> Result<CommandBody, ParseError> {
+    Ok(CommandBody::Select {
+        mailbox: mailbox(&args[0])?,
+        examine,
+    })
+}
+
+fn fetch(args: &[Vec<u8>], uid: bool) -> Result<CommandBody, ParseError> {
+    Ok(CommandBody::Fetch {
+        set: SequenceSet::parse(&ascii(&args[0])?)?,
+        items: join_ascii(&args[1..])?,
+        uid,
+    })
+}
+
+fn store(args: &[Vec<u8>], uid: bool) -> Result<CommandBody, ParseError> {
+    Ok(CommandBody::Store {
+        set: SequenceSet::parse(&ascii(&args[0])?)?,
+        operation: ascii(&args[1])?.to_ascii_uppercase(),
+        flags: join_ascii(&args[2..])?,
+        uid,
+    })
+}
+
+fn copy(args: &[Vec<u8>], move_messages: bool, uid: bool) -> Result<CommandBody, ParseError> {
+    Ok(CommandBody::Copy {
+        set: SequenceSet::parse(&ascii(&args[0])?)?,
+        mailbox: mailbox(&args[1])?,
+        move_messages,
+        uid,
+    })
+}
+
+fn uid_command(args: &[Vec<u8>]) -> Result<CommandBody, ParseError> {
+    let command = ascii(&args[0])?.to_ascii_uppercase();
+    let args = &args[1..];
+    match command.as_str() {
+        "FETCH" if args.len() >= 2 => fetch(args, true),
+        "STORE" if args.len() >= 3 => store(args, true),
+        "SEARCH" if !args.is_empty() => Ok(CommandBody::Search {
+            criteria: join_ascii(args)?,
+            uid: true,
+        }),
+        "COPY" | "MOVE" if args.len() == 2 => copy(args, command == "MOVE", true),
+        "EXPUNGE" if args.len() == 1 => Ok(CommandBody::Expunge {
+            uid_set: Some(SequenceSet::parse(&ascii(&args[0])?)?),
+        }),
+        _ => Err(ParseError::InvalidSyntax),
+    }
+}
+
+fn join_ascii(values: &[Vec<u8>]) -> Result<String, ParseError> {
+    values
+        .iter()
+        .map(|value| ascii(value))
+        .collect::<Result<Vec<_>, _>>()
+        .map(|values| values.join(" "))
 }
 
 fn tokenize(line: &[u8], literals: &[Vec<u8>]) -> Result<Vec<Vec<u8>>, ParseError> {
@@ -162,6 +331,9 @@ fn tokenize(line: &[u8], literals: &[Vec<u8>]) -> Result<Vec<Vec<u8>>, ParseErro
             }
             tokens.push(line[index..end].to_vec());
             index = end;
+        }
+        if index < line.len() && line[index] != b' ' {
+            return Err(ParseError::InvalidSyntax);
         }
     }
     if literal != literals.len() {
@@ -267,6 +439,21 @@ mod tests {
         );
         assert_eq!(SequenceSet::parse("1:4,8,*:10")?.0.len(), 3);
         assert!(SequenceSet::parse("0").is_err());
+        assert!(matches!(
+            parse_command(b"A2 UID FETCH 1:* (FLAGS BODY.PEEK[])\r\n", &[])?.body,
+            CommandBody::Fetch { uid: true, .. }
+        ));
+        assert!(matches!(
+            parse_command(b"A3 APPEND INBOX {4}\r\n", &[b"test".to_vec()])?.body,
+            CommandBody::Append { .. }
+        ));
+        assert!(matches!(
+            parse_command(b"A4 MOVE 2:4 Archive\r\n", &[])?.body,
+            CommandBody::Copy {
+                move_messages: true,
+                ..
+            }
+        ));
         Ok(())
     }
 }
