@@ -14,6 +14,10 @@ Phase 5 SMTP routing, sending and queue processing are implemented as a bounded 
 
 Phase 6 bounded IMF, address and MIME parsing is implemented as a partial RFC baseline; see `docs/phase-6-report.md`. Unsupported obsolete/EAI/RFC 2231 forms remain explicit rather than silently normalized.
 
+Phase 7 SMTP extensions, TLS-only authentication, authenticated submission, and extension queue propagation are implemented; see `docs/phase-7-report.md`.
+
+Phase 8 mailbox storage state, UID/UIDVALIDITY/MODSEQ allocation, flags, expunge tombstones, quota accounting, and concurrent mutation control are implemented; see `docs/phase-8-report.md`. IMAP wire and sequence-number behavior begins in Phase 9.
+
 ## Phase 1 detailed plan
 
 1. Create only domain/application/storage/PostgreSQL/migration/testkit crates and migration binary.

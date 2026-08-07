@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use mail_domain::{Alias, Domain, Mailbox, MailboxId, QueueId, Tenant, TenantId, User};
+use mail_mailbox::{FlagSet, StoreMode};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
@@ -87,6 +88,25 @@ pub enum StorageError {
 pub struct MailboxAllocation {
     pub uid: u32,
     pub modseq: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MailboxMessageState {
+    pub message_id: Uuid,
+    pub uid: u32,
+    pub modseq: u64,
+    pub flags: FlagSet,
+    pub internal_date: SystemTime,
+    pub saved_date: Option<SystemTime>,
+    pub object_id: Uuid,
+    pub expunged: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoreFlags {
+    pub mode: StoreMode,
+    pub values: FlagSet,
+    pub unchanged_since: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -502,4 +522,29 @@ pub trait SmtpRepository: Send + Sync {
             "message submission is unsupported".into(),
         ))
     }
+}
+
+#[async_trait]
+pub trait MailboxRepository: Send + Sync {
+    async fn mailbox_message_by_uid(
+        &self,
+        tenant_id: TenantId,
+        mailbox_id: MailboxId,
+        uid: u32,
+    ) -> Result<MailboxMessageState, StorageError>;
+
+    async fn store_flags(
+        &self,
+        tenant_id: TenantId,
+        mailbox_id: MailboxId,
+        uid: u32,
+        update: &StoreFlags,
+    ) -> Result<MailboxMessageState, StorageError>;
+
+    async fn expunge_uid(
+        &self,
+        tenant_id: TenantId,
+        mailbox_id: MailboxId,
+        uid: u32,
+    ) -> Result<u64, StorageError>;
 }

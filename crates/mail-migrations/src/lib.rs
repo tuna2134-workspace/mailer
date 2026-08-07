@@ -2,7 +2,7 @@
 
 use sqlx::{PgPool, migrate::Migrator};
 
-// Keep this embedding point rebuilt whenever the migration set changes (Phase 7).
+// Keep this embedding point rebuilt whenever the migration set changes (Phase 8 mailbox state).
 pub static MIGRATOR: Migrator = sqlx::migrate!("../../migrations");
 
 pub async fn run(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateError> {

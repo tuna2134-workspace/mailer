@@ -20,6 +20,7 @@ members = [
     "crates/mail-address",
     "crates/mail-message",
     "crates/mail-mime",
+    "crates/mail-mailbox",
     "bins/mail-migrate",
     "bins/mailctl",
     "bins/maild",

@@ -5,11 +5,12 @@ use mail_domain::{
     Alias, AliasId, AliasKind, Domain, DomainId, DomainName, EntityStatus, LocalPart, Mailbox,
     MailboxId, QuotaBytes, Tenant, TenantId, User, UserId,
 };
+use mail_mailbox::{FlagSet, StoreMode, SystemFlag};
 use mail_storage::{
     AdminRepository, ApiCredential, ApiTokenInfo, ApplicationPasswordInfo, AuditEvent, AuditRecord,
     DeliveryOutcome, IdempotencyRecord, LocalRecipient, MailRepository, MailboxAllocation,
-    MailboxInfo, PasswordCredential, QueueLease, SmtpRepository, StorageError, StoredMessage,
-    Versioned,
+    MailboxInfo, MailboxMessageState, MailboxRepository, PasswordCredential, QueueLease,
+    SmtpRepository, StorageError, StoreFlags, StoredMessage, Versioned,
 };
 use sqlx::{PgPool, Row};
 use std::{
@@ -319,9 +320,9 @@ impl MailRepository for PostgresRepository {
     async fn create_mailbox(&self, mailbox: &Mailbox) -> Result<(), StorageError> {
         let highest_modseq =
             i64::try_from(mailbox.highest_modseq).map_err(|_| StorageError::CounterExhausted)?;
-        sqlx::query("INSERT INTO mailboxes (id,tenant_id,user_id,name,uid_validity,uid_next,highest_modseq) VALUES ($1,$2,$3,$4,$5,$6,$7)")
+        sqlx::query("INSERT INTO mailboxes (id,tenant_id,user_id,name,uid_validity,uid_next,highest_modseq) VALUES ($1,$2,$3,$4,nextval('mailbox_uidvalidity_seq'),$5,$6)")
             .bind(mailbox.id.into_uuid()).bind(mailbox.tenant_id.into_uuid()).bind(mailbox.user_id.into_uuid())
-            .bind(&mailbox.name).bind(i64::from(mailbox.uid_validity)).bind(i64::from(mailbox.uid_next))
+            .bind(&mailbox.name).bind(i64::from(mailbox.uid_next))
             .bind(highest_modseq).execute(&self.pool).await.map_err(map_sqlx)?;
         Ok(())
     }
@@ -1012,10 +1013,15 @@ impl SmtpRepository for PostgresRepository {
             let size: i64 = sqlx::query_scalar("INSERT INTO messages(id,tenant_id,raw_message,envelope_sender,envelope_recipients,received_at,message_size,content_hash,storage_state,smtp_utf8,require_tls,dsn_ret,envelope_id,deliver_by_at,deliver_by_mode,deliver_by_trace,release_at) SELECT $1,$2,$3::bytea || mail_bytea_concat(content),$4,$5,clock_timestamp(),octet_length($3::bytea || mail_bytea_concat(content)),digest($3::bytea || mail_bytea_concat(content),'sha256'),'committed',$7,$8,$9,$10,to_timestamp($11),$12,$13,to_timestamp($14) FROM smtp_ingestion_chunks WHERE ingestion_id=$6 RETURNING message_size")
                 .bind(message_id).bind(tenant_id.into_uuid()).bind(&prefix).bind(envelope_sender).bind(addresses).bind(ingestion_id).bind(options.smtp_utf8).bind(options.require_tls).bind(&options.dsn_ret).bind(&options.envelope_id).bind(unix_seconds(options.deliver_by_at)?).bind(&options.deliver_by_mode).bind(options.deliver_by_trace).bind(unix_seconds(options.release_at)?)
                 .fetch_one(&mut *transaction).await.map_err(map_sqlx)?;
+            let tenant_quota = sqlx::query("UPDATE tenants SET used_bytes=used_bytes+$2,version=version+1,updated_at=clock_timestamp() WHERE id=$1 AND used_bytes<=quota_bytes-$2")
+                .bind(tenant_id.into_uuid()).bind(size).execute(&mut *transaction).await.map_err(map_sqlx)?;
+            if tenant_quota.rows_affected() != 1 {
+                return Err(StorageError::QuotaExceeded);
+            }
             for recipient in tenant_recipients {
                 sqlx::query("INSERT INTO message_recipient_options(message_id,recipient,dsn_notify,original_recipient) VALUES($1,$2,$3,$4)")
                     .bind(message_id).bind(&recipient.address).bind(&recipient.dsn_notify).bind(&recipient.original_recipient).execute(&mut *transaction).await.map_err(map_sqlx)?;
-                let quota = sqlx::query("UPDATE users u SET used_bytes=used_bytes+$1 WHERE u.tenant_id=$2 AND u.id=(SELECT user_id FROM mailboxes WHERE id=$3 AND tenant_id=$2) AND u.status='active' AND used_bytes+$1<=quota_bytes")
+                let quota = sqlx::query("UPDATE users u SET used_bytes=used_bytes+$1 WHERE u.tenant_id=$2 AND u.id=(SELECT user_id FROM mailboxes WHERE id=$3 AND tenant_id=$2) AND u.status='active' AND used_bytes<=quota_bytes-$1")
                     .bind(size).bind(tenant_id.into_uuid()).bind(recipient.mailbox_id.into_uuid()).execute(&mut *transaction).await.map_err(map_sqlx)?;
                 if quota.rows_affected() != 1 {
                     return Err(StorageError::QuotaExceeded);
@@ -1167,13 +1173,18 @@ impl SmtpRepository for PostgresRepository {
         let size: i64 = sqlx::query_scalar("INSERT INTO messages(id,tenant_id,raw_message,envelope_sender,envelope_recipients,received_at,message_size,content_hash,storage_state,smtp_utf8,require_tls,dsn_ret,envelope_id,deliver_by_at,deliver_by_mode,deliver_by_trace,release_at) SELECT $1,$2,$3::bytea || mail_bytea_concat(content),$4,$5,clock_timestamp(),octet_length($3::bytea || mail_bytea_concat(content)),digest($3::bytea || mail_bytea_concat(content),'sha256'),'committed',$7,$8,$9,$10,to_timestamp($11),$12,$13,to_timestamp($14) FROM smtp_ingestion_chunks WHERE ingestion_id=$6 RETURNING message_size")
             .bind(message_id).bind(tenant_id).bind(&prefix).bind(envelope_sender).bind(addresses).bind(ingestion_id).bind(options.smtp_utf8).bind(options.require_tls).bind(&options.dsn_ret).bind(&options.envelope_id).bind(unix_seconds(options.deliver_by_at)?).bind(&options.deliver_by_mode).bind(options.deliver_by_trace).bind(unix_seconds(options.release_at)?)
             .fetch_one(&mut *transaction).await.map_err(map_sqlx)?;
+        let tenant_quota = sqlx::query("UPDATE tenants SET used_bytes=used_bytes+$2,version=version+1,updated_at=clock_timestamp() WHERE id=$1 AND used_bytes<=quota_bytes-$2")
+            .bind(tenant_id).bind(size).execute(&mut *transaction).await.map_err(map_sqlx)?;
+        if tenant_quota.rows_affected() != 1 {
+            return Err(StorageError::QuotaExceeded);
+        }
         for recipient in recipients {
             sqlx::query("INSERT INTO message_recipient_options(message_id,recipient,dsn_notify,original_recipient) VALUES($1,$2,$3,$4)")
                 .bind(message_id).bind(&recipient.address).bind(&recipient.dsn_notify).bind(&recipient.original_recipient).execute(&mut *transaction).await.map_err(map_sqlx)?;
             let mailbox: Option<Uuid> = sqlx::query_scalar("SELECT m.id FROM users u JOIN domains d ON d.id=u.domain_id JOIN mailboxes m ON m.user_id=u.id AND m.tenant_id=u.tenant_id AND m.name='INBOX' WHERE u.tenant_id=$1 AND lower(u.local_part || '@' || d.name)=lower($2) AND u.status='active' AND d.status='active'")
                 .bind(tenant_id).bind(&recipient.address).fetch_optional(&mut *transaction).await.map_err(map_sqlx)?;
             if let Some(mailbox_id) = mailbox {
-                let quota = sqlx::query("UPDATE users u SET used_bytes=used_bytes+$1 WHERE u.tenant_id=$2 AND u.id=(SELECT user_id FROM mailboxes WHERE id=$3 AND tenant_id=$2) AND u.status='active' AND used_bytes+$1<=quota_bytes")
+                let quota = sqlx::query("UPDATE users u SET used_bytes=used_bytes+$1 WHERE u.tenant_id=$2 AND u.id=(SELECT user_id FROM mailboxes WHERE id=$3 AND tenant_id=$2) AND u.status='active' AND used_bytes<=quota_bytes-$1")
                     .bind(size).bind(tenant_id).bind(mailbox_id).execute(&mut *transaction).await.map_err(map_sqlx)?;
                 if quota.rows_affected() != 1 {
                     return Err(StorageError::QuotaExceeded);
@@ -1209,6 +1220,156 @@ impl SmtpRepository for PostgresRepository {
             octets: u64::try_from(size).map_err(|_| StorageError::Conflict)?,
         })
     }
+}
+
+#[async_trait]
+impl MailboxRepository for PostgresRepository {
+    async fn mailbox_message_by_uid(
+        &self,
+        tenant_id: TenantId,
+        mailbox_id: MailboxId,
+        uid: u32,
+    ) -> Result<MailboxMessageState, StorageError> {
+        let row = sqlx::query("SELECT mm.message_id,mm.uid,mm.modseq,mm.flags,mm.keywords,extract(epoch FROM mm.internal_date)::bigint AS internal_date,extract(epoch FROM mm.saved_date)::bigint AS saved_date,mm.object_id,mm.expunged_at IS NOT NULL AS expunged FROM mailbox_messages mm JOIN mailboxes m ON m.id=mm.mailbox_id WHERE m.tenant_id=$1 AND mm.mailbox_id=$2 AND mm.uid=$3")
+            .bind(tenant_id.into_uuid()).bind(mailbox_id.into_uuid()).bind(i64::from(uid))
+            .fetch_optional(&self.pool).await.map_err(map_sqlx)?.ok_or(StorageError::NotFound)?;
+        mailbox_message_state(&row)
+    }
+
+    async fn store_flags(
+        &self,
+        tenant_id: TenantId,
+        mailbox_id: MailboxId,
+        uid: u32,
+        update: &StoreFlags,
+    ) -> Result<MailboxMessageState, StorageError> {
+        let mut transaction = self.pool.begin().await.map_err(map_sqlx)?;
+        let row = sqlx::query("SELECT mm.message_id,mm.modseq,mm.flags,mm.keywords FROM mailbox_messages mm JOIN mailboxes m ON m.id=mm.mailbox_id WHERE m.tenant_id=$1 AND mm.mailbox_id=$2 AND mm.uid=$3 AND mm.expunged_at IS NULL FOR UPDATE OF mm")
+            .bind(tenant_id.into_uuid()).bind(mailbox_id.into_uuid()).bind(i64::from(uid))
+            .fetch_optional(&mut *transaction).await.map_err(map_sqlx)?.ok_or(StorageError::NotFound)?;
+        let current_modseq: i64 = row.try_get("modseq").map_err(map_sqlx)?;
+        if update.unchanged_since.is_some_and(|limit| {
+            u64::try_from(current_modseq).map_or(true, |current| current > limit)
+        }) {
+            return Err(StorageError::Conflict);
+        }
+        let current = stored_flags(&row)?;
+        let next = apply_store(current, update);
+        let next = FlagSet::new(next.system, next.keywords).map_err(|_| StorageError::Conflict)?;
+        let was_seen = next_seen(&stored_flags(&row)?);
+        let is_seen = next_seen(&next);
+        let unseen_delta = i64::from(was_seen) - i64::from(is_seen);
+        let next_modseq: i64 = sqlx::query_scalar("UPDATE mailboxes SET highest_modseq=highest_modseq+1,unseen_count=unseen_count+$3,version=version+1 WHERE id=$1 AND tenant_id=$2 AND highest_modseq<9223372036854775807 AND unseen_count+$3 BETWEEN 0 AND message_count RETURNING highest_modseq")
+            .bind(mailbox_id.into_uuid()).bind(tenant_id.into_uuid()).bind(unseen_delta)
+            .fetch_optional(&mut *transaction).await.map_err(map_sqlx)?.ok_or(StorageError::CounterExhausted)?;
+        let flags = next.system_names();
+        let keywords: Vec<_> = next.keywords.into_iter().collect();
+        let state = sqlx::query("UPDATE mailbox_messages SET flags=$4,keywords=$5,modseq=$6 WHERE mailbox_id=$1 AND uid=$2 AND message_id=$3 RETURNING message_id,uid,modseq,flags,keywords,extract(epoch FROM internal_date)::bigint AS internal_date,extract(epoch FROM saved_date)::bigint AS saved_date,object_id,expunged_at IS NOT NULL AS expunged")
+            .bind(mailbox_id.into_uuid()).bind(i64::from(uid)).bind(row.try_get::<Uuid,_>("message_id").map_err(map_sqlx)?).bind(flags).bind(keywords).bind(next_modseq)
+            .fetch_one(&mut *transaction).await.map_err(map_sqlx)?;
+        transaction.commit().await.map_err(map_sqlx)?;
+        mailbox_message_state(&state)
+    }
+
+    async fn expunge_uid(
+        &self,
+        tenant_id: TenantId,
+        mailbox_id: MailboxId,
+        uid: u32,
+    ) -> Result<u64, StorageError> {
+        let mut transaction = self.pool.begin().await.map_err(map_sqlx)?;
+        let row = sqlx::query("SELECT mm.message_id,mm.flags,msg.message_size,m.user_id FROM mailbox_messages mm JOIN mailboxes m ON m.id=mm.mailbox_id AND m.tenant_id=$1 JOIN messages msg ON msg.id=mm.message_id WHERE mm.mailbox_id=$2 AND mm.uid=$3 AND mm.expunged_at IS NULL FOR UPDATE OF mm,m")
+            .bind(tenant_id.into_uuid()).bind(mailbox_id.into_uuid()).bind(i64::from(uid))
+            .fetch_optional(&mut *transaction).await.map_err(map_sqlx)?.ok_or(StorageError::NotFound)?;
+        let flags: Vec<String> = row.try_get("flags").map_err(map_sqlx)?;
+        if !flags.iter().any(|flag| flag == "\\Deleted") {
+            return Err(StorageError::Conflict);
+        }
+        let unseen = i64::from(!flags.iter().any(|flag| flag == "\\Seen"));
+        let modseq: i64 = sqlx::query_scalar("UPDATE mailboxes SET highest_modseq=highest_modseq+1,message_count=message_count-1,unseen_count=unseen_count-$3,version=version+1 WHERE id=$1 AND tenant_id=$2 AND message_count>0 AND unseen_count>=$3 RETURNING highest_modseq")
+            .bind(mailbox_id.into_uuid()).bind(tenant_id.into_uuid()).bind(unseen)
+            .fetch_optional(&mut *transaction).await.map_err(map_sqlx)?.ok_or(StorageError::Conflict)?;
+        sqlx::query("UPDATE mailbox_messages SET expunged_at=clock_timestamp(),modseq=$3 WHERE mailbox_id=$1 AND uid=$2")
+            .bind(mailbox_id.into_uuid()).bind(i64::from(uid)).bind(modseq).execute(&mut *transaction).await.map_err(map_sqlx)?;
+        sqlx::query("UPDATE users SET used_bytes=used_bytes-$3 WHERE tenant_id=$1 AND id=$2 AND used_bytes>=$3")
+            .bind(tenant_id.into_uuid()).bind(row.try_get::<Uuid,_>("user_id").map_err(map_sqlx)?).bind(row.try_get::<i64,_>("message_size").map_err(map_sqlx)?)
+            .execute(&mut *transaction).await.map_err(map_sqlx)?;
+        transaction.commit().await.map_err(map_sqlx)?;
+        u64::try_from(modseq).map_err(|_| StorageError::Conflict)
+    }
+}
+
+fn apply_store(mut current: FlagSet, update: &StoreFlags) -> FlagSet {
+    match update.mode {
+        StoreMode::Replace => update.values.clone(),
+        StoreMode::Add => {
+            current.system.extend(&update.values.system);
+            current
+                .keywords
+                .extend(update.values.keywords.iter().cloned());
+            current
+        }
+        StoreMode::Remove => {
+            current
+                .system
+                .retain(|flag| !update.values.system.contains(flag));
+            current
+                .keywords
+                .retain(|word| !update.values.keywords.contains(word));
+            current
+        }
+    }
+}
+
+fn stored_flags(row: &sqlx::postgres::PgRow) -> Result<FlagSet, StorageError> {
+    let flags: Vec<String> = row.try_get("flags").map_err(map_sqlx)?;
+    let system = flags
+        .into_iter()
+        .map(|flag| match flag.as_str() {
+            "\\Answered" => Ok(SystemFlag::Answered),
+            "\\Deleted" => Ok(SystemFlag::Deleted),
+            "\\Draft" => Ok(SystemFlag::Draft),
+            "\\Flagged" => Ok(SystemFlag::Flagged),
+            "\\Seen" => Ok(SystemFlag::Seen),
+            _ => Err(StorageError::Conflict),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    FlagSet::new(
+        system,
+        row.try_get::<Vec<String>, _>("keywords")
+            .map_err(map_sqlx)?,
+    )
+    .map_err(|_| StorageError::Conflict)
+}
+
+fn next_seen(flags: &FlagSet) -> bool {
+    flags.system.contains(&SystemFlag::Seen)
+}
+
+fn mailbox_message_state(row: &sqlx::postgres::PgRow) -> Result<MailboxMessageState, StorageError> {
+    let time = |column| -> Result<Option<SystemTime>, StorageError> {
+        row.try_get::<Option<i64>, _>(column)
+            .map_err(map_sqlx)?
+            .map(|seconds| {
+                u64::try_from(seconds)
+                    .ok()
+                    .and_then(|value| UNIX_EPOCH.checked_add(Duration::from_secs(value)))
+                    .ok_or(StorageError::Conflict)
+            })
+            .transpose()
+    };
+    Ok(MailboxMessageState {
+        message_id: row.try_get("message_id").map_err(map_sqlx)?,
+        uid: u32::try_from(row.try_get::<i64, _>("uid").map_err(map_sqlx)?)
+            .map_err(|_| StorageError::Conflict)?,
+        modseq: u64::try_from(row.try_get::<i64, _>("modseq").map_err(map_sqlx)?)
+            .map_err(|_| StorageError::Conflict)?,
+        flags: stored_flags(row)?,
+        internal_date: time("internal_date")?.ok_or(StorageError::Conflict)?,
+        saved_date: time("saved_date")?,
+        object_id: row.try_get("object_id").map_err(map_sqlx)?,
+        expunged: row.try_get("expunged").map_err(map_sqlx)?,
+    })
 }
 
 fn mailbox_info(

@@ -64,7 +64,7 @@ Policy abbreviations: `F/P/E/N` = full/partial/external/not planned. Priority: `
 | 7672 | SMTP Security via Opportunistic DANE TLS | Proposed Standard | DANE | current | — | — | — | — | E/P | E | 15 | mail-dns,delivery | planned:dane_7672 | requires validated DNSSEC |
 | 8461 | SMTP MTA Strict Transport Security | Proposed Standard | MTA-STS | current | — | — | — | — | F | R | 15 | mail-policy | planned:mta_sts_8461 | HTTPS policy cache |
 | 8460 | SMTP TLS Reporting | Proposed Standard | TLS-RPT | current | — | — | — | — | F | R | 15 | mail-policy | planned:tls_rpt_8460 | aggregation/privacy limits |
-| 9051 | IMAP Version 4rev2 | Proposed Standard | IMAP | current | 3501 | — | — | — | F | C | 9-11 | mail-imap-proto/server | planned:imap_9051 | primary mailbox-access protocol |
+| 9051 | IMAP Version 4rev2 | Proposed Standard | IMAP | current | 3501 | — | — | — | partial | core | 8-11 | mail-mailbox,mail-imap-proto/server | flags_are_canonical_and_keywords_are_bounded;streaming_ingestion_and_atomic_local_delivery;planned:imap_9051 | Phase 8 persistent UID/UIDVALIDITY/MODSEQ/flags/tombstone foundation implemented; wire protocol remains Phases 9-11 |
 | 3501 | IMAP Version 4rev1 | Proposed Standard | IMAP | obsolete | 2060 | 9051 | — | many | P | L | 9-11 | mail-imap-proto | planned:imap_rev1_compat | compatibility only |
 | 9755 | IMAP Support for UTF-8 | Proposed Standard | IMAP | current | 6855 | — | — | — | F | R | 9-10 | mail-imap-proto | planned:imap_utf8_9755 | replaces 6855 |
 | 2177/4315/6851 | IDLE / UIDPLUS / MOVE | Proposed Standard | IMAP | current | UIDPLUS obsoletes 2359 | — | — | — | F | R | 10-11 | mail-imap-server | planned:imap_core_ext | concurrency-sensitive |

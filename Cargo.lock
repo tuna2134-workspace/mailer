@@ -1543,6 +1543,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mail-mailbox"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "mail-message"
 version = "0.1.0"
 dependencies = [
@@ -1587,6 +1595,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "mail-domain",
+ "mail-mailbox",
  "mail-migrations",
  "mail-storage",
  "sqlx",
@@ -1664,6 +1673,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "mail-domain",
+ "mail-mailbox",
  "serde",
  "thiserror",
  "uuid",
