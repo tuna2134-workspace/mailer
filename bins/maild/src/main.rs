@@ -25,6 +25,8 @@ async fn main() -> Result<()> {
     let smtp_addr = address("MAIL_SMTP_LISTEN", "0.0.0.0:25")?;
     let submission_addr = address("MAIL_SUBMISSION_LISTEN", "0.0.0.0:587")?;
     let implicit_submission_addr = address("MAIL_SUBMISSIONS_LISTEN", "0.0.0.0:465")?;
+    let imap_addr = address("MAIL_IMAP_LISTEN", "0.0.0.0:143")?;
+    let implicit_imap_addr = address("MAIL_IMAPS_LISTEN", "0.0.0.0:993")?;
     let hostname = match std::env::var("MAIL_HOSTNAME") {
         Ok(value) => value,
         Err(_) => domains
@@ -146,6 +148,8 @@ async fn main() -> Result<()> {
         )
         .await
     });
+    let imap_tls = Arc::clone(&smtp_tls);
+    let implicit_imap_tls = Arc::clone(&smtp_tls);
     let smtp_task = tokio::spawn(async move {
         mail_smtp_server::serve(
             smtp_listener,
@@ -161,6 +165,37 @@ async fn main() -> Result<()> {
                 require_tls: true,
                 deliver_by_min_seconds: Some(0),
                 ..mail_smtp_server::SmtpConfig::default()
+            },
+        )
+        .await
+    });
+    let imap_listener = TcpListener::bind(imap_addr)
+        .await
+        .with_context(|| format!("bind IMAP listener {imap_addr}"))?;
+    let imap_repository = Arc::new(repository.clone());
+    let imap_task = tokio::spawn(async move {
+        mail_imap_server::serve(
+            imap_listener,
+            imap_repository,
+            mail_imap_server::ImapConfig {
+                tls: Some(imap_tls),
+                ..mail_imap_server::ImapConfig::default()
+            },
+        )
+        .await
+    });
+    let implicit_imap_listener = TcpListener::bind(implicit_imap_addr)
+        .await
+        .with_context(|| format!("bind IMAPS listener {implicit_imap_addr}"))?;
+    let implicit_imap_repository = Arc::new(repository.clone());
+    let implicit_imap_task = tokio::spawn(async move {
+        mail_imap_server::serve(
+            implicit_imap_listener,
+            implicit_imap_repository,
+            mail_imap_server::ImapConfig {
+                tls: Some(implicit_imap_tls),
+                implicit_tls: true,
+                ..mail_imap_server::ImapConfig::default()
             },
         )
         .await
@@ -188,6 +223,14 @@ async fn main() -> Result<()> {
         result = implicit_submission_task => {
             result.context("implicit TLS Submission listener task stopped")??;
             bail!("implicit TLS Submission listener stopped unexpectedly");
+        }
+        result = imap_task => {
+            result.context("IMAP listener task stopped")??;
+            bail!("IMAP listener stopped unexpectedly");
+        }
+        result = implicit_imap_task => {
+            result.context("IMAPS listener task stopped")??;
+            bail!("IMAPS listener stopped unexpectedly");
         }
         result = shutdown_signal() => {
             result.context("install shutdown signal handler")?;

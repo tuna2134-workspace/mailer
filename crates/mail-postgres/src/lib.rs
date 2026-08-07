@@ -8,7 +8,7 @@ use mail_domain::{
 use mail_mailbox::{FlagSet, StoreMode, SystemFlag};
 use mail_storage::{
     AdminRepository, ApiCredential, ApiTokenInfo, ApplicationPasswordInfo, AuditEvent, AuditRecord,
-    DeliveryOutcome, IdempotencyRecord, LocalRecipient, MailRepository, MailboxAllocation,
+    DeliveryOutcome, IdempotencyRecord, ImapRepository, LocalRecipient, MailRepository,
     MailboxInfo, MailboxMessageState, MailboxRepository, PasswordCredential, QueueLease,
     SmtpRepository, StorageError, StoreFlags, StoredMessage, Versioned,
 };
@@ -325,24 +325,6 @@ impl MailRepository for PostgresRepository {
             .bind(&mailbox.name).bind(i64::from(mailbox.uid_next))
             .bind(highest_modseq).execute(&self.pool).await.map_err(map_sqlx)?;
         Ok(())
-    }
-
-    async fn allocate_mailbox_item(
-        &self,
-        mailbox_id: MailboxId,
-    ) -> Result<MailboxAllocation, StorageError> {
-        let row = sqlx::query(
-            "UPDATE mailboxes SET uid_next = uid_next + 1, highest_modseq = highest_modseq + 1, version = version + 1 \
-             WHERE id = $1 AND uid_next < 4294967295 AND highest_modseq < 9223372036854775807 \
-             RETURNING uid_next - 1 AS uid, highest_modseq AS modseq",
-        ).bind(mailbox_id.into_uuid()).fetch_optional(&self.pool).await.map_err(map_sqlx)?;
-        let row = row.ok_or(StorageError::CounterExhausted)?;
-        let uid: i64 = row.try_get("uid").map_err(map_sqlx)?;
-        let modseq: i64 = row.try_get("modseq").map_err(map_sqlx)?;
-        Ok(MailboxAllocation {
-            uid: u32::try_from(uid).map_err(|_| StorageError::CounterExhausted)?,
-            modseq: u64::try_from(modseq).map_err(|_| StorageError::CounterExhausted)?,
-        })
     }
 
     async fn consume_quota(&self, tenant_id: TenantId, bytes: u64) -> Result<(), StorageError> {
@@ -1026,7 +1008,7 @@ impl SmtpRepository for PostgresRepository {
                 if quota.rows_affected() != 1 {
                     return Err(StorageError::QuotaExceeded);
                 }
-                let allocation = sqlx::query("UPDATE mailboxes SET uid_next=uid_next+1,highest_modseq=highest_modseq+1,message_count=message_count+1,unseen_count=unseen_count+1 WHERE id=$1 AND tenant_id=$2 AND uid_next<4294967295 RETURNING uid_next-1 AS uid,highest_modseq")
+                let allocation = sqlx::query("UPDATE mailboxes SET uid_next=uid_next+1,highest_modseq=highest_modseq+1,message_count=message_count+1,unseen_count=unseen_count+1 WHERE id=$1 AND tenant_id=$2 AND uid_next<4294967295 AND highest_modseq<9223372036854775807 RETURNING uid_next-1 AS uid,highest_modseq")
                     .bind(recipient.mailbox_id.into_uuid()).bind(tenant_id.into_uuid()).fetch_optional(&mut *transaction).await.map_err(map_sqlx)?.ok_or(StorageError::Conflict)?;
                 let uid: i64 = allocation.try_get("uid").map_err(map_sqlx)?;
                 let modseq: i64 = allocation.try_get("highest_modseq").map_err(map_sqlx)?;
@@ -1189,7 +1171,7 @@ impl SmtpRepository for PostgresRepository {
                 if quota.rows_affected() != 1 {
                     return Err(StorageError::QuotaExceeded);
                 }
-                let allocation = sqlx::query("UPDATE mailboxes SET uid_next=uid_next+1,highest_modseq=highest_modseq+1,message_count=message_count+1,unseen_count=unseen_count+1 WHERE id=$1 AND tenant_id=$2 AND uid_next<4294967295 RETURNING uid_next-1 AS uid,highest_modseq")
+                let allocation = sqlx::query("UPDATE mailboxes SET uid_next=uid_next+1,highest_modseq=highest_modseq+1,message_count=message_count+1,unseen_count=unseen_count+1 WHERE id=$1 AND tenant_id=$2 AND uid_next<4294967295 AND highest_modseq<9223372036854775807 RETURNING uid_next-1 AS uid,highest_modseq")
                     .bind(mailbox_id).bind(tenant_id).fetch_optional(&mut *transaction).await.map_err(map_sqlx)?.ok_or(StorageError::Conflict)?;
                 sqlx::query("INSERT INTO mailbox_messages(mailbox_id,message_id,uid,modseq,internal_date,object_id) VALUES($1,$2,$3,$4,clock_timestamp(),$5)")
                     .bind(mailbox_id).bind(message_id).bind(allocation.try_get::<i64,_>("uid").map_err(map_sqlx)?).bind(allocation.try_get::<i64,_>("highest_modseq").map_err(map_sqlx)?).bind(Uuid::new_v4()).execute(&mut *transaction).await.map_err(map_sqlx)?;
@@ -1296,6 +1278,20 @@ impl MailboxRepository for PostgresRepository {
             .execute(&mut *transaction).await.map_err(map_sqlx)?;
         transaction.commit().await.map_err(map_sqlx)?;
         u64::try_from(modseq).map_err(|_| StorageError::Conflict)
+    }
+}
+
+#[async_trait]
+impl ImapRepository for PostgresRepository {
+    async fn imap_auth_account(
+        &self,
+        identity: &str,
+    ) -> Result<Option<mail_storage::SmtpAuthAccount>, StorageError> {
+        SmtpRepository::smtp_auth_account(self, identity).await
+    }
+
+    async fn record_imap_auth(&self, user_id: Uuid, success: bool) -> Result<(), StorageError> {
+        SmtpRepository::record_smtp_auth(self, user_id, success).await
     }
 }
 

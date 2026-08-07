@@ -21,6 +21,8 @@ members = [
     "crates/mail-message",
     "crates/mail-mime",
     "crates/mail-mailbox",
+    "crates/mail-imap-proto",
+    "crates/mail-imap-server",
     "bins/mail-migrate",
     "bins/mailctl",
     "bins/maild",

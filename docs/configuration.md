@@ -54,5 +54,7 @@ cors = "deny"
 - `MAIL_ADMIN_LISTEN`: administration HTTPS address, default `127.0.0.1:8443`.
 - `MAIL_HOSTNAME`: SMTP server identity; defaults to the first ACME domain and is strictly validated.
 - `MAIL_SMTP_LISTEN`: inbound SMTP address, default `0.0.0.0:25`.
+- `MAIL_IMAP_LISTEN`: STARTTLS-capable IMAP address, default `0.0.0.0:143`; credentials remain disabled until TLS succeeds.
+- `MAIL_IMAPS_LISTEN`: implicit-TLS IMAP address, default `0.0.0.0:993`.
 
 Run `mail-migrate up` explicitly first. `maild` only checks migration compatibility and fails closed on mismatch.

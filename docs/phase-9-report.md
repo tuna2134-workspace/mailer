@@ -1,0 +1,9 @@
+# Phase 9 report
+
+Implemented the IMAP4rev2 connection foundation in `mail-imap-proto` and `mail-imap-server`. The protocol crate provides bounded parsing for tags, atoms, quoted strings, synchronizing/non-synchronizing literal framing, mailbox names, sequence sets, CAPABILITY, NOOP, LOGOUT, STARTTLS, AUTHENTICATE, LOGIN, and ENABLE, plus tagged, untagged, continuation, OK, NO, BAD, and BYE serialization. The pure session state machine covers Not Authenticated, Authenticated, Selected, and Logout transitions.
+
+The Tokio server supports port 143 STARTTLS and port 993 implicit TLS through the shared rustls/ACME certificate resolver. Cleartext sessions advertise LOGINDISABLED and reject credentials; after a real STARTTLS handshake, capability state is regenerated and PLAIN/SASL-IR become available. LOGIN and AUTHENTICATE PLAIN use the existing PostgreSQL Argon2/application-password records, database lockout tracking, dummy password work for unknown accounts, three-failure connection limits, command timeouts, connection limits, CRLF enforcement, and 64 KiB bounded authentication literals.
+
+`maild` starts configurable `MAIL_IMAP_LISTEN` and `MAIL_IMAPS_LISTEN` listeners. Tests cover parser boundaries, quoted/literal splitting, sequence sets, state admission, real STARTTLS, successful LOGIN, ENABLE, CAPABILITY/NOOP/LOGOUT transcripts, timeout/size handling primitives, and fuzz parsing through `imap_command`.
+
+Known limitations: Phase 9 advertises only the PLAIN SASL mechanism that is implemented end-to-end; SCRAM for IMAP is not advertised. ENABLE parses safely but no optional capability is reported as enabled yet. Mailbox commands, UTF-8 mailbox semantics, streaming APPEND, and persistent Selected-state execution begin in Phase 10; IDLE/CONDSTORE/QRESYNC notifications are Phase 11. IMAP4rev1 is a compatibility capability, while RFC 9051 behavior is authoritative.

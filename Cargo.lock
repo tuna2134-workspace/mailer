@@ -1543,6 +1543,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "mail-imap-proto"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "mail-imap-server"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "async-trait",
+ "base64",
+ "mail-imap-proto",
+ "mail-storage",
+ "rcgen",
+ "rustls",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "uuid",
+]
+
+[[package]]
 name = "mail-mailbox"
 version = "0.1.0"
 dependencies = [
@@ -1719,6 +1743,7 @@ dependencies = [
  "axum-server",
  "mail-acme",
  "mail-admin-api",
+ "mail-imap-server",
  "mail-migrations",
  "mail-postgres",
  "mail-smtp-server",

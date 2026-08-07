@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use mail_domain::{Alias, Domain, Mailbox, MailboxId, QueueId, Tenant, TenantId, User};
 use mail_storage::{
     AdminRepository, ApiCredential, AuditEvent, IdempotencyRecord, MailRepository,
-    MailboxAllocation, PasswordCredential, QueueLease, StorageError, Versioned,
+    PasswordCredential, QueueLease, StorageError, Versioned,
 };
 use std::{
     collections::HashMap,
@@ -355,30 +355,6 @@ impl MailRepository for InMemoryRepository {
         Ok(())
     }
 
-    async fn allocate_mailbox_item(
-        &self,
-        mailbox_id: MailboxId,
-    ) -> Result<MailboxAllocation, StorageError> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|error| StorageError::Unavailable(error.to_string()))?;
-        let (uid, modseq) = state
-            .mailboxes
-            .get_mut(&mailbox_id)
-            .ok_or(StorageError::NotFound)?;
-        if *uid == u32::MAX || *modseq == u64::MAX {
-            return Err(StorageError::CounterExhausted);
-        }
-        let allocation = MailboxAllocation {
-            uid: *uid,
-            modseq: *modseq + 1,
-        };
-        *uid += 1;
-        *modseq += 1;
-        Ok(allocation)
-    }
-
     async fn consume_quota(&self, tenant_id: TenantId, bytes: u64) -> Result<(), StorageError> {
         let mut state = self
             .state
@@ -430,16 +406,6 @@ mod tests {
             Err(StorageError::QuotaExceeded)
         ));
 
-        let mailbox_id = MailboxId::new(Uuid::new_v4());
-        repository.add_mailbox(mailbox_id, 1, 1)?;
-        assert_eq!(
-            repository.allocate_mailbox_item(mailbox_id).await?,
-            MailboxAllocation { uid: 1, modseq: 2 }
-        );
-        assert_eq!(
-            repository.allocate_mailbox_item(mailbox_id).await?,
-            MailboxAllocation { uid: 2, modseq: 3 }
-        );
         Ok(())
     }
 }

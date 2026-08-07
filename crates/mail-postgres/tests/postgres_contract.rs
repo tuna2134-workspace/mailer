@@ -211,28 +211,6 @@ async fn constraints_counters_quota_and_leases() -> Result<(), Box<dyn std::erro
             .await?,
         2
     );
-    assert_eq!(repository.allocate_mailbox_item(mailbox_id).await?.uid, 1);
-    assert_eq!(
-        repository.allocate_mailbox_item(mailbox_id).await?.modseq,
-        3
-    );
-    let mut allocations = tokio::task::JoinSet::new();
-    for _ in 0..8 {
-        let repository = repository.clone();
-        allocations.spawn(async move { repository.allocate_mailbox_item(mailbox_id).await });
-    }
-    let mut uids = Vec::new();
-    let mut modseqs = Vec::new();
-    while let Some(result) = allocations.join_next().await {
-        let allocation = result??;
-        uids.push(allocation.uid);
-        modseqs.push(allocation.modseq);
-    }
-    uids.sort_unstable();
-    modseqs.sort_unstable();
-    assert_eq!(uids, (3..=10).collect::<Vec<_>>());
-    assert_eq!(modseqs, (4..=11).collect::<Vec<_>>());
-
     let message_id = Uuid::new_v4();
     sqlx::query("INSERT INTO messages (id,tenant_id,raw_message,envelope_sender,received_at,message_size,content_hash,storage_state) VALUES ($1,$2,$3,'',clock_timestamp(),3,$4,'committed')")
         .bind(message_id).bind(tenant_id.into_uuid()).bind(b"abc".as_slice()).bind(b"hash".as_slice()).execute(&pool).await?;

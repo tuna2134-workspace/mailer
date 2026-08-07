@@ -85,12 +85,6 @@ pub enum StorageError {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MailboxAllocation {
-    pub uid: u32,
-    pub modseq: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MailboxMessageState {
     pub message_id: Uuid,
     pub uid: u32,
@@ -250,10 +244,6 @@ pub trait MailRepository: Send + Sync {
         offset: u32,
     ) -> Result<Vec<Alias>, StorageError>;
     async fn create_mailbox(&self, mailbox: &Mailbox) -> Result<(), StorageError>;
-    async fn allocate_mailbox_item(
-        &self,
-        mailbox_id: MailboxId,
-    ) -> Result<MailboxAllocation, StorageError>;
     async fn consume_quota(&self, tenant_id: TenantId, bytes: u64) -> Result<(), StorageError>;
     async fn lease_queue(
         &self,
@@ -547,4 +537,14 @@ pub trait MailboxRepository: Send + Sync {
         mailbox_id: MailboxId,
         uid: u32,
     ) -> Result<u64, StorageError>;
+}
+
+#[async_trait]
+pub trait ImapRepository: Send + Sync {
+    async fn imap_auth_account(
+        &self,
+        identity: &str,
+    ) -> Result<Option<SmtpAuthAccount>, StorageError>;
+
+    async fn record_imap_auth(&self, user_id: Uuid, success: bool) -> Result<(), StorageError>;
 }
