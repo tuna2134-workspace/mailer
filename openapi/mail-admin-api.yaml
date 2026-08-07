@@ -1,0 +1,295 @@
+openapi: 3.1.0
+info:
+  title: Mail Administration API
+  version: 0.2.0
+  description: Implemented Phase 2 administration contract. Mutating POST requests require Idempotency-Key; updates and scheduled deletions require If-Match.
+servers:
+  - url: https://127.0.0.1:8443/api/v1
+security:
+  - bearerToken: []
+paths:
+  /tenants:
+    get:
+      operationId: listTenants
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200': { $ref: '#/components/responses/Page' }
+        default: { $ref: '#/components/responses/Problem' }
+    post:
+      operationId: createTenant
+      parameters: [{ $ref: '#/components/parameters/IdempotencyKey' }]
+      requestBody: { $ref: '#/components/requestBodies/Mutation' }
+      responses:
+        '201': { $ref: '#/components/responses/Resource' }
+        default: { $ref: '#/components/responses/Problem' }
+  /tenants/{tenant_id}:
+    parameters: [{ $ref: '#/components/parameters/TenantId' }]
+    get:
+      operationId: getTenant
+      responses: { '200': { $ref: '#/components/responses/Resource' }, default: { $ref: '#/components/responses/Problem' } }
+    patch:
+      operationId: updateTenant
+      parameters: [{ $ref: '#/components/parameters/IfMatch' }]
+      requestBody: { $ref: '#/components/requestBodies/Mutation' }
+      responses: { '200': { $ref: '#/components/responses/Resource' }, default: { $ref: '#/components/responses/Problem' } }
+    delete:
+      operationId: disableTenant
+      parameters: [{ $ref: '#/components/parameters/IfMatch' }]
+      responses: { '202': { $ref: '#/components/responses/Resource' }, default: { $ref: '#/components/responses/Problem' } }
+  /domains:
+    get:
+      operationId: listDomains
+      parameters: [{ $ref: '#/components/parameters/Limit' }, { $ref: '#/components/parameters/Cursor' }]
+      responses: { '200': { $ref: '#/components/responses/Page' }, default: { $ref: '#/components/responses/Problem' } }
+    post:
+      operationId: createDomain
+      parameters: [{ $ref: '#/components/parameters/IdempotencyKey' }]
+      requestBody: { $ref: '#/components/requestBodies/Mutation' }
+      responses: { '201': { $ref: '#/components/responses/Resource' }, default: { $ref: '#/components/responses/Problem' } }
+  /domains/{domain_id}:
+    parameters: [{ $ref: '#/components/parameters/DomainId' }]
+    get:
+      operationId: getDomain
+      responses: { '200': { $ref: '#/components/responses/Resource' }, default: { $ref: '#/components/responses/Problem' } }
+    patch:
+      operationId: updateDomain
+      parameters: [{ $ref: '#/components/parameters/IfMatch' }]
+      requestBody: { $ref: '#/components/requestBodies/Mutation' }
+      responses: { '200': { $ref: '#/components/responses/Resource' }, default: { $ref: '#/components/responses/Problem' } }
+    delete:
+      operationId: deleteDomain
+      parameters: [{ $ref: '#/components/parameters/IfMatch' }]
+      responses: { '202': { $ref: '#/components/responses/Resource' }, default: { $ref: '#/components/responses/Problem' } }
+  /domains/{domain_id}/dns-records:
+    parameters: [{ $ref: '#/components/parameters/DomainId' }]
+    get:
+      operationId: getDomainDnsRecords
+      responses: { '200': { $ref: '#/components/responses/Page' }, default: { $ref: '#/components/responses/Problem' } }
+  /domains/{domain_id}/verify:
+    parameters: [{ $ref: '#/components/parameters/DomainId' }]
+    post:
+      operationId: verifyDomain
+      parameters: [{ $ref: '#/components/parameters/IdempotencyKey' }]
+      responses: { '202': { $ref: '#/components/responses/Resource' }, default: { $ref: '#/components/responses/Problem' } }
+  /users:
+    get:
+      operationId: listUsers
+      parameters: [{ $ref: '#/components/parameters/Limit' }, { $ref: '#/components/parameters/Cursor' }]
+      responses: { '200': { $ref: '#/components/responses/Page' }, default: { $ref: '#/components/responses/Problem' } }
+    post:
+      operationId: createUser
+      parameters: [{ $ref: '#/components/parameters/IdempotencyKey' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateUser' }
+      responses: { '201': { $ref: '#/components/responses/Resource' }, default: { $ref: '#/components/responses/Problem' } }
+  /users/{user_id}:
+    parameters: [{ $ref: '#/components/parameters/UserId' }]
+    get:
+      operationId: getUser
+      responses: { '200': { $ref: '#/components/responses/Resource' }, default: { $ref: '#/components/responses/Problem' } }
+    patch:
+      operationId: updateUser
+      parameters: [{ $ref: '#/components/parameters/IfMatch' }]
+      requestBody: { $ref: '#/components/requestBodies/Mutation' }
+      responses: { '200': { $ref: '#/components/responses/Resource' }, default: { $ref: '#/components/responses/Problem' } }
+    delete:
+      operationId: deleteUser
+      parameters: [{ $ref: '#/components/parameters/IfMatch' }]
+      responses: { '202': { $ref: '#/components/responses/Resource' }, default: { $ref: '#/components/responses/Problem' } }
+  /aliases:
+    get:
+      operationId: listAliases
+      parameters: [{ $ref: '#/components/parameters/Limit' }, { $ref: '#/components/parameters/Cursor' }]
+      responses: { '200': { $ref: '#/components/responses/Page' }, default: { $ref: '#/components/responses/Problem' } }
+    post:
+      operationId: createAlias
+      parameters: [{ $ref: '#/components/parameters/IdempotencyKey' }]
+      requestBody: { $ref: '#/components/requestBodies/Mutation' }
+      responses: { '201': { $ref: '#/components/responses/Resource' }, default: { $ref: '#/components/responses/Problem' } }
+  /aliases/{alias_id}:
+    parameters: [{ $ref: '#/components/parameters/AliasId' }]
+    get:
+      operationId: getAlias
+      responses: { '200': { $ref: '#/components/responses/Resource' }, default: { $ref: '#/components/responses/Problem' } }
+    patch:
+      operationId: updateAlias
+      parameters: [{ $ref: '#/components/parameters/IfMatch' }]
+      requestBody: { $ref: '#/components/requestBodies/Mutation' }
+      responses: { '200': { $ref: '#/components/responses/Resource' }, default: { $ref: '#/components/responses/Problem' } }
+    delete:
+      operationId: deleteAlias
+      parameters: [{ $ref: '#/components/parameters/IfMatch' }]
+      responses: { '204': { description: Deleted }, default: { $ref: '#/components/responses/Problem' } }
+  /domains/{domain_id}/enable:
+    post:
+      operationId: enableDomain
+      parameters: [{ $ref: '#/components/parameters/DomainId' }, { $ref: '#/components/parameters/IfMatch' }, { $ref: '#/components/parameters/IdempotencyKey' }]
+      responses: { '204': { description: Enabled }, default: { $ref: '#/components/responses/Problem' } }
+  /domains/{domain_id}/disable:
+    post:
+      operationId: disableDomain
+      parameters: [{ $ref: '#/components/parameters/DomainId' }, { $ref: '#/components/parameters/IfMatch' }, { $ref: '#/components/parameters/IdempotencyKey' }]
+      responses: { '204': { description: Disabled }, default: { $ref: '#/components/responses/Problem' } }
+  /users/{user_id}/enable:
+    post:
+      operationId: enableUser
+      parameters: [{ $ref: '#/components/parameters/UserId' }, { $ref: '#/components/parameters/IfMatch' }, { $ref: '#/components/parameters/IdempotencyKey' }]
+      responses: { '204': { description: Enabled }, default: { $ref: '#/components/responses/Problem' } }
+  /users/{user_id}/disable:
+    post:
+      operationId: disableUser
+      parameters: [{ $ref: '#/components/parameters/UserId' }, { $ref: '#/components/parameters/IfMatch' }, { $ref: '#/components/parameters/IdempotencyKey' }]
+      responses: { '204': { description: Disabled }, default: { $ref: '#/components/responses/Problem' } }
+  /users/{user_id}/unlock:
+    post:
+      operationId: unlockUser
+      parameters: [{ $ref: '#/components/parameters/UserId' }, { $ref: '#/components/parameters/IdempotencyKey' }]
+      responses: { '204': { description: Unlocked }, default: { $ref: '#/components/responses/Problem' } }
+  /users/{user_id}/password:
+    post:
+      operationId: setUserPassword
+      parameters: [{ $ref: '#/components/parameters/UserId' }, { $ref: '#/components/parameters/IdempotencyKey' }]
+      requestBody: { $ref: '#/components/requestBodies/Mutation' }
+      responses: { '204': { description: Password changed }, default: { $ref: '#/components/responses/Problem' } }
+  /users/{user_id}/quota:
+    parameters: [{ $ref: '#/components/parameters/UserId' }]
+    get:
+      operationId: getUserQuota
+      responses: { '200': { $ref: '#/components/responses/Resource' }, default: { $ref: '#/components/responses/Problem' } }
+    patch:
+      operationId: setUserQuota
+      parameters: [{ $ref: '#/components/parameters/IfMatch' }]
+      requestBody: { $ref: '#/components/requestBodies/Mutation' }
+      responses: { '204': { description: Quota changed }, default: { $ref: '#/components/responses/Problem' } }
+  /users/{user_id}/application-passwords:
+    parameters: [{ $ref: '#/components/parameters/UserId' }]
+    get:
+      operationId: listApplicationPasswords
+      responses: { '200': { $ref: '#/components/responses/Page' }, default: { $ref: '#/components/responses/Problem' } }
+    post:
+      operationId: createApplicationPassword
+      parameters: [{ $ref: '#/components/parameters/IdempotencyKey' }]
+      requestBody: { $ref: '#/components/requestBodies/Mutation' }
+      responses: { '201': { $ref: '#/components/responses/Resource' }, default: { $ref: '#/components/responses/Problem' } }
+  /users/{user_id}/application-passwords/{app_password_id}:
+    delete:
+      operationId: revokeApplicationPassword
+      parameters: [{ $ref: '#/components/parameters/UserId' }, { $ref: '#/components/parameters/AppPasswordId' }]
+      responses: { '204': { description: Revoked }, default: { $ref: '#/components/responses/Problem' } }
+  /users/{user_id}/mailboxes:
+    get:
+      operationId: listMailboxes
+      parameters: [{ $ref: '#/components/parameters/UserId' }]
+      responses: { '200': { $ref: '#/components/responses/Page' }, default: { $ref: '#/components/responses/Problem' } }
+  /users/{user_id}/mailboxes/{mailbox_id}:
+    parameters: [{ $ref: '#/components/parameters/UserId' }, { $ref: '#/components/parameters/MailboxId' }]
+    get:
+      operationId: getMailbox
+      parameters: [{ $ref: '#/components/parameters/UserId' }, { $ref: '#/components/parameters/MailboxId' }]
+      responses: { '200': { $ref: '#/components/responses/Resource' }, default: { $ref: '#/components/responses/Problem' } }
+    patch:
+      operationId: updateMailbox
+      parameters: [{ $ref: '#/components/parameters/IfMatch' }]
+      requestBody: { $ref: '#/components/requestBodies/Mutation' }
+      responses: { '204': { description: Updated }, default: { $ref: '#/components/responses/Problem' } }
+    delete:
+      operationId: deleteMailbox
+      parameters: [{ $ref: '#/components/parameters/IfMatch' }]
+      responses: { '204': { description: Deleted }, default: { $ref: '#/components/responses/Problem' } }
+  /api-tokens:
+    get:
+      operationId: listApiTokens
+      responses: { '200': { $ref: '#/components/responses/Page' }, default: { $ref: '#/components/responses/Problem' } }
+    post:
+      operationId: createApiToken
+      parameters: [{ $ref: '#/components/parameters/IdempotencyKey' }]
+      requestBody: { $ref: '#/components/requestBodies/Mutation' }
+      responses: { '201': { $ref: '#/components/responses/Resource' }, default: { $ref: '#/components/responses/Problem' } }
+  /api-tokens/{token_id}:
+    delete:
+      operationId: revokeApiToken
+      parameters: [{ $ref: '#/components/parameters/TokenId' }]
+      responses: { '204': { description: Revoked }, default: { $ref: '#/components/responses/Problem' } }
+  /audit:
+    get:
+      operationId: listAuditEvents
+      responses: { '200': { $ref: '#/components/responses/Page' }, default: { $ref: '#/components/responses/Problem' } }
+components:
+  securitySchemes:
+    bearerToken:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque scoped API token
+  parameters:
+    TenantId: { name: tenant_id, in: path, required: true, schema: { type: string, format: uuid } }
+    DomainId: { name: domain_id, in: path, required: true, schema: { type: string, format: uuid } }
+    UserId: { name: user_id, in: path, required: true, schema: { type: string, format: uuid } }
+    AliasId: { name: alias_id, in: path, required: true, schema: { type: string, format: uuid } }
+    AppPasswordId: { name: app_password_id, in: path, required: true, schema: { type: string, format: uuid } }
+    MailboxId: { name: mailbox_id, in: path, required: true, schema: { type: string, format: uuid } }
+    TokenId: { name: token_id, in: path, required: true, schema: { type: string, format: uuid } }
+    Limit: { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
+    Cursor: { name: cursor, in: query, schema: { type: string, maxLength: 2048 } }
+    IdempotencyKey: { name: Idempotency-Key, in: header, required: true, schema: { type: string, minLength: 16, maxLength: 200 } }
+    IfMatch: { name: If-Match, in: header, required: true, schema: { type: string } }
+  requestBodies:
+    Mutation:
+      required: true
+      content:
+        application/json:
+          schema: { type: object, additionalProperties: false }
+  responses:
+    Resource:
+      description: Resource representation
+      headers: { ETag: { schema: { type: string } }, X-Request-Id: { schema: { type: string, format: uuid } } }
+      content: { application/json: { schema: { $ref: '#/components/schemas/Resource' } } }
+    Page:
+      description: Bounded page
+      content: { application/json: { schema: { $ref: '#/components/schemas/Page' } } }
+    Problem:
+      description: RFC 9457 problem
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+  schemas:
+    Resource:
+      type: object
+      required: [id, version]
+      properties:
+        id: { type: string, format: uuid }
+        version: { type: integer, minimum: 1 }
+      additionalProperties: true
+    Page:
+      type: object
+      required: [items]
+      properties:
+        items: { type: array, maxItems: 200, items: { $ref: '#/components/schemas/Resource' } }
+        next_cursor: { type: [string, 'null'] }
+      additionalProperties: false
+    CreateUser:
+      type: object
+      required: [tenant_id, domain_id, local_part, password]
+      properties:
+        tenant_id: { type: string, format: uuid }
+        domain_id: { type: string, format: uuid }
+        local_part: { type: string, minLength: 1, maxLength: 64 }
+        display_name: { type: string, maxLength: 256 }
+        password: { type: string, minLength: 12, writeOnly: true }
+        quota_bytes: { type: integer, minimum: 0 }
+        enabled: { type: boolean, default: true }
+      additionalProperties: false
+    Problem:
+      type: object
+      required: [type, title, status, code, request_id]
+      properties:
+        type: { type: string, format: uri-reference }
+        title: { type: string }
+        status: { type: integer, minimum: 400, maximum: 599 }
+        code: { type: string, pattern: '^[a-z][a-z0-9_]*$' }
+        detail: { type: string }
+        instance: { type: string, format: uri-reference }
+        request_id: { type: string, format: uuid }
+      additionalProperties: true

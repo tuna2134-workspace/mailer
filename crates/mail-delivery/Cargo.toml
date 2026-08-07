@@ -1,0 +1,16 @@
+[package]
+name = "mail-delivery"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mail-dns = { path = "../mail-dns" }
+mail-smtp-client = { path = "../mail-smtp-client" }
+mail-storage = { path = "../mail-storage" }
+thiserror.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

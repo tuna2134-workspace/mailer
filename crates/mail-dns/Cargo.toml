@@ -1,0 +1,13 @@
+[package]
+name = "mail-dns"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hickory-resolver.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

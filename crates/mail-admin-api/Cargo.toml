@@ -1,0 +1,31 @@
+[package]
+name = "mail-admin-api"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+argon2.workspace = true
+axum.workspace = true
+mail-application = { path = "../mail-application" }
+mail-domain = { path = "../mail-domain" }
+mail-storage = { path = "../mail-storage" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+mail-migrations = { path = "../mail-migrations" }
+mail-postgres = { path = "../mail-postgres" }
+mail-testkit = { path = "../mail-testkit" }
+sqlx.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

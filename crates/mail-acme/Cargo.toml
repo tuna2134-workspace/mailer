@@ -1,0 +1,22 @@
+[package]
+name = "mail-acme"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+futures.workspace = true
+ring.workspace = true
+rustls.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls-acme.workspace = true
+
+[dev-dependencies]
+mail-migrations = { path = "../mail-migrations" }
+
+[lints]
+workspace = true

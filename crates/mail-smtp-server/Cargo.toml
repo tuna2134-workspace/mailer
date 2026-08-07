@@ -1,0 +1,21 @@
+[package]
+name = "mail-smtp-server"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mail-smtp-proto = { path = "../mail-smtp-proto" }
+mail-storage = { path = "../mail-storage" }
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+mail-domain = { path = "../mail-domain" }
+
+[lints]
+workspace = true

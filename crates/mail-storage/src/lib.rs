@@ -1,0 +1,410 @@
+#![forbid(unsafe_code)]
+
+use async_trait::async_trait;
+use mail_domain::{Alias, Domain, Mailbox, MailboxId, QueueId, Tenant, TenantId, User};
+use serde::{Deserialize, Serialize};
+use std::time::{Duration, SystemTime};
+use thiserror::Error;
+use uuid::Uuid;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Versioned<T> {
+    pub value: T,
+    pub version: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ApplicationPasswordInfo {
+    pub id: Uuid,
+    pub display_name: String,
+    pub revoked: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ApiTokenInfo {
+    pub id: Uuid,
+    pub tenant_id: Option<TenantId>,
+    pub display_name: String,
+    pub scopes: Vec<String>,
+    pub revoked: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MailboxInfo {
+    pub mailbox: Mailbox,
+    pub version: i64,
+    pub message_count: u64,
+    pub unseen_count: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AuditRecord {
+    pub id: i64,
+    pub action: String,
+    pub resource_type: String,
+    pub resource_id: Option<Uuid>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IdempotencyRecord {
+    pub request_hash: Vec<u8>,
+    pub response_status: Option<u16>,
+    pub response_body: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApiCredential {
+    pub token_id: Uuid,
+    pub tenant_id: Option<TenantId>,
+    pub scopes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuditEvent {
+    pub tenant_id: Option<TenantId>,
+    pub actor_id: Uuid,
+    pub request_id: Uuid,
+    pub action: String,
+    pub resource_type: String,
+    pub resource_id: Option<Uuid>,
+}
+
+#[derive(Debug, Error)]
+pub enum StorageError {
+    #[error("resource not found")]
+    NotFound,
+    #[error("resource conflict")]
+    Conflict,
+    #[error("quota exceeded")]
+    QuotaExceeded,
+    #[error("counter exhausted")]
+    CounterExhausted,
+    #[error("storage unavailable: {0}")]
+    Unavailable(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MailboxAllocation {
+    pub uid: u32,
+    pub modseq: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueueLease {
+    pub queue_id: QueueId,
+    pub lease_token: Uuid,
+    pub message_id: Uuid,
+    pub recipient: String,
+    pub destination_domain: String,
+    pub envelope_sender: String,
+    pub attempt_count: u32,
+    pub expires_at: SystemTime,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DeliveryOutcome {
+    Delivered,
+    Deferred {
+        next_attempt_at: SystemTime,
+        enhanced_status_code: Option<String>,
+        diagnostic: String,
+    },
+    Failed {
+        enhanced_status_code: Option<String>,
+        diagnostic: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalRecipient {
+    pub address: String,
+    pub tenant_id: TenantId,
+    pub mailbox_id: MailboxId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredMessage {
+    pub message_ids: Vec<Uuid>,
+    pub octets: u64,
+}
+
+#[async_trait]
+pub trait MailRepository: Send + Sync {
+    async fn authenticate_api_token(
+        &self,
+        token_hash: &[u8],
+    ) -> Result<ApiCredential, StorageError>;
+    async fn write_audit(&self, event: &AuditEvent) -> Result<(), StorageError>;
+    async fn create_tenant(&self, tenant: &Tenant) -> Result<(), StorageError>;
+    async fn list_tenants(
+        &self,
+        tenant_id: Option<TenantId>,
+        limit: u16,
+        offset: u32,
+    ) -> Result<Vec<Tenant>, StorageError>;
+    async fn create_domain(&self, domain: &Domain) -> Result<(), StorageError>;
+    async fn list_domains(
+        &self,
+        tenant_id: TenantId,
+        limit: u16,
+        offset: u32,
+    ) -> Result<Vec<Domain>, StorageError>;
+    async fn create_user(&self, user: &User) -> Result<(), StorageError>;
+    async fn create_user_with_password(
+        &self,
+        user: &User,
+        password_hash: &str,
+    ) -> Result<(), StorageError>;
+    async fn list_users(
+        &self,
+        tenant_id: TenantId,
+        limit: u16,
+        offset: u32,
+    ) -> Result<Vec<User>, StorageError>;
+    async fn create_alias(&self, alias: &Alias) -> Result<(), StorageError>;
+    async fn list_aliases(
+        &self,
+        tenant_id: TenantId,
+        limit: u16,
+        offset: u32,
+    ) -> Result<Vec<Alias>, StorageError>;
+    async fn create_mailbox(&self, mailbox: &Mailbox) -> Result<(), StorageError>;
+    async fn allocate_mailbox_item(
+        &self,
+        mailbox_id: MailboxId,
+    ) -> Result<MailboxAllocation, StorageError>;
+    async fn consume_quota(&self, tenant_id: TenantId, bytes: u64) -> Result<(), StorageError>;
+    async fn lease_queue(
+        &self,
+        worker: Uuid,
+        limit: u32,
+        duration: Duration,
+    ) -> Result<Vec<QueueLease>, StorageError>;
+
+    async fn read_message_chunk(
+        &self,
+        _message_id: Uuid,
+        _offset: u64,
+        _limit: u32,
+    ) -> Result<Vec<u8>, StorageError> {
+        Err(StorageError::Unavailable(
+            "message streaming is unsupported".into(),
+        ))
+    }
+
+    async fn finish_delivery(
+        &self,
+        _queue_id: QueueId,
+        _lease_token: Uuid,
+        _outcome: &DeliveryOutcome,
+    ) -> Result<(), StorageError> {
+        Err(StorageError::Unavailable(
+            "delivery completion is unsupported".into(),
+        ))
+    }
+}
+
+#[async_trait]
+pub trait AdminRepository: MailRepository {
+    async fn get_tenant(&self, _id: TenantId) -> Result<Versioned<Tenant>, StorageError> {
+        Err(StorageError::NotFound)
+    }
+    async fn update_tenant(&self, _tenant: &Tenant, _expected: i64) -> Result<i64, StorageError> {
+        Err(StorageError::NotFound)
+    }
+    async fn get_domain(
+        &self,
+        _tenant: TenantId,
+        _id: mail_domain::DomainId,
+    ) -> Result<Versioned<Domain>, StorageError> {
+        Err(StorageError::NotFound)
+    }
+    async fn update_domain(&self, _domain: &Domain, _expected: i64) -> Result<i64, StorageError> {
+        Err(StorageError::NotFound)
+    }
+    async fn get_user(
+        &self,
+        _tenant: TenantId,
+        _id: mail_domain::UserId,
+    ) -> Result<Versioned<User>, StorageError> {
+        Err(StorageError::NotFound)
+    }
+    async fn update_user(&self, _user: &User, _expected: i64) -> Result<i64, StorageError> {
+        Err(StorageError::NotFound)
+    }
+    async fn set_user_password(
+        &self,
+        _tenant: TenantId,
+        _user: mail_domain::UserId,
+        _hash: &str,
+    ) -> Result<(), StorageError> {
+        Err(StorageError::NotFound)
+    }
+    async fn unlock_user(
+        &self,
+        _tenant: TenantId,
+        _user: mail_domain::UserId,
+    ) -> Result<(), StorageError> {
+        Err(StorageError::NotFound)
+    }
+    async fn get_alias(
+        &self,
+        _tenant: TenantId,
+        _id: mail_domain::AliasId,
+    ) -> Result<Versioned<Alias>, StorageError> {
+        Err(StorageError::NotFound)
+    }
+    async fn update_alias(&self, _alias: &Alias, _expected: i64) -> Result<i64, StorageError> {
+        Err(StorageError::NotFound)
+    }
+    async fn delete_alias(
+        &self,
+        _tenant: TenantId,
+        _id: mail_domain::AliasId,
+        _expected: i64,
+    ) -> Result<(), StorageError> {
+        Err(StorageError::NotFound)
+    }
+    async fn list_mailboxes(
+        &self,
+        _tenant: TenantId,
+        _user: mail_domain::UserId,
+        _limit: u16,
+    ) -> Result<Vec<MailboxInfo>, StorageError> {
+        Ok(Vec::new())
+    }
+    async fn get_mailbox(
+        &self,
+        _tenant: TenantId,
+        _user: mail_domain::UserId,
+        _id: MailboxId,
+    ) -> Result<MailboxInfo, StorageError> {
+        Err(StorageError::NotFound)
+    }
+    async fn update_mailbox_name(
+        &self,
+        _tenant: TenantId,
+        _user: mail_domain::UserId,
+        _id: MailboxId,
+        _name: &str,
+        _expected: i64,
+    ) -> Result<i64, StorageError> {
+        Err(StorageError::NotFound)
+    }
+    async fn delete_mailbox(
+        &self,
+        _tenant: TenantId,
+        _user: mail_domain::UserId,
+        _id: MailboxId,
+        _expected: i64,
+    ) -> Result<(), StorageError> {
+        Err(StorageError::NotFound)
+    }
+    async fn create_application_password(
+        &self,
+        _tenant: TenantId,
+        _user: mail_domain::UserId,
+        _id: Uuid,
+        _name: &str,
+        _hash: &str,
+    ) -> Result<ApplicationPasswordInfo, StorageError> {
+        Err(StorageError::NotFound)
+    }
+    async fn list_application_passwords(
+        &self,
+        _tenant: TenantId,
+        _user: mail_domain::UserId,
+    ) -> Result<Vec<ApplicationPasswordInfo>, StorageError> {
+        Ok(Vec::new())
+    }
+    async fn revoke_application_password(
+        &self,
+        _tenant: TenantId,
+        _user: mail_domain::UserId,
+        _id: Uuid,
+    ) -> Result<(), StorageError> {
+        Err(StorageError::NotFound)
+    }
+    async fn create_api_token(
+        &self,
+        _info: &ApiTokenInfo,
+        _hash: &[u8],
+        _creator: Uuid,
+        _expires_at: Option<&str>,
+        _networks: &[String],
+    ) -> Result<(), StorageError> {
+        Err(StorageError::NotFound)
+    }
+    async fn list_api_tokens(
+        &self,
+        _tenant: Option<TenantId>,
+        _limit: u16,
+    ) -> Result<Vec<ApiTokenInfo>, StorageError> {
+        Ok(Vec::new())
+    }
+    async fn revoke_api_token(
+        &self,
+        _tenant: Option<TenantId>,
+        _id: Uuid,
+    ) -> Result<(), StorageError> {
+        Err(StorageError::NotFound)
+    }
+    async fn list_audit(
+        &self,
+        _tenant: Option<TenantId>,
+        _limit: u16,
+    ) -> Result<Vec<AuditRecord>, StorageError> {
+        Ok(Vec::new())
+    }
+    async fn idempotency_get(
+        &self,
+        _tenant: TenantId,
+        _key: &str,
+        _operation: &str,
+    ) -> Result<Option<IdempotencyRecord>, StorageError> {
+        Ok(None)
+    }
+    async fn idempotency_begin(
+        &self,
+        _tenant: TenantId,
+        _key: &str,
+        _operation: &str,
+        _request_hash: &[u8],
+    ) -> Result<(), StorageError> {
+        Ok(())
+    }
+    async fn idempotency_finish(
+        &self,
+        _tenant: TenantId,
+        _key: &str,
+        _operation: &str,
+        _status: u16,
+        _body: &str,
+    ) -> Result<(), StorageError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+pub trait SmtpRepository: Send + Sync {
+    async fn recover_smtp_ingestions(&self) -> Result<u64, StorageError>;
+    async fn resolve_local_recipient(
+        &self,
+        address: &str,
+    ) -> Result<Option<LocalRecipient>, StorageError>;
+    async fn begin_smtp_ingestion(&self) -> Result<Uuid, StorageError>;
+    async fn append_smtp_chunk(
+        &self,
+        ingestion_id: Uuid,
+        position: u32,
+        bytes: &[u8],
+    ) -> Result<(), StorageError>;
+    async fn commit_smtp_ingestion(
+        &self,
+        ingestion_id: Uuid,
+        envelope_sender: &str,
+        recipients: &[LocalRecipient],
+        received_header: &[u8],
+    ) -> Result<StoredMessage, StorageError>;
+    async fn abort_smtp_ingestion(&self, ingestion_id: Uuid) -> Result<(), StorageError>;
+}

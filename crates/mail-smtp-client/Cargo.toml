@@ -1,0 +1,15 @@
+[package]
+name = "mail-smtp-client"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mail-dns = { path = "../mail-dns" }
+mail-storage = { path = "../mail-storage" }
+thiserror.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true
