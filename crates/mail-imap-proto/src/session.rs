@@ -63,6 +63,7 @@ impl Session {
             "NAMESPACE".into(),
             "UIDPLUS".into(),
             "MOVE".into(),
+            "BINARY".into(),
         ];
         if self.tls_available && !self.tls_active && self.state == State::NotAuthenticated {
             values.extend(["STARTTLS".into(), "LOGINDISABLED".into()]);

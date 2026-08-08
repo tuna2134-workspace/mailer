@@ -16,7 +16,7 @@
 ## Changed files
 
 - `crates/mail-imap-proto/src/parser.rs`, `session.rs`, and `lib.rs`
-- `crates/mail-imap-server/src/lib.rs` and `commands.rs`
+- `crates/mail-imap-server/src/lib.rs`, `commands.rs`, `commands/fetch.rs`, and `commands/search.rs`
 - `crates/mail-storage/src/lib.rs`
 - `crates/mail-postgres/src/lib.rs` and `imap.rs`
 - `migrations/202608070009_phase10_imap.sql`
@@ -41,12 +41,12 @@
 
 ## Known limitations
 
-- SEARCH currently implements `ALL`, `SEEN`, `UNSEEN`, `DELETED`, and `UNDELETED`; the remaining RFC 9051 search keys are not implemented and return tagged `BAD`.
-- FETCH returns raw full-message data for BODY/RFC822 requests and supports byte partials, but section-specific MIME extraction and a complete ENVELOPE/BODYSTRUCTURE serializer remain unimplemented.
-- APPEND flags and client-supplied INTERNALDATE are not yet accepted. APPEND is bounded by the listener literal limit (64 KiB by default), so large-literal database streaming remains pending.
-- STORE applies a multi-message set as individually atomic mutations; command-wide rollback is pending.
+- SEARCH now implements boolean groups, `OR`, `NOT`, flags/keywords, sequence and UID sets, headers, BODY/TEXT, size, internal date, and sent-date keys. Charset conversion, `$`, MODSEQ, and legacy RECENT-dependent keys remain unavailable.
+- FETCH implements nested MIME part addressing, HEADER.FIELDS/HEADER.FIELDS.NOT, byte partials, RFC822 variants, BINARY/BINARY.PEEK/BINARY.SIZE decoding, parsed address lists, and bounded recursive BODYSTRUCTURE serialization. Extended BODYSTRUCTURE data and all message/rfc822 section corner cases remain pending.
+- APPEND accepts flags and client-supplied INTERNALDATE. It remains bounded by the listener literal limit (64 KiB by default), so large-literal database streaming remains pending.
+- Multi-message STORE now locks all target rows and rolls back the whole command on any conflict.
 - Expunged-message garbage collection and tenant physical-byte reclamation remain the deletion-workflow responsibility.
 
 ## Next
 
-Complete the listed Phase 10 conformance gaps before Phase 11 synchronization (`IDLE`, `CONDSTORE`, and `QRESYNC`).
+Complete large-literal streaming and the remaining FETCH serialization edge cases before Phase 10 is marked complete and Phase 11 synchronization (`IDLE`, `CONDSTORE`, and `QRESYNC`) begins.

@@ -4,8 +4,9 @@ use mail_domain::{
 };
 use mail_mailbox::{FlagSet, StoreMode, SystemFlag};
 use mail_postgres::PostgresRepository;
-use mail_storage::{ImapRepository, MailRepository, StoreFlags};
+use mail_storage::{ImapAppend, ImapRepository, MailRepository, StoreFlags};
 use sqlx::postgres::PgPoolOptions;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 #[tokio::test]
@@ -63,17 +64,57 @@ async fn phase10_mailbox_message_and_uid_contract() -> Result<(), Box<dyn std::e
     repository
         .imap_subscribe(user_id.into_uuid(), "Archive", true)
         .await?;
+    let append_flags = FlagSet::new([SystemFlag::Seen], [])?;
+    let append_date = UNIX_EPOCH + Duration::from_secs(1_786_104_000);
     let (validity, uid) = repository
-        .imap_append(user_id.into_uuid(), "INBOX", b"Subject: test\r\n\r\nbody")
+        .imap_append(
+            user_id.into_uuid(),
+            "INBOX",
+            &ImapAppend {
+                raw: b"Subject: test\r\n\r\nbody",
+                flags: &append_flags,
+                internal_date: append_date,
+            },
+        )
         .await?;
     assert_eq!(validity, inbox.uid_validity);
     assert_eq!(uid, 1);
-    assert_eq!(
+    let appended = repository
+        .imap_messages(user_id.into_uuid(), inbox.id)
+        .await?;
+    assert_eq!(appended.len(), 1);
+    assert!(appended[0].flags.iter().any(|flag| flag == "\\Seen"));
+    assert_eq!(appended[0].internal_date, append_date);
+
+    let (_, second_uid) = repository
+        .imap_append(
+            user_id.into_uuid(),
+            "INBOX",
+            &ImapAppend {
+                raw: b"Subject: second\r\n\r\nbody",
+                flags: &FlagSet::default(),
+                internal_date: SystemTime::now(),
+            },
+        )
+        .await?;
+    let flagged = StoreFlags {
+        mode: StoreMode::Add,
+        values: FlagSet::new([SystemFlag::Flagged], [])?,
+        unchanged_since: None,
+    };
+    assert!(
         repository
+            .imap_store_flags(user_id.into_uuid(), inbox.id, &[uid, 999], &flagged)
+            .await
+            .is_err()
+    );
+    assert!(
+        !repository
             .imap_messages(user_id.into_uuid(), inbox.id)
-            .await?
-            .len(),
-        1
+            .await?[0]
+            .flags
+            .iter()
+            .any(|flag| flag == "\\Flagged")
     );
 
     let seen = StoreFlags {
@@ -111,10 +152,50 @@ async fn phase10_mailbox_message_and_uid_contract() -> Result<(), Box<dyn std::e
         [uid]
     );
     assert!(
+        !repository
+            .imap_messages(user_id.into_uuid(), inbox.id)
+            .await?
+            .is_empty()
+    );
+    repository
+        .imap_store_flags(user_id.into_uuid(), inbox.id, &[second_uid], &deleted)
+        .await?;
+    repository
+        .imap_expunge(user_id.into_uuid(), inbox.id, None)
+        .await?;
+    assert!(
         repository
             .imap_messages(user_id.into_uuid(), inbox.id)
             .await?
             .is_empty()
+    );
+    repository
+        .imap_append(
+            user_id.into_uuid(),
+            "INBOX",
+            &ImapAppend {
+                raw: b"Subject: rename\r\n\r\nbody",
+                flags: &FlagSet::default(),
+                internal_date: SystemTime::now(),
+            },
+        )
+        .await?;
+    repository
+        .imap_rename_mailbox(user_id.into_uuid(), "INBOX", "Renamed")
+        .await?;
+    let mailboxes = repository.imap_mailboxes(user_id.into_uuid()).await?;
+    let renamed = mailboxes
+        .iter()
+        .find(|mailbox| mailbox.name == "Renamed")
+        .ok_or("renamed mailbox")?;
+    assert_eq!(renamed.message_count, 1);
+    assert_eq!(
+        mailboxes
+            .iter()
+            .find(|mailbox| mailbox.name == "INBOX")
+            .ok_or("INBOX")?
+            .message_count,
+        0
     );
     assert!(
         repository

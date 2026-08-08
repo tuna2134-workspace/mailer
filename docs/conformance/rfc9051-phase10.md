@@ -14,7 +14,7 @@ Requirement: Message access commands MUST distinguish sequence numbers from UIDs
 Implementation: `crates/mail-imap-server/src/commands.rs`, `crates/mail-postgres/src/imap.rs`  
 Test: `phase10_mailbox_message_and_uid_contract`; `patterns_and_partial_fetch`  
 Status: partial  
-Notes: Core operations and UID forms are implemented. SEARCH keys, FETCH sections/BODYSTRUCTURE, APPEND options, and command-wide multi-message STORE rollback remain incomplete.
+Notes: Core operations and UID forms, broad SEARCH keys, nested MIME FETCH sections, APPEND options, and command-wide STORE rollback are implemented. Large APPEND streaming and extended BODYSTRUCTURE/message-rfc822 edge cases remain incomplete.
 
 RFC: RFC 4315  
 Section: 3  

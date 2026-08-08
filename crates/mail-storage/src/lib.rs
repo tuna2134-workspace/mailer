@@ -119,6 +119,13 @@ pub struct ImapMessage {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImapAppend<'a> {
+    pub raw: &'a [u8],
+    pub flags: &'a FlagSet,
+    pub internal_date: SystemTime,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoreFlags {
     pub mode: StoreMode,
     pub values: FlagSet,
@@ -628,7 +635,7 @@ pub trait ImapRepository: Send + Sync {
         &self,
         _user_id: Uuid,
         _mailbox: &str,
-        _raw: &[u8],
+        _append: &ImapAppend<'_>,
     ) -> Result<(u32, u32), StorageError> {
         Err(StorageError::Unavailable(
             "IMAP APPEND is unsupported".into(),

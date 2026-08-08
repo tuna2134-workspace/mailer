@@ -71,6 +71,8 @@ pub enum CommandBody {
     Check,
     Append {
         mailbox: MailboxName,
+        flags: Option<String>,
+        internal_date: Option<String>,
         message: Vec<u8>,
     },
     Fetch {
@@ -85,7 +87,7 @@ pub enum CommandBody {
         uid: bool,
     },
     Search {
-        criteria: String,
+        criteria: Vec<AString>,
         uid: bool,
     },
     Copy {
@@ -201,15 +203,12 @@ pub fn parse_command(line: &[u8], literals: &[Vec<u8>]) -> Result<Command, Parse
         "UNSELECT" if args.is_empty() => CommandBody::Unselect,
         "CHECK" if args.is_empty() => CommandBody::Check,
         "APPEND" if args.len() >= 2 && literals.len() == 1 && args.last() == literals.first() => {
-            CommandBody::Append {
-                mailbox: mailbox(&args[0])?,
-                message: args.last().cloned().ok_or(ParseError::InvalidSyntax)?,
-            }
+            append(args)?
         }
         "FETCH" if args.len() >= 2 => fetch(args, false)?,
         "STORE" if args.len() >= 3 => store(args, false)?,
         "SEARCH" if !args.is_empty() => CommandBody::Search {
-            criteria: join_ascii(args)?,
+            criteria: args.iter().cloned().map(AString).collect(),
             uid: false,
         },
         "COPY" | "MOVE" if args.len() == 2 => copy(args, name == "MOVE", false)?,
@@ -235,6 +234,30 @@ fn select(args: &[Vec<u8>], examine: bool) -> Result<CommandBody, ParseError> {
     Ok(CommandBody::Select {
         mailbox: mailbox(&args[0])?,
         examine,
+    })
+}
+
+fn append(args: &[Vec<u8>]) -> Result<CommandBody, ParseError> {
+    let options = &args[1..args.len() - 1];
+    let (flags, rest) = if options.first().is_some_and(|value| value.starts_with(b"(")) {
+        let end = options
+            .iter()
+            .position(|value| value.ends_with(b")"))
+            .ok_or(ParseError::InvalidSyntax)?;
+        (Some(join_ascii(&options[..=end])?), &options[end + 1..])
+    } else {
+        (None, options)
+    };
+    let internal_date = match rest {
+        [] => None,
+        [date] => Some(ascii(date)?),
+        _ => return Err(ParseError::InvalidSyntax),
+    };
+    Ok(CommandBody::Append {
+        mailbox: mailbox(&args[0])?,
+        flags,
+        internal_date,
+        message: args.last().cloned().ok_or(ParseError::InvalidSyntax)?,
     })
 }
 
@@ -271,7 +294,7 @@ fn uid_command(args: &[Vec<u8>]) -> Result<CommandBody, ParseError> {
         "FETCH" if args.len() >= 2 => fetch(args, true),
         "STORE" if args.len() >= 3 => store(args, true),
         "SEARCH" if !args.is_empty() => Ok(CommandBody::Search {
-            criteria: join_ascii(args)?,
+            criteria: args.iter().cloned().map(AString).collect(),
             uid: true,
         }),
         "COPY" | "MOVE" if args.len() == 2 => copy(args, command == "MOVE", true),
@@ -446,6 +469,18 @@ mod tests {
         assert!(matches!(
             parse_command(b"A3 APPEND INBOX {4}\r\n", &[b"test".to_vec()])?.body,
             CommandBody::Append { .. }
+        ));
+        assert!(matches!(
+            parse_command(
+                b"A3 APPEND INBOX (\\Seen custom) \"7-Aug-2026 12:00:00 +0000\" {4}\r\n",
+                &[b"test".to_vec()]
+            )?
+            .body,
+            CommandBody::Append {
+                flags: Some(_),
+                internal_date: Some(_),
+                ..
+            }
         ));
         assert!(matches!(
             parse_command(b"A4 MOVE 2:4 Archive\r\n", &[])?.body,

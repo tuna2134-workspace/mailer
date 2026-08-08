@@ -1,8 +1,13 @@
+mod fetch;
+mod search;
+
 use mail_imap_proto::{CommandBody, MailboxName, SequenceSet, SequenceValue};
 use mail_mailbox::{FlagSet, StoreMode, SystemFlag};
-use mail_storage::{ImapMailbox, ImapMessage, ImapRepository, StorageError, StoreFlags};
-use std::collections::BTreeSet;
-use time::{OffsetDateTime, format_description::well_known::Rfc2822};
+use mail_storage::{
+    ImapAppend, ImapMailbox, ImapMessage, ImapRepository, StorageError, StoreFlags,
+};
+use std::time::SystemTime;
+use time::{OffsetDateTime, format_description};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -124,22 +129,72 @@ pub async fn execute<R: ImapRepository>(
                 .into_iter()
                 .find(|item| item.name.eq_ignore_ascii_case(name))
                 .ok_or(CommandError::No("mailbox not found"))?;
-            let upper = items.to_ascii_uppercase();
+            let requested = items
+                .trim_matches(|character| matches!(character, '(' | ')'))
+                .split_whitespace()
+                .map(str::to_ascii_uppercase)
+                .collect::<Vec<_>>();
+            if requested.is_empty()
+                || requested.iter().any(|item| {
+                    !matches!(
+                        item.as_str(),
+                        "MESSAGES"
+                            | "UNSEEN"
+                            | "UIDNEXT"
+                            | "UIDVALIDITY"
+                            | "HIGHESTMODSEQ"
+                            | "DELETED"
+                            | "SIZE"
+                    )
+                })
+            {
+                return Err(CommandError::Bad("unknown STATUS item"));
+            }
             let mut values = Vec::new();
-            if upper.contains("MESSAGES") {
+            if requested.iter().any(|item| item == "MESSAGES") {
                 values.push(format!("MESSAGES {}", mailbox.message_count));
             }
-            if upper.contains("UNSEEN") {
+            if requested.iter().any(|item| item == "UNSEEN") {
                 values.push(format!("UNSEEN {}", mailbox.unseen_count));
             }
-            if upper.contains("UIDNEXT") {
+            if requested.iter().any(|item| item == "UIDNEXT") {
                 values.push(format!("UIDNEXT {}", mailbox.uid_next));
             }
-            if upper.contains("UIDVALIDITY") {
+            if requested.iter().any(|item| item == "UIDVALIDITY") {
                 values.push(format!("UIDVALIDITY {}", mailbox.uid_validity));
             }
-            if upper.contains("HIGHESTMODSEQ") {
+            if requested.iter().any(|item| item == "HIGHESTMODSEQ") {
                 values.push(format!("HIGHESTMODSEQ {}", mailbox.highest_modseq));
+            }
+            if requested
+                .iter()
+                .any(|item| matches!(item.as_str(), "DELETED" | "SIZE"))
+            {
+                let messages = repo
+                    .imap_messages(user, mailbox.id)
+                    .await
+                    .map_err(storage)?;
+                if requested.iter().any(|item| item == "DELETED") {
+                    values.push(format!(
+                        "DELETED {}",
+                        messages
+                            .iter()
+                            .filter(|message| message
+                                .flags
+                                .iter()
+                                .any(|flag| flag.eq_ignore_ascii_case("\\Deleted")))
+                            .count()
+                    ));
+                }
+                if requested.iter().any(|item| item == "SIZE") {
+                    values.push(format!(
+                        "SIZE {}",
+                        messages
+                            .iter()
+                            .map(|message| message.raw.len())
+                            .sum::<usize>()
+                    ));
+                }
             }
             out.responses.push(
                 format!(
@@ -171,9 +226,32 @@ pub async fn execute<R: ImapRepository>(
             out.unselect = true;
             out.completion = "CLOSE completed".into();
         }
-        CommandBody::Append { mailbox, message } => {
+        CommandBody::Append {
+            mailbox,
+            flags,
+            internal_date,
+            message,
+        } => {
+            let flags = flags
+                .as_deref()
+                .map(|value| store_update("FLAGS", value).map(|update| update.values))
+                .transpose()?
+                .unwrap_or_default();
+            let internal_date = internal_date
+                .as_deref()
+                .map(parse_internal_date)
+                .transpose()?
+                .unwrap_or_else(SystemTime::now);
             let (validity, uid) = repo
-                .imap_append(user, text(&mailbox)?, &message)
+                .imap_append(
+                    user,
+                    text(&mailbox)?,
+                    &ImapAppend {
+                        raw: &message,
+                        flags: &flags,
+                        internal_date,
+                    },
+                )
                 .await
                 .map_err(storage)?;
             out.completion = format!("[APPENDUID {validity} {uid}] APPEND completed");
@@ -195,8 +273,11 @@ pub async fn execute<R: ImapRepository>(
                 .map_err(storage)?;
             let upper = items.to_ascii_uppercase();
             if !selected.read_only
-                && (upper.contains("BODY[") || upper.contains("RFC822"))
+                && (upper.contains("BODY[")
+                    || upper.contains("RFC822")
+                    || upper.contains("BINARY["))
                 && !upper.contains("BODY.PEEK[")
+                && !upper.contains("BINARY.PEEK[")
                 && !upper.contains("RFC822.PEEK")
             {
                 let uids = chosen(&messages, &set, uid)
@@ -218,7 +299,7 @@ pub async fn execute<R: ImapRepository>(
                     .map_err(storage)?;
             }
             for message in chosen(&messages, &set, uid) {
-                out.responses.push(fetch_response(message, &items));
+                out.responses.push(fetch::response(message, &items));
             }
             out.completion = "FETCH completed".into();
         }
@@ -228,7 +309,7 @@ pub async fn execute<R: ImapRepository>(
                 .imap_messages(user, selected.mailbox.id)
                 .await
                 .map_err(storage)?;
-            let found = search(&messages, &criteria)?;
+            let found = search::messages(&messages, &criteria)?;
             out.responses.push(
                 format!(
                     "* SEARCH {}\r\n",
@@ -363,6 +444,16 @@ fn text(name: &MailboxName) -> Result<&str, CommandError> {
     std::str::from_utf8(name.as_bytes())
         .map_err(|_| CommandError::Bad("mailbox name must be UTF-8"))
 }
+
+fn parse_internal_date(value: &str) -> Result<SystemTime, CommandError> {
+    let format = format_description::parse_borrowed::<2>(
+        "[day padding:none]-[month repr:short]-[year] [hour]:[minute]:[second] [offset_hour sign:mandatory][offset_minute]",
+    )
+    .map_err(|_| CommandError::Bad("invalid APPEND date-time"))?;
+    OffsetDateTime::parse(value, &format)
+        .map(SystemTime::from)
+        .map_err(|_| CommandError::Bad("invalid APPEND date-time"))
+}
 #[allow(clippy::needless_pass_by_value)] // Result::map_err supplies an owned value.
 fn storage(error: StorageError) -> CommandError {
     match error {
@@ -457,73 +548,6 @@ fn store_update(operation: &str, flags: &str) -> Result<StoreFlags, CommandError
         unchanged_since: None,
     })
 }
-fn fetch_response(message: &ImapMessage, items: &str) -> Vec<u8> {
-    let upper = items.to_ascii_uppercase();
-    let mut fields = Vec::new();
-    if upper.contains("FLAGS") {
-        fields.push(format!("FLAGS ({})", message.flags.join(" ")).into_bytes());
-    }
-    if upper.contains("UID") {
-        fields.push(format!("UID {}", message.uid).into_bytes());
-    }
-    if upper.contains("RFC822.SIZE") {
-        fields.push(format!("RFC822.SIZE {}", message.raw.len()).into_bytes());
-    }
-    if upper.contains("INTERNALDATE") {
-        let date = OffsetDateTime::from(message.internal_date)
-            .format(&Rfc2822)
-            .unwrap_or_else(|_| "Thu, 1 Jan 1970 00:00:00 +0000".into());
-        fields.push(format!("INTERNALDATE \"{date}\"").into_bytes());
-    }
-    if upper.contains("BODY") || upper.contains("RFC822") {
-        let (offset, count) = partial(&upper).unwrap_or((0, message.raw.len()));
-        let end = offset.saturating_add(count).min(message.raw.len());
-        let bytes = message.raw.get(offset..end).unwrap_or_default();
-        let mut field = format!("BODY[]<{offset}> {{{}}}\r\n", bytes.len()).into_bytes();
-        field.extend_from_slice(bytes);
-        fields.push(field);
-    }
-    let mut response = format!("* {} FETCH (", message.sequence).into_bytes();
-    for (index, field) in fields.iter().enumerate() {
-        if index > 0 {
-            response.push(b' ');
-        }
-        response.extend_from_slice(field);
-    }
-    response.extend_from_slice(b")\r\n");
-    response
-}
-fn partial(value: &str) -> Option<(usize, usize)> {
-    let start = value.find('<')? + 1;
-    let end = value[start..].find('>')? + start;
-    let (offset, count) = value[start..end].split_once('.')?;
-    Some((offset.parse().ok()?, count.parse().ok()?))
-}
-fn search<'a>(
-    messages: &'a [ImapMessage],
-    criteria: &str,
-) -> Result<Vec<&'a ImapMessage>, CommandError> {
-    let terms = criteria
-        .trim_matches(|c| c == '(' || c == ')')
-        .split_whitespace()
-        .map(str::to_ascii_uppercase)
-        .collect::<BTreeSet<_>>();
-    let known = ["ALL", "SEEN", "UNSEEN", "DELETED", "UNDELETED"];
-    if terms.iter().any(|term| !known.contains(&term.as_str())) {
-        return Err(CommandError::Bad("unsupported search criterion"));
-    }
-    Ok(messages
-        .iter()
-        .filter(|m| {
-            let seen = m.flags.iter().any(|f| f.eq_ignore_ascii_case("\\Seen"));
-            let deleted = m.flags.iter().any(|f| f.eq_ignore_ascii_case("\\Deleted"));
-            (!terms.contains("SEEN") || seen)
-                && (!terms.contains("UNSEEN") || !seen)
-                && (!terms.contains("DELETED") || deleted)
-                && (!terms.contains("UNDELETED") || !deleted)
-        })
-        .collect())
-}
 fn join_numbers(values: &[u32]) -> String {
     values
         .iter()
@@ -539,6 +563,5 @@ mod tests {
     fn patterns_and_partial_fetch() {
         assert!(matches_pattern("Archive/2026", "Archive/%"));
         assert!(!matches_pattern("Archive/2026/Aug", "Archive/%"));
-        assert_eq!(partial("BODY[]<2.4>"), Some((2, 4)));
     }
 }
