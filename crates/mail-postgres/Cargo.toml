@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 async-trait.workspace = true
 mail-domain = { path = "../mail-domain" }
+mail-dsn = { path = "../mail-dsn" }
 mail-mailbox = { path = "../mail-mailbox" }
 mail-storage = { path = "../mail-storage" }
 sqlx.workspace = true

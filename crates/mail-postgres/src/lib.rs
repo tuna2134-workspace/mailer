@@ -7,6 +7,7 @@ use mail_domain::{
     Alias, AliasId, AliasKind, Domain, DomainId, DomainName, EntityStatus, LocalPart, Mailbox,
     MailboxId, QuotaBytes, Tenant, TenantId, User, UserId,
 };
+use mail_dsn::{FailureNotice, failure_message};
 use mail_mailbox::{FlagSet, StoreMode, SystemFlag};
 use mail_storage::{
     AdminRepository, ApiCredential, ApiTokenInfo, ApplicationPasswordInfo, AuditEvent, AuditRecord,
@@ -505,10 +506,17 @@ impl MailRepository for PostgresRepository {
                     .filter(|domain| !domain.is_empty() && !sender.contains(['\r', '\n']))
                 {
                     let message_id = Uuid::new_v4();
-                    let bounce = format!(
-                        "From: Mail Delivery System <MAILER-DAEMON@localhost>\r\nTo: <{sender}>\r\nSubject: Delivery Status Notification (Failure)\r\nAuto-Submitted: auto-generated\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nDelivery failed permanently.\r\n\r\n{}\r\n",
-                        diagnostic.chars().take(2_000).collect::<String>()
-                    ).into_bytes();
+                    let bounce = failure_message(&FailureNotice {
+                        sender: "MAILER-DAEMON@localhost",
+                        recipient: &sender,
+                        original_recipient: None,
+                        action: "failed",
+                        status: "5.0.0",
+                        diagnostic: &diagnostic.chars().take(2_000).collect::<String>(),
+                        remote_mta: None,
+                        envelope_id: None,
+                    })
+                    .map_err(|error| StorageError::Unavailable(error.to_string()))?;
                     sqlx::query("INSERT INTO messages(id,tenant_id,raw_message,envelope_sender,envelope_recipients,received_at,message_size,content_hash,storage_state) VALUES($1,$2,$3,'',ARRAY[$4],clock_timestamp(),octet_length($3),digest($3,'sha256'),'committed')")
                         .bind(message_id).bind(tenant_id).bind(&bounce).bind(&sender)
                         .execute(&mut *tx).await.map_err(map_sqlx)?;

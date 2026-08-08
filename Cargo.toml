@@ -27,6 +27,7 @@ members = [
     "crates/mail-dkim",
     "crates/mail-dmarc",
     "crates/mail-arc",
+    "crates/mail-dsn",
     "bins/mail-migrate",
     "bins/mailctl",
     "bins/maild",
