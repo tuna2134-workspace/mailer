@@ -30,6 +30,10 @@ Phase 13 is complete for bounded RFC 3464 DSN and RFC 8098 MDN generation, SMTP 
 
 Phase 14 implements the bounded Sieve core parser/evaluator, actions, variables, and execution budgets; ManageSieve transport and optional extension providers remain explicit service boundaries; see `docs/phase-14-report.md`.
 
+Phase 15 implements local MTA-STS/TLS-RPT/DANE/REQUIRETLS policy parsing and decisions, including a DNSSEC Secure requirement for TLSA use; HTTPS policy retrieval, resolver validation, and report aggregation remain external adapters; see `docs/phase-15-report.md`.
+
+Phase 16 implements bounded mailing-list header generation, RFC 8058 one-click markers, authenticated VERP, bounce correlation, hop/List-Id loop rejection, and DMARC/ARC-aware From mitigation; see `docs/phase-16-report.md`.
+
 ## Phase 1 detailed plan
 
 1. Create only domain/application/storage/PostgreSQL/migration/testkit crates and migration binary.

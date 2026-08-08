@@ -29,6 +29,8 @@ members = [
     "crates/mail-arc",
     "crates/mail-dsn",
     "crates/mail-sieve",
+    "crates/mail-policy",
+    "crates/mail-list",
     "bins/mail-migrate",
     "bins/mailctl",
     "bins/maild",

@@ -9,6 +9,9 @@ pub enum Action {
     FileInto(String),
     Redirect(String),
     Reject(String),
+    Vacation(String),
+    Notify(String),
+    EditHeader { name: String, value: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -282,13 +285,20 @@ impl Parser<'_> {
                     self.punct(b';')?;
                     Command::Require(cap)
                 }
-                "keep" | "discard" | "reject" | "redirect" | "fileinto" => {
+                "keep" | "discard" | "reject" | "redirect" | "fileinto" | "vacation" | "notify"
+                | "addheader" => {
                     let action = match word.as_str() {
                         "keep" => Action::Keep,
                         "discard" => Action::Discard,
                         "reject" => Action::Reject(self.string()?),
                         "redirect" => Action::Redirect(self.string()?),
-                        _ => Action::FileInto(self.string()?),
+                        "fileinto" => Action::FileInto(self.string()?),
+                        "vacation" => Action::Vacation(self.string()?),
+                        "notify" => Action::Notify(self.string()?),
+                        _ => Action::EditHeader {
+                            name: self.string()?,
+                            value: self.string()?,
+                        },
                     };
                     self.punct(b';')?;
                     Command::Action(action)

@@ -1603,6 +1603,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mail-list"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "ring",
+ "subtle",
+ "thiserror",
+]
+
+[[package]]
 name = "mail-mailbox"
 version = "0.1.0"
 dependencies = [
@@ -1646,6 +1656,13 @@ dependencies = [
  "mail-message",
  "proptest",
  "quoted_printable",
+ "thiserror",
+]
+
+[[package]]
+name = "mail-policy"
+version = "0.1.0"
+dependencies = [
  "thiserror",
 ]
 
