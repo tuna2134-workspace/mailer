@@ -4,7 +4,7 @@ use rustls::{
     ServerConfig,
     crypto::ring::default_provider,
     pki_types::{CertificateDer, PrivateKeyDer},
-    server::{ResolvesServerCert, ResolvesServerCertUsingSni},
+    server::{ClientHello, ResolvesServerCert, ResolvesServerCertUsingSni},
     sign::CertifiedKey,
 };
 use std::{collections::BTreeMap, io::Cursor, sync::Arc};
@@ -31,6 +31,20 @@ pub struct PemIdentity {
     pub private_key: Vec<u8>,
 }
 
+#[derive(Debug)]
+struct SniResolverWithDefault {
+    sni: ResolvesServerCertUsingSni,
+    default: Arc<CertifiedKey>,
+}
+
+impl ResolvesServerCert for SniResolverWithDefault {
+    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        self.sni
+            .resolve(client_hello)
+            .or_else(|| Some(Arc::clone(&self.default)))
+    }
+}
+
 pub fn certified_key(identity: &PemIdentity) -> Result<CertifiedKey, TlsError> {
     let certificates: Vec<CertificateDer<'static>> =
         rustls_pemfile::certs(&mut Cursor::new(&identity.certificate_chain))
@@ -49,17 +63,23 @@ pub fn certified_key(identity: &PemIdentity) -> Result<CertifiedKey, TlsError> {
 
 pub fn sni_resolver(identities: &[PemIdentity]) -> Result<Arc<dyn ResolvesServerCert>, TlsError> {
     let mut resolver = ResolvesServerCertUsingSni::new();
+    let default = identities.first().ok_or(TlsError::EmptyCertificate)?;
+    let default = Arc::new(certified_key(default)?);
     for identity in identities {
+        let key = certified_key(identity)?;
         for name in &identity.names {
             resolver
-                .add(name, certified_key(identity)?)
+                .add(name, key.clone())
                 .map_err(|error| TlsError::InvalidSni {
                     name: name.clone(),
                     reason: error.to_string(),
                 })?;
         }
     }
-    Ok(Arc::new(resolver))
+    Ok(Arc::new(SniResolverWithDefault {
+        sni: resolver,
+        default,
+    }))
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
