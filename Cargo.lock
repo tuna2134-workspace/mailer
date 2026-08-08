@@ -1688,6 +1688,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mail-sieve"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "mail-smtp-client"
 version = "0.1.0"
 dependencies = [

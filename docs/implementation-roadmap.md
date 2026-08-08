@@ -28,6 +28,8 @@ Phase 12 is complete for SPF, DKIM, DMARC, ARC, aggregate/failure report builder
 
 Phase 13 is complete for bounded RFC 3464 DSN and RFC 8098 MDN generation, SMTP failure-queue integration, null reverse-path bounce delivery, and injection guards; see `docs/phase-13-report.md`.
 
+Phase 14 implements the bounded Sieve core parser/evaluator, actions, variables, and execution budgets; ManageSieve transport and optional extension providers remain explicit service boundaries; see `docs/phase-14-report.md`.
+
 ## Phase 1 detailed plan
 
 1. Create only domain/application/storage/PostgreSQL/migration/testkit crates and migration binary.
