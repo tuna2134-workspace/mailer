@@ -408,4 +408,18 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn rfc_matrix_has_no_untracked_implementation_placeholders() {
+        let matrix = include_str!("../../../docs/rfc-matrix.md");
+        assert!(!matrix.contains("planned:"));
+        for line in matrix.lines().filter(|line| line.starts_with('|')) {
+            if line.contains("| full |") || line.contains("| F |") {
+                assert!(
+                    !line.contains("| none |"),
+                    "full claim lacks a test: {line}"
+                );
+            }
+        }
+    }
 }

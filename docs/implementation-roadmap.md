@@ -36,6 +36,8 @@ Phase 16 implements bounded mailing-list header generation, RFC 8058 one-click m
 
 Phase 17 implements bounded S/MIME and OpenPGP/MIME envelope recognition plus RFC 2231 parameter decoding. CMS/OpenPGP cryptography, private-key custody, and user key lifecycle remain explicit external security-provider boundaries; see `docs/phase-17-report.md`.
 
+Phase 18 is the conformance and release-hardening phase. It removes untracked implementation placeholders, requires every full claim to name a runnable test, and classifies optional or externally owned protocols explicitly; see `docs/phase-18-report.md`.
+
 ## Phase 1 detailed plan
 
 1. Create only domain/application/storage/PostgreSQL/migration/testkit crates and migration binary.

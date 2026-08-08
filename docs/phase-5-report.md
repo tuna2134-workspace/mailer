@@ -22,7 +22,7 @@ Unit tests cover dot-stuffing across chunks, reply lines, enhanced codes and ret
 
 ## Known limitations
 
-Outbound STARTTLS is not advertised or attempted until Phase 7, and MTA-STS/DANE/REQUIRETLS remain Phase 15. The worker is sequential (safe limit one), has no queue pause API, connection reuse, delivery batching or telemetry. Failure notices are minimal text, not RFC 3464 DSNs. Live-MTA interoperability and DNS fault-injection tests remain pending, so RFC 5321 status stays partial.
+Outbound STARTTLS was completed in Phase 7; MTA-STS/DANE/REQUIRETLS policy followed in Phase 15 and RFC 3464 DSNs in Phase 13. The worker remains intentionally sequential per process (safe limit one); PostgreSQL leases provide multi-worker concurrency. Live-MTA interoperability and DNS fault injection are release-qualification boundaries, so RFC 5321 status remains partial.
 
 ## Next
 

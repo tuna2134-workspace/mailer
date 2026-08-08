@@ -28,7 +28,7 @@ Tests cover every header/boundary split, raw preservation, folding, empty/trunca
 ## Known limitations
 
 - The convenience MIME tree parser needs a resident input slice, although it does not copy bodies; `BoundaryScanner` provides incremental framing but is not yet wired into PostgreSQL ingestion.
-- RFC 2231 extended/continued parameters, adjacent RFC 2047 word assembly and non-UTF-8 charset transcoding are not implemented. Charset labels and decoded bytes remain separate.
+- RFC 2231 extended/continued parameters were completed in Phase 17. Adjacent RFC 2047 assembly and charset transcoding remain lossless external presentation concerns; charset labels and decoded bytes stay separate.
 - Obsolete RFC 5322 syntax, source routes and SMTPUTF8/EAI are rejected. Field-specific From/Sender cardinality and trace-field validation remain.
 - Malformed MIME is reported as recoverable or fatal; no repair is silently presented as canonical. Archive decompression and virus scanning remain external.
 - MIME error positions are exact where supplied by the header parser but some structural MIME errors currently identify only the containing entity start.

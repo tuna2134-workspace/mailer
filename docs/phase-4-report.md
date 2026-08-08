@@ -36,6 +36,6 @@ Status: Phase 4 SMTP receiving subset implemented. RFC 5321 is marked partial, n
 ## Known limitations
 
 - Address literals, quoted local-parts, obsolete source routes, aliases/catch-all expansion and SMTPUTF8 await the address and extension phases.
-- EHLO advertises no extensions yet; SIZE, PIPELINING, 8BITMIME, STARTTLS and AUTH remain Phase 7.
+- At this checkpoint EHLO advertised no extensions; SIZE, PIPELINING, 8BITMIME, STARTTLS and AUTH were subsequently completed in Phase 7.
 - Accepted messages are local deliveries only. MX lookup, remote delivery, queue retry, bounce and DSN begin in Phase 5.
 - A `cargo-fuzz` SMTP command/DATA-line target and an idle-timeout test are present. RFC 5321 status remains partial because later extensions and address syntax are separate phases.

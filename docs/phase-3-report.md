@@ -1,6 +1,6 @@
 # Phase 3 implementation report
 
-Status: TLS/ACME infrastructure complete; protocol-specific STARTTLS state resets remain in their SMTP/IMAP phases.
+Status: TLS/ACME infrastructure complete; protocol-specific STARTTLS state resets were completed in the SMTP and IMAP phases.
 
 ## Implemented
 

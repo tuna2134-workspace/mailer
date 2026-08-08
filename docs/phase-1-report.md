@@ -39,4 +39,4 @@ No protocol or untrusted-message parser was added. SQL uses bound parameters. Te
 
 ## Standards impact
 
-No SMTP, IMAP or MIME RFC behavior is claimed implemented. This phase establishes storage invariants needed by RFC 9051 UID/UIDVALIDITY/MODSEQ work, but conformance status remains `not implemented` until protocol code and mapped tests exist.
+At the Phase 1 checkpoint no SMTP, IMAP or MIME behavior was claimed. Those protocol implementations and mapped tests were subsequently added in Phases 4-17; this report remains the historical storage-foundation record.
