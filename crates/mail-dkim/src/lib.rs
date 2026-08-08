@@ -210,6 +210,56 @@ pub fn sign_headers(
     .into_bytes())
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn sign_headers_named(
+    header_name: &str,
+    leading_tags: &str,
+    message_headers: &[u8],
+    precomputed_body_hash: &str,
+    domain: &str,
+    selector: &str,
+    key: SigningKey,
+    headers: &[&str],
+) -> Result<Vec<u8>, DkimError> {
+    if header_name.contains(['\r', '\n', ':']) || leading_tags.contains(['\r', '\n']) {
+        return Err(DkimError::Malformed);
+    }
+    let algorithm = algorithm_name(&key);
+    let unsigned = format!(
+        "{leading_tags}a={algorithm}; c=relaxed:relaxed; d={domain}; s={selector}; h={}; bh={precomputed_body_hash}; b=",
+        headers.join(":")
+    );
+    let line = format!("{header_name}: {unsigned}\r\n");
+    let signing = signing_input(
+        message_headers,
+        line.as_bytes(),
+        headers,
+        Canonicalization::Relaxed,
+    );
+    let signature = sign_bytes(&signing, key)?;
+    Ok(format!(
+        "{header_name}: {unsigned}{}\r\n",
+        STANDARD.encode(signature)
+    )
+    .into_bytes())
+}
+
+pub fn sign_signature_data(
+    unsigned_header: &[u8],
+    mut signing_data: Vec<u8>,
+    key: SigningKey,
+) -> Result<Vec<u8>, DkimError> {
+    signing_data.extend(canonicalize_header_relaxed(unsigned_header));
+    let signature = sign_bytes(&signing_data, key)?;
+    let mut header = unsigned_header
+        .strip_suffix(b"\r\n")
+        .ok_or(DkimError::Malformed)?
+        .to_vec();
+    header.extend_from_slice(STANDARD.encode(signature).as_bytes());
+    header.extend_from_slice(b"\r\n");
+    Ok(header)
+}
+
 pub fn verify(message: &[u8], dkim_header: &[u8], public_key: &[u8]) -> Result<bool, DkimError> {
     let tags = parse_tags(dkim_header)?;
     let algorithm = tags.get("a").ok_or(DkimError::Malformed)?;
@@ -230,7 +280,7 @@ pub fn verify(message: &[u8], dkim_header: &[u8], public_key: &[u8]) -> Result<b
         Canonicalization::Simple
     };
     let (_, body) = split_body(message);
-    if tags.get("bh") != Some(&body_hash(body, body_canon)) {
+    if tags.get("bh").map(|value| compact(value)) != Some(body_hash(body, body_canon)) {
         return Ok(false);
     }
     let names = tags.get("h").ok_or(DkimError::Malformed)?.split(':');
@@ -238,7 +288,7 @@ pub fn verify(message: &[u8], dkim_header: &[u8], public_key: &[u8]) -> Result<b
     let unsigned = remove_tag_value(dkim_header, "b")?;
     let signing = signing_input(message, &unsigned, &header_names, header_canon);
     let signature_bytes = STANDARD
-        .decode(tags.get("b").ok_or(DkimError::Malformed)?)
+        .decode(compact(tags.get("b").ok_or(DkimError::Malformed)?))
         .map_err(|_| DkimError::Malformed)?;
     let valid = match algorithm.as_str() {
         "rsa-sha256" => {
@@ -261,7 +311,7 @@ pub fn verify_headers(
     precomputed_body_hash: &str,
 ) -> Result<bool, DkimError> {
     let tags = parse_tags(dkim_header)?;
-    if tags.get("bh").map(String::as_str) != Some(precomputed_body_hash) {
+    if tags.get("bh").map(|value| compact(value)) != Some(precomputed_body_hash.to_owned()) {
         return Ok(false);
     }
     let algorithm = tags.get("a").ok_or(DkimError::Malformed)?;
@@ -281,7 +331,7 @@ pub fn verify_headers(
     let unsigned = remove_tag_value(dkim_header, "b")?;
     let signing = signing_input(message_headers, &unsigned, &names, header_canon);
     let signature_bytes = STANDARD
-        .decode(tags.get("b").ok_or(DkimError::Malformed)?)
+        .decode(compact(tags.get("b").ok_or(DkimError::Malformed)?))
         .map_err(|_| DkimError::Malformed)?;
     match algorithm.as_str() {
         "rsa-sha256" => Ok(signature::UnparsedPublicKey::new(
@@ -322,6 +372,41 @@ pub fn body_canonicalization(dkim_header: &[u8]) -> Result<Canonicalization, Dki
     )
 }
 
+pub fn signature_header_without_b(header: &[u8]) -> Result<Vec<u8>, DkimError> {
+    remove_tag_value(header, "b")
+}
+
+#[must_use]
+pub fn canonicalize_header_relaxed(header: &[u8]) -> Vec<u8> {
+    canonicalize_header(header, Canonicalization::Relaxed)
+}
+
+pub fn verify_signature_data(
+    signature_header: &[u8],
+    public_key: &[u8],
+    signing_data: &[u8],
+) -> Result<bool, DkimError> {
+    let tags = parse_tags(signature_header)?;
+    let signature_bytes = STANDARD
+        .decode(compact(tags.get("b").ok_or(DkimError::Malformed)?))
+        .map_err(|_| DkimError::Malformed)?;
+    match tags.get("a").map(String::as_str) {
+        Some("rsa-sha256") => Ok(signature::UnparsedPublicKey::new(
+            &signature::RSA_PKCS1_2048_8192_SHA256,
+            public_key,
+        )
+        .verify(signing_data, &signature_bytes)
+        .is_ok()),
+        Some("ed25519-sha256") => Ok(signature::UnparsedPublicKey::new(
+            &signature::ED25519,
+            public_key,
+        )
+        .verify(signing_data, &signature_bytes)
+        .is_ok()),
+        _ => Err(DkimError::Algorithm),
+    }
+}
+
 fn sign_bytes(data: &[u8], key: SigningKey) -> Result<Vec<u8>, DkimError> {
     match key {
         SigningKey::RsaPkcs8(der) => {
@@ -340,6 +425,13 @@ fn sign_bytes(data: &[u8], key: SigningKey) -> Result<Vec<u8>, DkimError> {
         SigningKey::Ed25519Pkcs8(der) => signature::Ed25519KeyPair::from_pkcs8(&der)
             .map(|pair| pair.sign(data).as_ref().to_vec())
             .map_err(|error| DkimError::Key(error.to_string())),
+    }
+}
+
+fn algorithm_name(key: &SigningKey) -> &'static str {
+    match key {
+        SigningKey::RsaPkcs8(_) => "rsa-sha256",
+        SigningKey::Ed25519Pkcs8(_) => "ed25519-sha256",
     }
 }
 fn split_body(message: &[u8]) -> (&[u8], &[u8]) {
@@ -367,14 +459,33 @@ fn signing_input(
     signing
 }
 fn find_header<'a>(headers: &'a [u8], name: &str) -> Option<&'a [u8]> {
-    headers
-        .split_inclusive(|byte| *byte == b'\n')
-        .rev()
-        .find(|line| {
-            line.get(..name.len())
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(name.as_bytes()))
-                && line.get(name.len()) == Some(&b':')
-        })
+    let mut found = None;
+    let mut start = 0;
+    let mut field_start = 0;
+    while start < headers.len() {
+        let end = headers[start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(headers.len(), |offset| start + offset + 1);
+        if !matches!(headers.get(start), Some(b' ' | b'\t')) {
+            if header_name_matches(&headers[field_start..start], name) {
+                found = Some(&headers[field_start..start]);
+            }
+            field_start = start;
+        }
+        start = end;
+    }
+    if header_name_matches(&headers[field_start..], name) {
+        found = Some(&headers[field_start..]);
+    }
+    found
+}
+
+fn header_name_matches(field: &[u8], name: &str) -> bool {
+    field
+        .get(..name.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(name.as_bytes()))
+        && field.get(name.len()) == Some(&b':')
 }
 fn canonicalize_header(line: &[u8], mode: Canonicalization) -> Vec<u8> {
     if mode == Canonicalization::Simple {
@@ -422,11 +533,12 @@ fn canon_name(mode: Canonicalization) -> &'static str {
     }
 }
 fn parse_tags(header: &[u8]) -> Result<std::collections::HashMap<String, String>, DkimError> {
-    let value = std::str::from_utf8(header)
+    let text = std::str::from_utf8(header)
         .map_err(|_| DkimError::Malformed)?
         .split_once(':')
         .ok_or(DkimError::Malformed)?
         .1;
+    let value = text.replace("\r\n", "\n").replace(['\n', '\t'], " ");
     value
         .split(';')
         .map(str::trim)
@@ -437,6 +549,10 @@ fn parse_tags(header: &[u8]) -> Result<std::collections::HashMap<String, String>
                 .map(|(key, value)| (key.trim().to_owned(), value.trim().to_owned()))
         })
         .collect()
+}
+
+fn compact(value: &str) -> String {
+    value.split_ascii_whitespace().collect()
 }
 fn remove_tag_value(header: &[u8], target: &str) -> Result<Vec<u8>, DkimError> {
     let text = std::str::from_utf8(header).map_err(|_| DkimError::Malformed)?;
@@ -494,6 +610,15 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn signed_header_lookup_includes_continuation_lines() {
+        let headers = b"From: a@example.test\r\nSubject: first\r\n second\r\nDate: now\r\n";
+        assert_eq!(
+            find_header(headers, "Subject"),
+            Some(b"Subject: first\r\n second\r\n".as_slice())
+        );
     }
 
     #[test]

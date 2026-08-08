@@ -6,7 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+mail-dkim = { path = "../mail-dkim" }
 thiserror.workspace = true
+
+[dev-dependencies]
+ring.workspace = true
 
 [lints]
 workspace = true

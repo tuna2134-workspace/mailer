@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod arc_validation;
 mod auth;
 mod authentication;
 

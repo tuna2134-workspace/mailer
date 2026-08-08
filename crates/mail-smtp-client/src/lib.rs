@@ -4,6 +4,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use mail_arc::{ArcSealConfig, ChainStatus, seal as seal_arc};
 use mail_dkim::{BodyHasher, Canonicalization, SigningKey, sign_headers};
 use mail_dns::{MailHost, MailRoute};
 use mail_storage::{MailRepository, QueueLease, StorageError};
@@ -511,7 +512,7 @@ async fn prepare_dkim<R: MailRepository>(
         return Ok(Err("message has no RFC 5322 header/body separator".into()));
     }
     let hash = body.finish();
-    Ok(sign_headers(
+    let dkim = match sign_headers(
         &headers,
         &hash,
         &config.domain,
@@ -520,8 +521,62 @@ async fn prepare_dkim<R: MailRepository>(
         &["From", "To", "Cc", "Subject", "Date", "Message-ID"],
         Canonicalization::Relaxed,
         Canonicalization::Relaxed,
-    )
-    .map_err(|error| format!("DKIM signing failed: {error}")))
+    ) {
+        Ok(header) => header,
+        Err(error) => return Ok(Err(format!("DKIM signing failed: {error}"))),
+    };
+    Ok(add_arc(&headers, &hash, config, dkim))
+}
+
+fn add_arc(
+    headers: &[u8],
+    hash: &str,
+    config: &DkimSigningConfig,
+    dkim: Vec<u8>,
+) -> Result<Vec<u8>, String> {
+    let text = String::from_utf8_lossy(headers);
+    let authentication_results = text
+        .lines()
+        .find_map(|line| line.strip_prefix("Authentication-Results:"))
+        .map(str::trim);
+    let Some(authentication_results) = authentication_results else {
+        return Ok(dkim);
+    };
+    let chain_status = if authentication_results.contains("arc=pass") {
+        ChainStatus::Pass
+    } else if authentication_results.contains("arc=fail") {
+        ChainStatus::Fail
+    } else {
+        ChainStatus::None
+    };
+    let owned = text
+        .lines()
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.starts_with("ARC-")
+                .then(|| (name.to_owned(), value.trim().to_owned()))
+        })
+        .collect::<Vec<_>>();
+    let existing = owned
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect::<Vec<_>>();
+    let arc = match seal_arc(
+        headers,
+        hash,
+        authentication_results,
+        &existing,
+        chain_status,
+        &ArcSealConfig {
+            domain: config.domain.clone(),
+            selector: config.selector.clone(),
+            key: config.key.clone(),
+        },
+    ) {
+        Ok(header) => header,
+        Err(error) => return Err(format!("ARC sealing failed: {error}")),
+    };
+    Ok([arc, dkim].concat())
 }
 
 fn has_line_break(value: &str) -> bool {

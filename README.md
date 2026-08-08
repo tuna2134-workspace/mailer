@@ -218,7 +218,7 @@ cargo run -p mailctl -- user --help
 - SPF、DKIM、DMARC
 - 必要に応じてMTA-STSとTLS-RPT
 
-TCP/25で受信したメッセージは、保存確定前にSPF、DKIM、DMARCを評価し、信頼境界側で生成した`Authentication-Results`と`Received-SPF`を付与します。DKIM本文ハッシュはPostgreSQLの受信chunkからストリーミング計算されます。現時点のDMARC discoveryはHeader Fromドメインの直接`_dmarc` recordが対象で、PSLを使う組織ドメインfallbackは未実装です。ARCは構文用crateのみで、暗号検証・seal生成は配送経路へ未接続です。
+TCP/25で受信したメッセージは、保存確定前にSPF、DKIM、DMARC、ARCを評価し、信頼境界側で生成した`Authentication-Results`と`Received-SPF`を付与します。DKIM/ARCの本文ハッシュはPostgreSQLの受信chunkからストリーミング計算されます。DMARC discoveryとrelaxed alignmentはMozilla Public Suffix Listに基づく組織ドメインfallbackを使用します。ARCは最新AMSと全ARC-SealをDNS公開鍵で検証し、構造検査だけでは`arc=pass`にしません。DKIMを設定したqueue workerは、受信認証結果を持つ中継メッセージへ同じ管理鍵で新しいAAR、AMS、ARC-Sealを追加します。
 
 outbound DKIM署名を有効にする場合は、queue workerへ次をすべて設定します。秘密鍵fileはPKCS#8 DER形式で、未設定時は意図的に署名しません。不完全な設定や署名失敗時はメールを未署名で送らず、一時失敗としてqueueへ戻します。
 

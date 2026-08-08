@@ -1,7 +1,10 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use mail_address::{Address, AddressLimits, parse_address_list};
 use mail_dkim::{BodyHasher, Canonicalization, body_canonicalization, identity, verify_headers};
-use mail_dmarc::{Authentication, evaluate as evaluate_dmarc, parse as parse_dmarc};
+use mail_dmarc::{
+    Authentication, DmarcPolicy, evaluate as evaluate_dmarc, organizational_domain,
+    parse as parse_dmarc,
+};
 use mail_dns::MailResolver;
 use mail_policy::{AuthenticationResult, authentication_results};
 use mail_spf::{SpfContext, SpfResult, evaluate};
@@ -95,44 +98,53 @@ impl InboundAuthenticator {
             result: dkim,
             property: dkim_domain.as_deref().map(|domain| ("header.d", domain)),
         });
+        results.push(AuthenticationResult {
+            method: "arc",
+            result: crate::arc_validation::validate(
+                &scanned.headers,
+                &scanned.simple_hash,
+                &scanned.relaxed_hash,
+                &self.resolver,
+            )
+            .await,
+            property: None,
+        });
         let from_domain = from_domain(&scanned.headers);
         let (dmarc, policy_domain) = match from_domain.as_deref() {
             None => ("permerror", None),
-            Some(domain) => match self.resolver.txt(&format!("_dmarc.{domain}")).await {
-                Err(_) => ("temperror", Some(domain)),
-                Ok(records) => match records
-                    .iter()
-                    .find(|record| record.trim_start().starts_with("v=DMARC1"))
-                {
-                    None => ("none", Some(domain)),
-                    Some(record) => match parse_dmarc(record) {
-                        Err(_) => ("permerror", Some(domain)),
-                        Ok(policy) => {
-                            let spf_domain = spf_sender
-                                .rsplit_once('@')
-                                .map_or(Some(spf_sender.clone()), |(_, domain)| {
-                                    Some(domain.to_owned())
-                                });
-                            let evaluated = evaluate_dmarc(
-                                &policy,
-                                &Authentication {
-                                    header_from: domain.to_owned(),
-                                    dkim_domain: dkim_domain.clone(),
-                                    dkim_pass: dkim == "pass",
-                                    spf_domain,
-                                    spf_pass: spf == SpfResult::Pass,
-                                },
-                            );
-                            (if evaluated.pass { "pass" } else { "fail" }, Some(domain))
-                        }
-                    },
-                },
+            Some(domain) => match discover_dmarc(&self.resolver, domain).await {
+                Err(DmarcDiscoveryError::Temporary) => ("temperror", Some(domain.to_owned())),
+                Err(DmarcDiscoveryError::Permanent) => ("permerror", Some(domain.to_owned())),
+                Ok(None) => ("none", Some(domain.to_owned())),
+                Ok(Some((policy_domain, policy))) => {
+                    let spf_domain = spf_sender
+                        .rsplit_once('@')
+                        .map_or(Some(spf_sender.clone()), |(_, domain)| {
+                            Some(domain.to_owned())
+                        });
+                    let evaluated = evaluate_dmarc(
+                        &policy,
+                        &Authentication {
+                            header_from: domain.to_owned(),
+                            dkim_domain: dkim_domain.clone(),
+                            dkim_pass: dkim == "pass",
+                            spf_domain,
+                            spf_pass: spf == SpfResult::Pass,
+                        },
+                    );
+                    (
+                        if evaluated.pass { "pass" } else { "fail" },
+                        Some(policy_domain),
+                    )
+                }
             },
         };
         results.push(AuthenticationResult {
             method: "dmarc",
             result: dmarc,
-            property: policy_domain.map(|domain| ("header.from", domain)),
+            property: policy_domain
+                .as_deref()
+                .map(|domain| ("header.from", domain)),
         });
         let value = authentication_results(&self.authserv_id, &results)
             .map_err(|error| StorageError::Unavailable(error.to_string()))?;
@@ -217,7 +229,7 @@ fn header_fields(headers: &[u8], name: &[u8]) -> Vec<Vec<u8>> {
     fields
 }
 
-fn dkim_key(record: &str) -> Option<Vec<u8>> {
+pub(super) fn dkim_key(record: &str) -> Option<Vec<u8>> {
     if !record.split(';').any(|tag| tag.trim() == "v=DKIM1") {
         return None;
     }
@@ -230,6 +242,42 @@ fn dkim_key(record: &str) -> Option<Vec<u8>> {
     STANDARD
         .decode(value.split_ascii_whitespace().collect::<String>())
         .ok()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DmarcDiscoveryError {
+    Temporary,
+    Permanent,
+}
+
+async fn discover_dmarc(
+    resolver: &MailResolver,
+    from_domain: &str,
+) -> Result<Option<(String, DmarcPolicy)>, DmarcDiscoveryError> {
+    let organizational = organizational_domain(from_domain);
+    let mut domains = vec![from_domain];
+    if organizational != from_domain {
+        domains.push(&organizational);
+    }
+    for domain in domains {
+        let records = resolver
+            .txt(&format!("_dmarc.{domain}"))
+            .await
+            .map_err(|_| DmarcDiscoveryError::Temporary)?;
+        let matching = records
+            .iter()
+            .filter(|record| record.trim_start().starts_with("v=DMARC1"))
+            .collect::<Vec<_>>();
+        match matching.as_slice() {
+            [] => {}
+            [record] => {
+                let policy = parse_dmarc(record).map_err(|_| DmarcDiscoveryError::Permanent)?;
+                return Ok(Some((domain.to_owned(), policy)));
+            }
+            _ => return Err(DmarcDiscoveryError::Permanent),
+        }
+    }
+    Ok(None)
 }
 
 fn from_domain(headers: &[u8]) -> Option<String> {

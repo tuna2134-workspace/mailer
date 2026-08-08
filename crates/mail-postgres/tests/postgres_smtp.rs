@@ -122,6 +122,15 @@ async fn streaming_ingestion_and_atomic_local_delivery() -> Result<(), Box<dyn s
     repository
         .append_smtp_chunk(ingestion, 1, b"\r\nbody\r\n")
         .await?;
+    assert_eq!(
+        repository.read_smtp_chunk(ingestion, 0).await?,
+        b"Subject: stored\r\n"
+    );
+    assert_eq!(
+        repository.read_smtp_chunk(ingestion, 1).await?,
+        b"\r\nbody\r\n"
+    );
+    assert!(repository.read_smtp_chunk(ingestion, 2).await?.is_empty());
     let stored = repository
         .commit_smtp_ingestion(
             ingestion,

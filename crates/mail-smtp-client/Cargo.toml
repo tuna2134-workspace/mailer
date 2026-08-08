@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+mail-arc = { path = "../mail-arc" }
 mail-dkim = { path = "../mail-dkim" }
 mail-dns = { path = "../mail-dns" }
 mail-storage = { path = "../mail-storage" }

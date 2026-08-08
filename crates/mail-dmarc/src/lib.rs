@@ -172,18 +172,12 @@ pub fn failure_report(report: &FailureReport, body_inclusion: bool) -> String {
     )
 }
 
+#[must_use]
 pub fn organizational_domain(domain: &str) -> String {
-    let labels = domain
-        .trim_end_matches('.')
-        .to_ascii_lowercase()
-        .split('.')
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    if labels.len() <= 2 {
-        labels.join(".")
-    } else {
-        labels[labels.len() - 2..].join(".")
-    }
+    let normalized = domain.trim_end_matches('.').to_ascii_lowercase();
+    psl::domain_str(&normalized)
+        .unwrap_or(&normalized)
+        .to_owned()
 }
 fn aligned(a: &str, b: &str, mode: Alignment) -> bool {
     let a = a.trim_end_matches('.').to_ascii_lowercase();
@@ -279,5 +273,11 @@ mod tests {
             )
             .contains("[redacted]")
         );
+    }
+
+    #[test]
+    fn organizational_domain_uses_public_suffix_list() {
+        assert_eq!(organizational_domain("mx.example.co.uk"), "example.co.uk");
+        assert_eq!(organizational_domain("EXAMPLE.COM."), "example.com");
     }
 }

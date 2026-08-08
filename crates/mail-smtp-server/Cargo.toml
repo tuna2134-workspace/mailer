@@ -9,6 +9,7 @@ license.workspace = true
 argon2.workspace = true
 base64.workspace = true
 mail-address = { path = "../mail-address" }
+mail-arc = { path = "../mail-arc" }
 mail-dkim = { path = "../mail-dkim" }
 mail-dmarc = { path = "../mail-dmarc" }
 mail-dns = { path = "../mail-dns" }
