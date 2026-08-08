@@ -181,6 +181,7 @@ pub struct QueueLease {
     pub envelope_sender: String,
     pub require_tls: bool,
     pub smtp_utf8: bool,
+    pub authentication_results_trust: AuthenticationResultsTrust,
     pub dsn_ret: Option<String>,
     pub envelope_id: Option<String>,
     pub dsn_notify: Option<String>,
@@ -192,9 +193,20 @@ pub struct QueueLease {
     pub expires_at: SystemTime,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AuthenticationResultsTrust {
+    #[default]
+    Untrusted,
+    LocallyGenerated,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DeliveryOutcome {
     Delivered,
+    Ambiguous {
+        next_attempt_at: SystemTime,
+        diagnostic: String,
+    },
     Deferred {
         next_attempt_at: SystemTime,
         enhanced_status_code: Option<String>,
@@ -219,6 +231,7 @@ pub struct LocalRecipient {
 pub struct SmtpMailOptions {
     pub smtp_utf8: bool,
     pub require_tls: bool,
+    pub authentication_results_trust: AuthenticationResultsTrust,
     pub dsn_ret: Option<String>,
     pub envelope_id: Option<String>,
     pub deliver_by_at: Option<SystemTime>,

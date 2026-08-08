@@ -261,6 +261,8 @@ cargo test -p mail-postgres --tests
 
 ## セキュリティ上の注意
 
+非root実行、`CAP_NET_BIND_SERVICE`、systemd/container sandboxの具体例は [docs/deployment-hardening.md](docs/deployment-hardening.md) を参照してください。
+
 - 管理APIをpublic networkへ直接bindしないでください。
 - ACME cache key、API token、password、DKIM/private keyをログやshell履歴へ残さないでください。
 - production ACMEへ切り替える前にstagingで検証してください。

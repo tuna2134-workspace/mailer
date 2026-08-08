@@ -4,9 +4,9 @@ RFC: RFC 8601
 Section: 2
 Requirement: Authentication-Results values identify the authentication service and methods without permitting injected fields.
 Implementation: crates/mail-policy/src/lib.rs
-Test: authentication_results_and_auto_response_are_bounded
+Test: authentication_results_and_auto_response_are_bounded; untrusted_authentication_results_cannot_trigger_arc_sealing
 Status: partial
-Notes: Trusted-hop stripping is enforced by the receiving integration.
+Notes: Locally generated results carry explicit trusted metadata into outbound ARC sealing. External fields are preserved as untrusted content; configurable removal/rename policy remains unimplemented.
 
 RFC: RFC 3834
 Section: 4

@@ -1,5 +1,10 @@
 #![forbid(unsafe_code)]
 
+mod throttle;
+pub use throttle::{
+    AuthAttemptLimiter, LocalAuthAttemptLimiter, SourceAggregation, ThrottleDecision,
+};
+
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ring::{digest, hmac, pbkdf2};
 use std::num::NonZeroU32;

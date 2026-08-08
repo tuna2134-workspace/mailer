@@ -12,7 +12,7 @@ Requirement: Send EHLO/HELO, envelope commands and DATA; distinguish transient a
 Implementation: crates/mail-smtp-client/src/lib.rs
 Test: enhanced_status_is_strict; dot_stuffing_survives_chunk_boundaries
 Status: partial
-Notes: STARTTLS and extensions are Phase 7.
+Notes: `final_reply_loss_is_delivery_ambiguity` records loss of the final DATA reply as an at-least-once ambiguity; live-MTA interoperability remains manual.
 
 RFC: RFC 5321
 Section: 4.5.4.1

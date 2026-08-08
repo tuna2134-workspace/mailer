@@ -11,9 +11,10 @@ use mail_dsn::{FailureNotice, failure_message};
 use mail_mailbox::{FlagSet, StoreMode, SystemFlag};
 use mail_storage::{
     AdminRepository, ApiCredential, ApiTokenInfo, ApplicationPasswordInfo, AuditEvent, AuditRecord,
-    DatabaseStatus, DeliveryOutcome, IdempotencyRecord, LocalRecipient, MailRepository,
-    MailboxInfo, MailboxMessageState, MailboxRepository, MigrationStatus, PasswordCredential,
-    QueueLease, SmtpRepository, StorageError, StoreFlags, StoredMessage, Versioned,
+    AuthenticationResultsTrust, DatabaseStatus, DeliveryOutcome, IdempotencyRecord, LocalRecipient,
+    MailRepository, MailboxInfo, MailboxMessageState, MailboxRepository, MigrationStatus,
+    PasswordCredential, QueueLease, SmtpRepository, StorageError, StoreFlags, StoredMessage,
+    Versioned,
 };
 use sqlx::{PgPool, Row};
 use std::{
@@ -355,9 +356,9 @@ impl MailRepository for PostgresRepository {
         let rows = sqlx::query(
             "WITH candidates AS ( \
                 SELECT id FROM queue_recipients \
-                WHERE ((state IN ('pending','deferred') AND next_attempt_at <= clock_timestamp()) \
+                WHERE ((state IN ('pending','deferred','ambiguous') AND next_attempt_at <= clock_timestamp()) \
                     OR (state = 'leased' AND lease_expires_at <= clock_timestamp())) \
-                  OR (state IN ('pending','deferred','leased') AND expires_at <= clock_timestamp()) \
+                  OR (state IN ('pending','deferred','ambiguous','leased') AND expires_at <= clock_timestamp()) \
                 ORDER BY next_attempt_at, id FOR UPDATE SKIP LOCKED LIMIT $1 \
              ) UPDATE queue_recipients q SET state='leased', lease_owner=$2, lease_token=gen_random_uuid(), \
                  lease_expires_at=clock_timestamp() + make_interval(secs => $3::int) \
@@ -366,6 +367,7 @@ impl MailRepository for PostgresRepository {
                  (SELECT envelope_sender FROM messages WHERE id=q.message_id) AS envelope_sender, \
                  (SELECT require_tls FROM messages WHERE id=q.message_id) AS require_tls, \
                  (SELECT smtp_utf8 FROM messages WHERE id=q.message_id) AS smtp_utf8, \
+                 (SELECT authentication_results_trusted FROM messages WHERE id=q.message_id) AS authentication_results_trusted, \
                  (SELECT dsn_ret FROM messages WHERE id=q.message_id) AS dsn_ret, \
                  (SELECT envelope_id FROM messages WHERE id=q.message_id) AS envelope_id, \
                  (SELECT extract(epoch FROM deliver_by_at)::bigint FROM messages WHERE id=q.message_id) AS deliver_by_at, \
@@ -389,6 +391,14 @@ impl MailRepository for PostgresRepository {
                     envelope_sender: row.try_get("envelope_sender").map_err(map_sqlx)?,
                     require_tls: row.try_get("require_tls").map_err(map_sqlx)?,
                     smtp_utf8: row.try_get("smtp_utf8").map_err(map_sqlx)?,
+                    authentication_results_trust: if row
+                        .try_get("authentication_results_trusted")
+                        .map_err(map_sqlx)?
+                    {
+                        AuthenticationResultsTrust::LocallyGenerated
+                    } else {
+                        AuthenticationResultsTrust::Untrusted
+                    },
                     dsn_ret: row.try_get("dsn_ret").map_err(map_sqlx)?,
                     envelope_id: row.try_get("envelope_id").map_err(map_sqlx)?,
                     dsn_notify: row.try_get("dsn_notify").map_err(map_sqlx)?,
@@ -447,6 +457,15 @@ impl MailRepository for PostgresRepository {
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
         let (state, next_attempt, code, diagnostic) = match outcome {
             DeliveryOutcome::Delivered => ("delivered", None, None, None),
+            DeliveryOutcome::Ambiguous {
+                next_attempt_at,
+                diagnostic,
+            } => (
+                "ambiguous",
+                Some(*next_attempt_at),
+                Some("4.4.2"),
+                Some(diagnostic.as_str()),
+            ),
             DeliveryOutcome::Deferred {
                 next_attempt_at,
                 enhanced_status_code,
@@ -1098,8 +1117,8 @@ impl SmtpRepository for PostgresRepository {
                 .iter()
                 .map(|recipient| recipient.address.as_str())
                 .collect();
-            let size: i64 = sqlx::query_scalar("INSERT INTO messages(id,tenant_id,raw_message,envelope_sender,envelope_recipients,received_at,message_size,content_hash,storage_state,smtp_utf8,require_tls,dsn_ret,envelope_id,deliver_by_at,deliver_by_mode,deliver_by_trace,release_at) SELECT $1,$2,$3::bytea || mail_bytea_concat(content),$4,$5,clock_timestamp(),octet_length($3::bytea || mail_bytea_concat(content)),digest($3::bytea || mail_bytea_concat(content),'sha256'),'committed',$7,$8,$9,$10,to_timestamp($11),$12,$13,to_timestamp($14) FROM smtp_ingestion_chunks WHERE ingestion_id=$6 RETURNING message_size")
-                .bind(message_id).bind(tenant_id.into_uuid()).bind(&prefix).bind(envelope_sender).bind(addresses).bind(ingestion_id).bind(options.smtp_utf8).bind(options.require_tls).bind(&options.dsn_ret).bind(&options.envelope_id).bind(unix_seconds(options.deliver_by_at)?).bind(&options.deliver_by_mode).bind(options.deliver_by_trace).bind(unix_seconds(options.release_at)?)
+            let size: i64 = sqlx::query_scalar("INSERT INTO messages(id,tenant_id,raw_message,envelope_sender,envelope_recipients,received_at,message_size,content_hash,storage_state,smtp_utf8,require_tls,authentication_results_trusted,dsn_ret,envelope_id,deliver_by_at,deliver_by_mode,deliver_by_trace,release_at) SELECT $1,$2,$3::bytea || mail_bytea_concat(content),$4,$5,clock_timestamp(),octet_length($3::bytea || mail_bytea_concat(content)),digest($3::bytea || mail_bytea_concat(content),'sha256'),'committed',$7,$8,$9,$10,$11,to_timestamp($12),$13,$14,to_timestamp($15) FROM smtp_ingestion_chunks WHERE ingestion_id=$6 RETURNING message_size")
+                .bind(message_id).bind(tenant_id.into_uuid()).bind(&prefix).bind(envelope_sender).bind(addresses).bind(ingestion_id).bind(options.smtp_utf8).bind(options.require_tls).bind(options.authentication_results_trust == AuthenticationResultsTrust::LocallyGenerated).bind(&options.dsn_ret).bind(&options.envelope_id).bind(unix_seconds(options.deliver_by_at)?).bind(&options.deliver_by_mode).bind(options.deliver_by_trace).bind(unix_seconds(options.release_at)?)
                 .fetch_one(&mut *transaction).await.map_err(map_sqlx)?;
             let tenant_quota = sqlx::query("UPDATE tenants SET used_bytes=used_bytes+$2,version=version+1,updated_at=clock_timestamp() WHERE id=$1 AND used_bytes<=quota_bytes-$2")
                 .bind(tenant_id.into_uuid()).bind(size).execute(&mut *transaction).await.map_err(map_sqlx)?;
@@ -1269,8 +1288,8 @@ impl SmtpRepository for PostgresRepository {
             .iter()
             .map(|value| value.address.as_str())
             .collect();
-        let size: i64 = sqlx::query_scalar("INSERT INTO messages(id,tenant_id,raw_message,envelope_sender,envelope_recipients,received_at,message_size,content_hash,storage_state,smtp_utf8,require_tls,dsn_ret,envelope_id,deliver_by_at,deliver_by_mode,deliver_by_trace,release_at) SELECT $1,$2,$3::bytea || mail_bytea_concat(content),$4,$5,clock_timestamp(),octet_length($3::bytea || mail_bytea_concat(content)),digest($3::bytea || mail_bytea_concat(content),'sha256'),'committed',$7,$8,$9,$10,to_timestamp($11),$12,$13,to_timestamp($14) FROM smtp_ingestion_chunks WHERE ingestion_id=$6 RETURNING message_size")
-            .bind(message_id).bind(tenant_id).bind(&prefix).bind(envelope_sender).bind(addresses).bind(ingestion_id).bind(options.smtp_utf8).bind(options.require_tls).bind(&options.dsn_ret).bind(&options.envelope_id).bind(unix_seconds(options.deliver_by_at)?).bind(&options.deliver_by_mode).bind(options.deliver_by_trace).bind(unix_seconds(options.release_at)?)
+        let size: i64 = sqlx::query_scalar("INSERT INTO messages(id,tenant_id,raw_message,envelope_sender,envelope_recipients,received_at,message_size,content_hash,storage_state,smtp_utf8,require_tls,authentication_results_trusted,dsn_ret,envelope_id,deliver_by_at,deliver_by_mode,deliver_by_trace,release_at) SELECT $1,$2,$3::bytea || mail_bytea_concat(content),$4,$5,clock_timestamp(),octet_length($3::bytea || mail_bytea_concat(content)),digest($3::bytea || mail_bytea_concat(content),'sha256'),'committed',$7,$8,$9,$10,$11,to_timestamp($12),$13,$14,to_timestamp($15) FROM smtp_ingestion_chunks WHERE ingestion_id=$6 RETURNING message_size")
+            .bind(message_id).bind(tenant_id).bind(&prefix).bind(envelope_sender).bind(addresses).bind(ingestion_id).bind(options.smtp_utf8).bind(options.require_tls).bind(options.authentication_results_trust == AuthenticationResultsTrust::LocallyGenerated).bind(&options.dsn_ret).bind(&options.envelope_id).bind(unix_seconds(options.deliver_by_at)?).bind(&options.deliver_by_mode).bind(options.deliver_by_trace).bind(unix_seconds(options.release_at)?)
             .fetch_one(&mut *transaction).await.map_err(map_sqlx)?;
         let tenant_quota = sqlx::query("UPDATE tenants SET used_bytes=used_bytes+$2,version=version+1,updated_at=clock_timestamp() WHERE id=$1 AND used_bytes<=quota_bytes-$2")
             .bind(tenant_id).bind(size).execute(&mut *transaction).await.map_err(map_sqlx)?;

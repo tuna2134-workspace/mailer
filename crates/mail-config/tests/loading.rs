@@ -28,12 +28,16 @@ certificate_file = "/run/file.crt"
 private_key_file = "/run/file.key"
 [smtp]
 listen = "127.0.0.1:2525"
+data_progress_grace_seconds = 20
+data_min_bytes_per_second = 512
 "#,
     )?;
     let config = MaildConfig::load_with_environment(Some(path), environment(&[]))?;
     assert_eq!(config.database_url, "postgresql://file/db");
     assert_eq!(config.hostname, "mail.file.test");
     assert_eq!(config.smtp_listen, "127.0.0.1:2525".parse()?);
+    assert_eq!(config.smtp_data_progress_grace_seconds, 20);
+    assert_eq!(config.smtp_data_min_bytes_per_second, 512);
     assert_eq!(config.imaps_listen, "0.0.0.0:993".parse()?);
     assert!(config.manual_tls.is_some());
     assert!(config.acme.is_none());
@@ -60,6 +64,8 @@ listen = "127.0.0.1:2525"
             ("MAIL_DATABASE_URL", "postgresql://environment/db"),
             ("MAIL_HOSTNAME", "mail.environment.test"),
             ("MAIL_SMTP_LISTEN", "127.0.0.1:2025"),
+            ("MAIL_SMTP_DATA_PROGRESS_GRACE_SECONDS", "15"),
+            ("MAIL_SMTP_DATA_MIN_BYTES_PER_SECOND", "1024"),
             ("MAIL_TLS_CERT_FILE", "/run/environment.crt"),
             ("MAIL_TLS_KEY_FILE", "/run/environment.key"),
         ]),
@@ -67,6 +73,8 @@ listen = "127.0.0.1:2525"
     assert_eq!(config.database_url, "postgresql://environment/db");
     assert_eq!(config.hostname, "mail.environment.test");
     assert_eq!(config.smtp_listen, "127.0.0.1:2025".parse()?);
+    assert_eq!(config.smtp_data_progress_grace_seconds, 15);
+    assert_eq!(config.smtp_data_min_bytes_per_second, 1024);
     assert_eq!(
         config.manual_tls.as_ref().map(|tls| &tls.certificate_file),
         Some(&PathBuf::from("/run/environment.crt"))

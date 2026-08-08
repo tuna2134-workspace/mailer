@@ -1,3 +1,6 @@
+mod transport_security;
+pub use transport_security::{TlsFailureAction, TransportSecurityPolicy};
+
 use std::{
     io,
     net::SocketAddr,
@@ -7,7 +10,7 @@ use std::{
 use mail_arc::{ArcSealConfig, ChainStatus, seal as seal_arc};
 use mail_dkim::{BodyHasher, Canonicalization, SigningKey, sign_headers};
 use mail_dns::{MailHost, MailRoute};
-use mail_storage::{MailRepository, QueueLease, StorageError};
+use mail_storage::{AuthenticationResultsTrust, MailRepository, QueueLease, StorageError};
 use rustls_platform_verifier::BuilderVerifierExt;
 use thiserror::Error;
 use tokio::{
@@ -33,6 +36,9 @@ pub struct DkimSigningConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SendResult {
     Delivered,
+    Ambiguous {
+        diagnostic: String,
+    },
     Deferred {
         code: Option<String>,
         diagnostic: String,
@@ -55,6 +61,7 @@ pub struct SmtpClient {
     connect_timeout: Duration,
     command_timeout: Duration,
     dkim: Option<DkimSigningConfig>,
+    transport_security: TransportSecurityPolicy,
 }
 
 impl SmtpClient {
@@ -65,12 +72,19 @@ impl SmtpClient {
             connect_timeout: Duration::from_secs(30),
             command_timeout: Duration::from_secs(60),
             dkim: None,
+            transport_security: TransportSecurityPolicy::Opportunistic,
         }
     }
 
     #[must_use]
     pub fn with_dkim(mut self, config: DkimSigningConfig) -> Self {
         self.dkim = Some(config);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_transport_security(mut self, policy: TransportSecurityPolicy) -> Self {
+        self.transport_security = policy;
         self
     }
 
@@ -110,11 +124,29 @@ impl SmtpClient {
         let MailRoute::Hosts(hosts) = route else {
             unreachable!()
         };
+        let policy = if lease.require_tls {
+            TransportSecurityPolicy::RequireTls
+        } else {
+            self.transport_security
+        };
+        if policy == TransportSecurityPolicy::Dane {
+            return Ok(SendResult::Deferred {
+                code: Some("4.7.5".into()),
+                diagnostic: "DANE TLSA verifier is not configured".into(),
+            });
+        }
         let mut last = "no reachable mail exchanger".to_owned();
         for host in hosts {
             for address in &host.addresses {
                 match self
-                    .send_to(repository, lease, host, SocketAddr::new(*address, 25))
+                    .send_to(
+                        repository,
+                        lease,
+                        host,
+                        SocketAddr::new(*address, 25),
+                        policy,
+                        true,
+                    )
                     .await?
                 {
                     SendResult::Deferred { diagnostic, .. } => last = diagnostic,
@@ -135,6 +167,8 @@ impl SmtpClient {
         lease: &QueueLease,
         host: &MailHost,
         address: SocketAddr,
+        policy: TransportSecurityPolicy,
+        attempt_tls: bool,
     ) -> Result<SendResult, ClientError> {
         let dkim_header = match &self.dkim {
             Some(config) => match prepare_dkim(repository, lease, config).await? {
@@ -202,14 +236,31 @@ impl SmtpClient {
             if let Some(result) = classify_reply(ehlo, "EHLO", &[250]) {
                 return Ok(result);
             }
-            if starttls {
+            if starttls && attempt_tls {
                 if let Err(error) = self.write(connection.get_mut(), b"STARTTLS\r\n").await {
+                    if policy.on_tls_failure() == TlsFailureAction::RetryPlaintext {
+                        return Box::pin(
+                            self.send_to(repository, lease, host, address, policy, false),
+                        )
+                        .await;
+                    }
                     return Ok(deferred_io(host, &error));
                 }
-                if let Some(result) =
-                    classify_reply(self.reply(&mut connection).await, "STARTTLS", &[220])
-                {
-                    return Ok(result);
+                let starttls_reply = self.reply(&mut connection).await;
+                if !matches!(starttls_reply, Ok((220, _))) {
+                    if policy.on_tls_failure() == TlsFailureAction::RetryPlaintext {
+                        return Box::pin(
+                            self.send_to(repository, lease, host, address, policy, false),
+                        )
+                        .await;
+                    }
+                    return Ok(SendResult::Deferred {
+                        code: Some("4.7.5".into()),
+                        diagnostic: match starttls_reply {
+                            Ok((code, text)) => format!("STARTTLS: {code} {text}"),
+                            Err(error) => format!("STARTTLS: {error}"),
+                        },
+                    });
                 }
                 let tls = match rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
                     rustls::crypto::ring::default_provider(),
@@ -220,6 +271,12 @@ impl SmtpClient {
                 {
                     Ok(config) => config,
                     Err(error) => {
+                        if policy.on_tls_failure() == TlsFailureAction::RetryPlaintext {
+                            return Box::pin(
+                                self.send_to(repository, lease, host, address, policy, false),
+                            )
+                            .await;
+                        }
                         return Ok(SendResult::Deferred {
                             code: Some("4.7.5".into()),
                             diagnostic: format!("TLS verifier unavailable: {error}"),
@@ -229,6 +286,12 @@ impl SmtpClient {
                 let server_name = match rustls::pki_types::ServerName::try_from(host.name.clone()) {
                     Ok(name) => name,
                     Err(error) => {
+                        if policy.on_tls_failure() == TlsFailureAction::RetryPlaintext {
+                            return Box::pin(
+                                self.send_to(repository, lease, host, address, policy, false),
+                            )
+                            .await;
+                        }
                         return Ok(SendResult::Deferred {
                             code: Some("4.7.5".into()),
                             diagnostic: format!("invalid TLS server name: {error}"),
@@ -244,12 +307,24 @@ impl SmtpClient {
                 {
                     Ok(Ok(stream)) => stream,
                     Ok(Err(error)) => {
+                        if policy.on_tls_failure() == TlsFailureAction::RetryPlaintext {
+                            return Box::pin(
+                                self.send_to(repository, lease, host, address, policy, false),
+                            )
+                            .await;
+                        }
                         return Ok(SendResult::Deferred {
                             code: Some("4.7.5".into()),
                             diagnostic: format!("TLS handshake failed: {error}"),
                         });
                     }
                     Err(_) => {
+                        if policy.on_tls_failure() == TlsFailureAction::RetryPlaintext {
+                            return Box::pin(
+                                self.send_to(repository, lease, host, address, policy, false),
+                            )
+                            .await;
+                        }
                         return Ok(SendResult::Deferred {
                             code: Some("4.7.5".into()),
                             diagnostic: "TLS handshake timed out".into(),
@@ -277,7 +352,9 @@ impl SmtpClient {
                 }
             }
         }
-        if lease.require_tls && (!tls_active || !requiretls_supported) {
+        if policy.requires_tls()
+            && (!tls_active || policy.requires_requiretls() && !requiretls_supported)
+        {
             return Ok(SendResult::Deferred {
                 code: Some("4.7.5".into()),
                 diagnostic: "REQUIRETLS cannot be satisfied by destination".into(),
@@ -432,9 +509,7 @@ impl SmtpClient {
         if let Err(error) = self.write(connection.get_mut(), b".\r\n").await {
             return Ok(deferred_io(host, &error));
         }
-        if let Some(result) =
-            classify_reply(self.reply(&mut connection).await, "message body", &[250])
-        {
+        if let Some(result) = classify_final_reply(self.reply(&mut connection).await) {
             return Ok(result);
         }
         let _ = connection.get_mut().write_all(b"QUIT\r\n").await;
@@ -525,7 +600,13 @@ async fn prepare_dkim<R: MailRepository>(
         Ok(header) => header,
         Err(error) => return Ok(Err(format!("DKIM signing failed: {error}"))),
     };
-    Ok(add_arc(&headers, &hash, config, dkim))
+    Ok(add_arc(
+        &headers,
+        &hash,
+        config,
+        dkim,
+        lease.authentication_results_trust == AuthenticationResultsTrust::LocallyGenerated,
+    ))
 }
 
 fn add_arc(
@@ -533,7 +614,11 @@ fn add_arc(
     hash: &str,
     config: &DkimSigningConfig,
     dkim: Vec<u8>,
+    trusted_authentication_results: bool,
 ) -> Result<Vec<u8>, String> {
+    if !trusted_authentication_results {
+        return Ok(dkim);
+    }
     let text = String::from_utf8_lossy(headers);
     let authentication_results = text
         .lines()
@@ -615,6 +700,15 @@ fn classify_reply(
             code: Some("4.4.2".into()),
             diagnostic: format!("{stage}: {error}"),
         }),
+    }
+}
+
+fn classify_final_reply(reply: io::Result<(u16, String)>) -> Option<SendResult> {
+    match reply {
+        Err(error) => Some(SendResult::Ambiguous {
+            diagnostic: format!("final delivery status is unknown: {error}"),
+        }),
+        reply => classify_reply(reply, "message body", &[250]),
     }
 }
 
@@ -718,5 +812,33 @@ mod tests {
         assert_eq!(parse_reply_line(b"250 ok\r\n"), Some((250, false)));
         assert_eq!(parse_reply_line(b"250?bad\r\n"), None);
         assert_eq!(parse_reply_line(b"250 bare\n"), None);
+    }
+
+    #[test]
+    fn final_reply_loss_is_delivery_ambiguity() {
+        assert!(matches!(
+            classify_final_reply(Err(io::Error::new(io::ErrorKind::UnexpectedEof, "lost")),),
+            Some(SendResult::Ambiguous { .. })
+        ));
+    }
+
+    #[test]
+    fn untrusted_authentication_results_cannot_trigger_arc_sealing() {
+        let dkim = b"DKIM-Signature: test\r\n".to_vec();
+        let config = DkimSigningConfig {
+            domain: "example.test".into(),
+            selector: "selector".into(),
+            key: mail_dkim::SigningKey::Ed25519Pkcs8(vec![0; 32]),
+        };
+        assert_eq!(
+            add_arc(
+                b"Authentication-Results: attacker.example; arc=pass\r\n",
+                "hash",
+                &config,
+                dkim.clone(),
+                false,
+            ),
+            Ok(dkim)
+        );
     }
 }

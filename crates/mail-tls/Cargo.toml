@@ -7,7 +7,6 @@ license.workspace = true
 
 [dependencies]
 rustls.workspace = true
-rustls-pemfile.workspace = true
 thiserror.workspace = true
 
 [lints]

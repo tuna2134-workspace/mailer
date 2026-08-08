@@ -75,6 +75,7 @@ impl<R: MailRepository> DeliveryWorker<R> {
         Ok(
             match self.client.send(&self.repository, lease, &route).await? {
                 SendResult::Delivered => DeliveryOutcome::Delivered,
+                SendResult::Ambiguous { diagnostic } => ambiguous(lease, diagnostic),
                 SendResult::Deferred { code, diagnostic } => defer(lease, code, diagnostic),
                 SendResult::Failed { code, diagnostic } => DeliveryOutcome::Failed {
                     enhanced_status_code: code,
@@ -94,6 +95,18 @@ fn defer(lease: &QueueLease, code: Option<String>, diagnostic: String) -> Delive
     DeliveryOutcome::Deferred {
         next_attempt_at: next,
         enhanced_status_code: code,
+        diagnostic,
+    }
+}
+
+fn ambiguous(lease: &QueueLease, diagnostic: String) -> DeliveryOutcome {
+    let delay = retry_delay(lease.queue_id.into_uuid(), lease.attempt_count);
+    let next_attempt_at = SystemTime::now()
+        .checked_add(delay)
+        .unwrap_or(lease.expires_at)
+        .min(lease.expires_at);
+    DeliveryOutcome::Ambiguous {
+        next_attempt_at,
         diagnostic,
     }
 }

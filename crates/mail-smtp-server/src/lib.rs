@@ -8,12 +8,14 @@ pub use authentication::InboundAuthenticator;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use mail_message::{MessageLimits, MessageParser, ParseProgress};
+use mail_sasl::{AuthAttemptLimiter, LocalAuthAttemptLimiter};
 use mail_smtp_proto::{
     Action, Command, DataError, ParseError, Reply, Session, SessionExtensions, Transaction,
     parse_command, unstuff_data_line,
 };
 use mail_storage::{
-    LocalRecipient, SmtpMailOptions, SmtpRepository, StorageError, SubmissionRecipient,
+    AuthenticationResultsTrust, LocalRecipient, SmtpMailOptions, SmtpRepository, StorageError,
+    SubmissionRecipient,
 };
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use thiserror::Error;
@@ -49,6 +51,8 @@ pub struct SmtpConfig {
     pub max_connections: usize,
     pub command_timeout: Duration,
     pub data_timeout: Duration,
+    pub data_progress_grace: Duration,
+    pub data_min_bytes_per_second: u64,
     pub allow_bare_lf: bool,
     pub tls: Option<Arc<rustls::ServerConfig>>,
     pub auth_plain: bool,
@@ -63,6 +67,7 @@ pub struct SmtpConfig {
     pub deliver_by_min_seconds: Option<u32>,
     pub future_release_max_seconds: Option<u32>,
     pub inbound_authentication: Option<Arc<InboundAuthenticator>>,
+    pub auth_limiter: Arc<dyn AuthAttemptLimiter>,
 }
 
 impl Default for SmtpConfig {
@@ -74,6 +79,8 @@ impl Default for SmtpConfig {
             max_connections: 1024,
             command_timeout: Duration::from_secs(300),
             data_timeout: Duration::from_secs(600),
+            data_progress_grace: Duration::from_secs(30),
+            data_min_bytes_per_second: 256,
             allow_bare_lf: false,
             tls: None,
             auth_plain: false,
@@ -88,6 +95,7 @@ impl Default for SmtpConfig {
             deliver_by_min_seconds: None,
             future_release_max_seconds: None,
             inbound_authentication: None,
+            auth_limiter: Arc::new(LocalAuthAttemptLimiter::default()),
         }
     }
 }
@@ -329,7 +337,17 @@ where
                     )
                     .await?;
                 } else if mechanism == "PLAIN" {
+                    let identity = auth::decode_plain(&response).map(|(identity, _)| identity);
+                    if !auth_permitted(config, peer.ip(), identity.as_deref()).await {
+                        write_reply(&mut stream, &auth_failed()).await?;
+                        continue;
+                    }
                     let authenticated = auth::authenticate(repository, &response).await?;
+                    config.auth_limiter.record_result(
+                        peer.ip(),
+                        identity.as_deref(),
+                        authenticated.is_some(),
+                    );
                     let Some(user_id) = authenticated else {
                         write_reply(&mut stream, &auth_failed()).await?;
                         continue;
@@ -356,9 +374,15 @@ where
                         .ok()
                         .and_then(|value| String::from_utf8(value).ok());
                     let Some(client_first) = client_first else {
+                        config.auth_limiter.record_result(peer.ip(), None, false);
                         write_reply(&mut stream, &auth_failed()).await?;
                         continue;
                     };
+                    let identity = mail_sasl::client_identity(mechanism, &client_first).ok();
+                    if !auth_permitted(config, peer.ip(), identity.as_deref()).await {
+                        write_reply(&mut stream, &auth_failed()).await?;
+                        continue;
+                    }
                     let Ok((server_first, exchange)) = auth::begin_scram(
                         repository,
                         mechanism,
@@ -367,6 +391,9 @@ where
                     )
                     .await
                     else {
+                        config
+                            .auth_limiter
+                            .record_result(peer.ip(), identity.as_deref(), false);
                         write_reply(&mut stream, &auth_failed()).await?;
                         continue;
                     };
@@ -385,6 +412,11 @@ where
                         Some(value) => auth::finish_scram(repository, exchange, &value).await?,
                         None => None,
                     };
+                    config.auth_limiter.record_result(
+                        peer.ip(),
+                        identity.as_deref(),
+                        result.is_some(),
+                    );
                     if let Some((user_id, server_final)) = result {
                         authenticated_user = Some(user_id);
                         session.authentication_succeeded();
@@ -464,6 +496,11 @@ where
                     )
                     .await?;
                     let prefix = [received.as_bytes(), authentication.as_slice()].concat();
+                    let mut options = mail_options(&ingestion.transaction);
+                    if !authentication.is_empty() {
+                        options.authentication_results_trust =
+                            AuthenticationResultsTrust::LocallyGenerated;
+                    }
                     if config.authenticated_relay {
                         repository
                             .commit_submission_ingestion(
@@ -472,7 +509,7 @@ where
                                 &ingestion.transaction.reverse_path,
                                 &ingestion.submission_recipients,
                                 &prefix,
-                                &mail_options(&ingestion.transaction),
+                                &options,
                             )
                             .await
                             .map_err(storage)?;
@@ -483,7 +520,7 @@ where
                                 &ingestion.transaction.reverse_path,
                                 &ingestion.recipients,
                                 &prefix,
-                                &mail_options(&ingestion.transaction),
+                                &options,
                             )
                             .await
                             .map_err(storage)?;
@@ -700,6 +737,18 @@ where
     }
 }
 
+async fn auth_permitted(
+    config: &SmtpConfig,
+    source: std::net::IpAddr,
+    account: Option<&str>,
+) -> bool {
+    let decision = config.auth_limiter.before_attempt(source, account);
+    if !decision.delay.is_zero() {
+        tokio::time::sleep(decision.delay).await;
+    }
+    decision.allowed
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn receive_data<S: AsyncRead + AsyncWrite + Unpin, R: SmtpRepository>(
     stream: &mut S,
@@ -732,6 +781,10 @@ async fn receive_data<S: AsyncRead + AsyncWrite + Unpin, R: SmtpRepository>(
     )
     .await?;
     let prefix = [received.as_bytes(), authentication.as_slice()].concat();
+    let mut options = mail_options(transaction);
+    if !authentication.is_empty() {
+        options.authentication_results_trust = AuthenticationResultsTrust::LocallyGenerated;
+    }
     if config.authenticated_relay {
         repository
             .commit_submission_ingestion(
@@ -740,7 +793,7 @@ async fn receive_data<S: AsyncRead + AsyncWrite + Unpin, R: SmtpRepository>(
                 &transaction.reverse_path,
                 submission_recipients,
                 &prefix,
-                &mail_options(transaction),
+                &options,
             )
             .await
             .map_err(storage)?;
@@ -751,7 +804,7 @@ async fn receive_data<S: AsyncRead + AsyncWrite + Unpin, R: SmtpRepository>(
                 &transaction.reverse_path,
                 recipients,
                 &prefix,
-                &mail_options(transaction),
+                &options,
             )
             .await
             .map_err(storage)?;
@@ -806,6 +859,7 @@ fn mail_options(transaction: &Transaction) -> SmtpMailOptions {
     SmtpMailOptions {
         smtp_utf8: transaction.parameters.smtp_utf8,
         require_tls: transaction.parameters.require_tls,
+        authentication_results_trust: AuthenticationResultsTrust::Untrusted,
         dsn_ret: transaction.parameters.ret.clone(),
         envelope_id: transaction.parameters.envid.clone(),
         deliver_by_at,
@@ -860,11 +914,20 @@ async fn receive_bdat_piece<S: AsyncRead + Unpin, R: SmtpRepository>(
         ingestion.position = 1;
     }
     let mut remaining = octets;
+    let started = tokio::time::Instant::now();
+    let mut received = 0_u64;
     let mut buffer = vec![0_u8; CHUNK_SIZE];
     while remaining != 0 {
         let length =
             usize::try_from(remaining.min(CHUNK_SIZE as u64)).map_err(|_| DataError::TooLarge)?;
-        stream.read_exact(&mut buffer[..length]).await.map_err(io)?;
+        timeout(
+            progress_budget(started, received, config),
+            stream.read_exact(&mut buffer[..length]),
+        )
+        .await
+        .map_err(|_| SmtpError::Timeout)?
+        .map_err(io)?;
+        received = received.saturating_add(length as u64);
         if !too_large {
             repository
                 .append_smtp_chunk(ingestion.id, ingestion.position, &buffer[..length])
@@ -895,15 +958,20 @@ async fn receive_data_inner<S: AsyncRead + Unpin, R: SmtpRepository>(
     let mut size = 0_u64;
     let mut message = MessageParser::new(MessageLimits::default());
     let mut headers_complete = false;
+    let started = tokio::time::Instant::now();
     loop {
-        let line = read_line_bounded(stream, DATA_LINE_LIMIT)
-            .await?
-            .ok_or_else(|| {
-                io(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "EOF during DATA",
-                ))
-            })?;
+        let line = timeout(
+            progress_budget(started, size, config),
+            read_line_bounded(stream, DATA_LINE_LIMIT),
+        )
+        .await
+        .map_err(|_| SmtpError::Timeout)??
+        .ok_or_else(|| {
+            io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "EOF during DATA",
+            ))
+        })?;
         if line.len() > DATA_LINE_LIMIT {
             drain_data(stream, config.allow_bare_lf).await?;
             return Err(DataError::LineTooLong.into());
@@ -944,6 +1012,24 @@ async fn receive_data_inner<S: AsyncRead + Unpin, R: SmtpRepository>(
         .await
         .map_err(storage)?;
     Ok(())
+}
+
+fn progress_budget(started: tokio::time::Instant, received: u64, config: &SmtpConfig) -> Duration {
+    if config.data_min_bytes_per_second == 0 {
+        return config.data_timeout;
+    }
+    let earned = Duration::from_millis(
+        received
+            .saturating_mul(1_000)
+            .checked_div(config.data_min_bytes_per_second)
+            .unwrap_or_default(),
+    );
+    started
+        .checked_add(config.data_progress_grace.saturating_add(earned))
+        .map_or(Duration::ZERO, |deadline| {
+            deadline.saturating_duration_since(tokio::time::Instant::now())
+        })
+        .min(config.data_timeout)
 }
 
 async fn drain_data<S: AsyncRead + Unpin>(
@@ -1361,6 +1447,25 @@ mod tests {
         assert!(greeting[..count].starts_with(b"220 "));
         assert!(matches!(task.await?, Err(SmtpError::Timeout)));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn slow_data_sender_exhausts_rolling_progress_budget() {
+        let (mut client, mut server) = duplex(1024);
+        let writer = tokio::spawn(async move {
+            let _ = client.write_all(b"S").await;
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        });
+        let config = SmtpConfig {
+            data_timeout: Duration::from_secs(1),
+            data_progress_grace: Duration::from_millis(10),
+            data_min_bytes_per_second: 100,
+            ..SmtpConfig::default()
+        };
+        let result =
+            receive_data_inner(&mut server, &Repository::default(), &config, Uuid::nil()).await;
+        assert!(matches!(result, Err(SmtpError::Timeout)));
+        assert!(writer.await.is_ok());
     }
 
     #[tokio::test]

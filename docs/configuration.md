@@ -33,6 +33,8 @@ private_key_file = "/run/secrets/maild/privkey.pem"
 
 [smtp]
 listen = "0.0.0.0:25"
+data_progress_grace_seconds = 30
+data_min_bytes_per_second = 256
 
 [submission]
 listen = "0.0.0.0:587"
@@ -82,6 +84,8 @@ listen = "0.0.0.0:443"
 | `MAIL_ACME_PRODUCTION` | `acme.production` | `false` |
 | `MAIL_ACME_LISTEN` | `acme.listen` | `0.0.0.0:443` |
 | `MAIL_SMTP_LISTEN` | `smtp.listen` | `0.0.0.0:25` |
+| `MAIL_SMTP_DATA_PROGRESS_GRACE_SECONDS` | `smtp.data_progress_grace_seconds` | `30` |
+| `MAIL_SMTP_DATA_MIN_BYTES_PER_SECOND` | `smtp.data_min_bytes_per_second` | `256` |
 | `MAIL_SUBMISSION_LISTEN` | `submission.listen` | `0.0.0.0:587` |
 | `MAIL_SUBMISSIONS_LISTEN` | `submissions.listen` | `0.0.0.0:465` |
 | `MAIL_IMAP_LISTEN` | `imap.listen` | `0.0.0.0:143` |

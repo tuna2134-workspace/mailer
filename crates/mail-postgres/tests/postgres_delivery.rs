@@ -2,7 +2,7 @@ use std::time::{Duration, SystemTime};
 
 use mail_domain::{EntityStatus, Tenant, TenantId};
 use mail_postgres::PostgresRepository;
-use mail_storage::{DeliveryOutcome, MailRepository, StorageError};
+use mail_storage::{DeliveryOutcome, MailRepository, QueueLease, StorageError};
 use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
 
@@ -34,12 +34,7 @@ async fn queue_lease_stream_result_and_bounce_are_atomic() -> Result<(), Box<dyn
     sqlx::query("INSERT INTO queue_recipients(id,tenant_id,message_id,recipient,destination_domain,state,next_attempt_at,expires_at) VALUES($1,$2,$3,'bob@example.net','example.net','pending',clock_timestamp(),clock_timestamp()+interval '1 day')")
         .bind(queue).bind(tenant.into_uuid()).bind(message).execute(&pool).await?;
 
-    let lease = repository
-        .lease_queue(Uuid::new_v4(), 100, Duration::from_secs(30))
-        .await?
-        .into_iter()
-        .find(|lease| lease.queue_id.into_uuid() == queue)
-        .ok_or("inserted queue item was not leased")?;
+    let lease = lease_item(&repository, queue).await?;
     assert_eq!(
         repository.read_message_chunk(message, 0, 8).await?,
         &raw[..8]
@@ -50,6 +45,27 @@ async fn queue_lease_stream_result_and_bounce_are_atomic() -> Result<(), Box<dyn
             .await,
         Err(StorageError::Conflict)
     ));
+    repository
+        .finish_delivery(
+            lease.queue_id,
+            lease.lease_token,
+            &DeliveryOutcome::Ambiguous {
+                next_attempt_at: SystemTime::now() + Duration::from_secs(60),
+                diagnostic: "remote may have accepted after final dot".into(),
+            },
+        )
+        .await?;
+    let state: String = sqlx::query_scalar("SELECT state FROM queue_recipients WHERE id=$1")
+        .bind(queue)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(state, "ambiguous");
+
+    sqlx::query("UPDATE queue_recipients SET next_attempt_at=clock_timestamp() WHERE id=$1")
+        .bind(queue)
+        .execute(&pool)
+        .await?;
+    let lease = lease_item(&repository, queue).await?;
     repository
         .finish_delivery(
             lease.queue_id,
@@ -71,12 +87,7 @@ async fn queue_lease_stream_result_and_bounce_are_atomic() -> Result<(), Box<dyn
         .bind(queue)
         .execute(&pool)
         .await?;
-    let lease = repository
-        .lease_queue(Uuid::new_v4(), 100, Duration::from_secs(30))
-        .await?
-        .into_iter()
-        .find(|lease| lease.queue_id.into_uuid() == queue)
-        .ok_or("deferred queue item was not leased")?;
+    let lease = lease_item(&repository, queue).await?;
     repository
         .finish_delivery(
             lease.queue_id,
@@ -91,4 +102,16 @@ async fn queue_lease_stream_result_and_bounce_are_atomic() -> Result<(), Box<dyn
         .fetch_one(&pool).await?;
     assert_eq!(bounce, (String::new(), "alice@example.test".into()));
     Ok(())
+}
+
+async fn lease_item(
+    repository: &PostgresRepository,
+    queue: Uuid,
+) -> Result<QueueLease, Box<dyn std::error::Error>> {
+    repository
+        .lease_queue(Uuid::new_v4(), 100, Duration::from_secs(30))
+        .await?
+        .into_iter()
+        .find(|lease| lease.queue_id.into_uuid() == queue)
+        .ok_or_else(|| "queue item was not leased".into())
 }

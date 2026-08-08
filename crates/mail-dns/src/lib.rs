@@ -1,6 +1,7 @@
 use std::net::IpAddr;
 
 use hickory_resolver::TokioResolver;
+use hickory_resolver::proto::rr::RData;
 use mail_spf::{SpfError, SpfLookup};
 use thiserror::Error;
 
@@ -31,7 +32,8 @@ pub struct MailResolver(TokioResolver);
 impl MailResolver {
     pub fn system() -> Result<Self, DnsError> {
         TokioResolver::builder_tokio()
-            .map(|builder| Self(builder.build()))
+            .and_then(hickory_resolver::ResolverBuilder::build)
+            .map(Self)
             .map_err(|error| DnsError::Temporary(error.to_string()))
     }
 
@@ -42,8 +44,13 @@ impl MailResolver {
         }
         let exchanges = match self.0.mx_lookup(domain).await {
             Ok(records) => records
+                .message()
+                .answers
                 .iter()
-                .map(|mx| (mx.preference(), mx.exchange().to_utf8()))
+                .filter_map(|record| match &record.data {
+                    RData::MX(mx) => Some((mx.preference, mx.exchange.to_utf8())),
+                    _ => None,
+                })
                 .collect::<Vec<_>>(),
             Err(error) if error.is_no_records_found() => {
                 vec![(0, domain.to_owned())]
@@ -81,13 +88,17 @@ impl MailResolver {
             .await
             .map(|records| {
                 records
+                    .message()
+                    .answers
                     .iter()
-                    .map(|record| {
-                        record
-                            .txt_data()
-                            .iter()
-                            .flat_map(|part| part.iter().copied())
-                            .collect::<Vec<_>>()
+                    .filter_map(|record| match &record.data {
+                        RData::TXT(txt) => Some(
+                            txt.txt_data
+                                .iter()
+                                .flat_map(|part| part.iter().copied())
+                                .collect::<Vec<_>>(),
+                        ),
+                        _ => None,
                     })
                     .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
                     .collect()
@@ -119,7 +130,17 @@ impl MailResolver {
         self.0
             .mx_lookup(name)
             .await
-            .map(|records| records.iter().map(|mx| mx.exchange().to_utf8()).collect())
+            .map(|records| {
+                records
+                    .message()
+                    .answers
+                    .iter()
+                    .filter_map(|record| match &record.data {
+                        RData::MX(mx) => Some(mx.exchange.to_utf8()),
+                        _ => None,
+                    })
+                    .collect()
+            })
             .or_else(|error| {
                 if error.is_no_records_found() {
                     Ok(Vec::new())

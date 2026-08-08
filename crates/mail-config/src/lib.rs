@@ -29,6 +29,8 @@ pub enum ConfigError {
     ManualTlsPair,
     #[error("MAIL_HOSTNAME must be a valid ASCII DNS hostname")]
     Hostname,
+    #[error("{name} must be an unsigned integer: {value}")]
+    Unsigned { name: &'static str, value: String },
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -52,6 +54,8 @@ pub struct MaildConfig {
     pub hostname: String,
     pub admin_listen: SocketAddr,
     pub smtp_listen: SocketAddr,
+    pub smtp_data_progress_grace_seconds: u64,
+    pub smtp_data_min_bytes_per_second: u64,
     pub submission_listen: SocketAddr,
     pub submissions_listen: SocketAddr,
     pub imap_listen: SocketAddr,
@@ -80,7 +84,7 @@ impl MaildConfig {
             }
             None => RawConfig::default(),
         };
-        raw.apply_environment(&environment);
+        raw.apply_environment(&environment)?;
         raw.resolve()
     }
 }
@@ -127,13 +131,28 @@ struct Acme {
 #[serde(default, deny_unknown_fields)]
 struct Listener {
     listen: Option<String>,
+    data_progress_grace_seconds: Option<u64>,
+    data_min_bytes_per_second: Option<u64>,
 }
 
 impl RawConfig {
-    fn apply_environment(&mut self, environment: &impl Fn(&str) -> Option<String>) {
+    fn apply_environment(
+        &mut self,
+        environment: &impl Fn(&str) -> Option<String>,
+    ) -> Result<(), ConfigError> {
         replace(&mut self.database.url, environment("MAIL_DATABASE_URL"));
         replace(&mut self.hostname, environment("MAIL_HOSTNAME"));
         replace(&mut self.smtp.listen, environment("MAIL_SMTP_LISTEN"));
+        replace_unsigned(
+            &mut self.smtp.data_progress_grace_seconds,
+            "MAIL_SMTP_DATA_PROGRESS_GRACE_SECONDS",
+            environment("MAIL_SMTP_DATA_PROGRESS_GRACE_SECONDS"),
+        )?;
+        replace_unsigned(
+            &mut self.smtp.data_min_bytes_per_second,
+            "MAIL_SMTP_DATA_MIN_BYTES_PER_SECOND",
+            environment("MAIL_SMTP_DATA_MIN_BYTES_PER_SECOND"),
+        )?;
         replace(
             &mut self.submission.listen,
             environment("MAIL_SUBMISSION_LISTEN"),
@@ -165,6 +184,7 @@ impl RawConfig {
         if let Some(value) = environment("MAIL_TLS_KEY_FILE") {
             self.tls.private_key_file = Some(value.into());
         }
+        Ok(())
     }
 
     fn resolve(self) -> Result<MaildConfig, ConfigError> {
@@ -211,6 +231,8 @@ impl RawConfig {
             hostname,
             admin_listen: address("MAIL_ADMIN_LISTEN", self.admin_api.listen, ADMIN_DEFAULT)?,
             smtp_listen: address("MAIL_SMTP_LISTEN", self.smtp.listen, SMTP_DEFAULT)?,
+            smtp_data_progress_grace_seconds: self.smtp.data_progress_grace_seconds.unwrap_or(30),
+            smtp_data_min_bytes_per_second: self.smtp.data_min_bytes_per_second.unwrap_or(256),
             submission_listen: address(
                 "MAIL_SUBMISSION_LISTEN",
                 self.submission.listen,
@@ -233,6 +255,21 @@ fn replace<T>(target: &mut Option<T>, value: Option<impl Into<T>>) {
     if let Some(value) = value {
         *target = Some(value.into());
     }
+}
+
+fn replace_unsigned(
+    target: &mut Option<u64>,
+    name: &'static str,
+    value: Option<String>,
+) -> Result<(), ConfigError> {
+    if let Some(value) = value {
+        *target = Some(
+            value
+                .parse()
+                .map_err(|_| ConfigError::Unsigned { name, value })?,
+        );
+    }
+    Ok(())
 }
 
 fn csv(value: &str) -> Vec<String> {

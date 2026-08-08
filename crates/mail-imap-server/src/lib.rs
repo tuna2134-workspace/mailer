@@ -5,6 +5,7 @@ mod commands;
 mod frame;
 
 use mail_imap_proto::{Action, Session, Status, greeting, parse_command, tagged};
+use mail_sasl::{AuthAttemptLimiter, LocalAuthAttemptLimiter};
 use mail_storage::ImapRepository;
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 use thiserror::Error;
@@ -26,6 +27,7 @@ pub struct ImapConfig {
     pub command_timeout: Duration,
     pub tls: Option<Arc<rustls::ServerConfig>>,
     pub implicit_tls: bool,
+    pub auth_limiter: Arc<dyn AuthAttemptLimiter>,
 }
 
 impl Default for ImapConfig {
@@ -36,6 +38,7 @@ impl Default for ImapConfig {
             command_timeout: Duration::from_secs(300),
             tls: None,
             implicit_tls: false,
+            auth_limiter: Arc::new(LocalAuthAttemptLimiter::default()),
         }
     }
 }
@@ -72,10 +75,10 @@ pub async fn serve<R: ImapRepository + 'static>(
     let permits = Arc::new(Semaphore::new(config.max_connections));
     loop {
         let (stream, peer) = listener.accept().await?;
-        let permit = Arc::clone(&permits)
-            .acquire_owned()
-            .await
-            .map_err(|_| ImapError::Storage)?;
+        let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+            reject_busy(stream).await;
+            continue;
+        };
         let repository = Arc::clone(&repository);
         let config = config.clone();
         tokio::spawn(async move {
@@ -85,10 +88,17 @@ pub async fn serve<R: ImapRepository + 'static>(
     }
 }
 
+async fn reject_busy<W: AsyncWrite + Unpin>(mut stream: W) {
+    let _ = stream
+        .write_all(b"* BYE [UNAVAILABLE] Service busy\r\n")
+        .await;
+    let _ = stream.shutdown().await;
+}
+
 #[allow(clippy::too_many_lines)] // Keeping one command exchange in wire order makes protocol auditing safer.
 pub async fn run_session<S, R>(
     stream: S,
-    _peer: SocketAddr,
+    peer: SocketAddr,
     repository: &R,
     config: &ImapConfig,
 ) -> Result<(), ImapError>
@@ -191,6 +201,8 @@ where
                     &mut stream,
                     &mut session,
                     repository,
+                    config,
+                    peer.ip(),
                     tag,
                     identity.zip(Some(password)),
                 )
@@ -235,8 +247,16 @@ where
                 } else {
                     auth::decode_plain(&response)
                 };
-                if let Some(user) =
-                    finish_auth(&mut stream, &mut session, repository, tag, credentials).await?
+                if let Some(user) = finish_auth(
+                    &mut stream,
+                    &mut session,
+                    repository,
+                    config,
+                    peer.ip(),
+                    tag,
+                    credentials,
+                )
+                .await?
                 {
                     authenticated_user = Some(user);
                 } else {
@@ -433,13 +453,33 @@ async fn finish_auth<S: AsyncWrite + Unpin, R: ImapRepository>(
     stream: &mut S,
     session: &mut Session,
     repository: &R,
+    config: &ImapConfig,
+    source: std::net::IpAddr,
     tag: String,
     credentials: Option<(String, Vec<u8>)>,
 ) -> Result<Option<Uuid>, ImapError> {
+    let identity = credentials
+        .as_ref()
+        .map(|(identity, _)| identity.to_owned());
+    let decision = config
+        .auth_limiter
+        .before_attempt(source, identity.as_deref());
+    if !decision.delay.is_zero() {
+        tokio::time::sleep(decision.delay).await;
+    }
+    if !decision.allowed {
+        stream
+            .write_all(tagged(&tag, Status::No, "authentication failed").as_bytes())
+            .await?;
+        return Ok(None);
+    }
     let authenticated = match credentials {
         Some((identity, password)) => auth::authenticate(repository, identity, password).await?,
         None => None,
     };
+    config
+        .auth_limiter
+        .record_result(source, identity.as_deref(), authenticated.is_some());
     if authenticated.is_some() {
         session.authentication_succeeded();
         stream
@@ -560,6 +600,16 @@ mod tests {
         ) -> Result<(), StorageError> {
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn connection_limit_rejects_without_waiting() -> Result<(), Box<dyn std::error::Error>> {
+        let (mut client, server) = duplex(128);
+        reject_busy(server).await;
+        let mut response = String::new();
+        client.read_to_string(&mut response).await?;
+        assert_eq!(response, "* BYE [UNAVAILABLE] Service busy\r\n");
+        Ok(())
     }
 
     #[tokio::test]

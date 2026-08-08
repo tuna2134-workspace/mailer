@@ -13,6 +13,7 @@ mail-address = { path = "../mail-address" }
 mail-domain = { path = "../mail-domain" }
 mail-mailbox = { path = "../mail-mailbox" }
 mail-mime = { path = "../mail-mime" }
+mail-sasl = { path = "../mail-sasl" }
 mail-storage = { path = "../mail-storage" }
 rustls.workspace = true
 thiserror.workspace = true

@@ -1,0 +1,4 @@
+[advisories]
+# rsa is an optional sqlx-mysql lockfile entry. The resolved workspace graph has
+# PostgreSQL only and `cargo tree -i rsa@0.9.10` is empty.
+ignore = ["RUSTSEC-2023-0071"]

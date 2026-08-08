@@ -35,6 +35,8 @@ async fn main() -> Result<()> {
         hostname,
         admin_listen: admin_addr,
         smtp_listen: smtp_addr,
+        smtp_data_progress_grace_seconds,
+        smtp_data_min_bytes_per_second,
         submission_listen: submission_addr,
         submissions_listen: implicit_submission_addr,
         imap_listen: imap_addr,
@@ -109,6 +111,8 @@ async fn main() -> Result<()> {
         .recover_smtp_ingestions()
         .await
         .context("recover expired SMTP ingestions")?;
+    let auth_limiter: Arc<dyn mail_sasl::AuthAttemptLimiter> =
+        Arc::new(mail_sasl::LocalAuthAttemptLimiter::default());
     let smtp_listener = TcpListener::bind(smtp_addr)
         .await
         .with_context(|| format!("bind SMTP listener {smtp_addr}"))?;
@@ -123,6 +127,7 @@ async fn main() -> Result<()> {
     let submission_repository = Arc::clone(&smtp_repository);
     let submission_tls = Arc::clone(&smtp_tls);
     let submission_hostname = hostname.clone();
+    let submission_auth_limiter = Arc::clone(&auth_limiter);
     let submission_task = tokio::spawn(async move {
         mail_smtp_server::serve(
             submission_listener,
@@ -138,6 +143,11 @@ async fn main() -> Result<()> {
                 require_tls: true,
                 require_auth: true,
                 authenticated_relay: true,
+                auth_limiter: submission_auth_limiter,
+                data_progress_grace: std::time::Duration::from_secs(
+                    smtp_data_progress_grace_seconds,
+                ),
+                data_min_bytes_per_second: smtp_data_min_bytes_per_second,
                 deliver_by_min_seconds: Some(0),
                 future_release_max_seconds: Some(30 * 24 * 60 * 60),
                 ..mail_smtp_server::SmtpConfig::default()
@@ -153,6 +163,7 @@ async fn main() -> Result<()> {
     let implicit_repository = Arc::clone(&smtp_repository);
     let implicit_tls = Arc::clone(&smtp_tls);
     let implicit_hostname = hostname.clone();
+    let implicit_auth_limiter = Arc::clone(&auth_limiter);
     let implicit_submission_task = tokio::spawn(async move {
         mail_smtp_server::serve(
             implicit_submission_listener,
@@ -168,6 +179,11 @@ async fn main() -> Result<()> {
                 require_tls: true,
                 require_auth: true,
                 authenticated_relay: true,
+                auth_limiter: implicit_auth_limiter,
+                data_progress_grace: std::time::Duration::from_secs(
+                    smtp_data_progress_grace_seconds,
+                ),
+                data_min_bytes_per_second: smtp_data_min_bytes_per_second,
                 implicit_tls: true,
                 deliver_by_min_seconds: Some(0),
                 future_release_max_seconds: Some(30 * 24 * 60 * 60),
@@ -178,6 +194,7 @@ async fn main() -> Result<()> {
     });
     let imap_tls = Arc::clone(&smtp_tls);
     let implicit_imap_tls = Arc::clone(&smtp_tls);
+    let smtp_auth_limiter = Arc::clone(&auth_limiter);
     let smtp_task = tokio::spawn(async move {
         mail_smtp_server::serve(
             smtp_listener,
@@ -185,6 +202,11 @@ async fn main() -> Result<()> {
             mail_smtp_server::SmtpConfig {
                 hostname,
                 inbound_authentication: Some(inbound_authenticator),
+                auth_limiter: smtp_auth_limiter,
+                data_progress_grace: std::time::Duration::from_secs(
+                    smtp_data_progress_grace_seconds,
+                ),
+                data_min_bytes_per_second: smtp_data_min_bytes_per_second,
                 tls: Some(smtp_tls),
                 auth_plain: true,
                 auth_scram: true,
@@ -202,12 +224,14 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("bind IMAP listener {imap_addr}"))?;
     let imap_repository = Arc::new(repository.clone());
+    let imap_auth_limiter = Arc::clone(&auth_limiter);
     let imap_task = tokio::spawn(async move {
         mail_imap_server::serve(
             imap_listener,
             imap_repository,
             mail_imap_server::ImapConfig {
                 tls: Some(imap_tls),
+                auth_limiter: imap_auth_limiter,
                 ..mail_imap_server::ImapConfig::default()
             },
         )
@@ -224,6 +248,7 @@ async fn main() -> Result<()> {
             mail_imap_server::ImapConfig {
                 tls: Some(implicit_imap_tls),
                 implicit_tls: true,
+                auth_limiter,
                 ..mail_imap_server::ImapConfig::default()
             },
         )

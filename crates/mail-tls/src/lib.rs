@@ -3,11 +3,11 @@
 use rustls::{
     ServerConfig,
     crypto::ring::default_provider,
-    pki_types::{CertificateDer, PrivateKeyDer},
+    pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
     server::{ClientHello, ResolvesServerCert, ResolvesServerCertUsingSni},
     sign::CertifiedKey,
 };
-use std::{collections::BTreeMap, io::Cursor, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -47,16 +47,14 @@ impl ResolvesServerCert for SniResolverWithDefault {
 
 pub fn certified_key(identity: &PemIdentity) -> Result<CertifiedKey, TlsError> {
     let certificates: Vec<CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut Cursor::new(&identity.certificate_chain))
+        CertificateDer::pem_slice_iter(&identity.certificate_chain)
             .collect::<Result<_, _>>()
             .map_err(|error| TlsError::InvalidKey(error.to_string()))?;
     if certificates.is_empty() {
         return Err(TlsError::EmptyCertificate);
     }
-    let key: PrivateKeyDer<'static> =
-        rustls_pemfile::private_key(&mut Cursor::new(&identity.private_key))
-            .map_err(|error| TlsError::InvalidKey(error.to_string()))?
-            .ok_or(TlsError::EmptyPrivateKey)?;
+    let key = PrivateKeyDer::from_pem_slice(&identity.private_key)
+        .map_err(|_| TlsError::EmptyPrivateKey)?;
     CertifiedKey::from_der(certificates, key, &default_provider())
         .map_err(|error| TlsError::InvalidKey(error.to_string()))
 }

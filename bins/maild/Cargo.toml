@@ -15,6 +15,7 @@ mail-migrations = { path = "../../crates/mail-migrations" }
 mail-imap-server = { path = "../../crates/mail-imap-server" }
 mail-config = { path = "../../crates/mail-config" }
 mail-postgres = { path = "../../crates/mail-postgres" }
+mail-sasl = { path = "../../crates/mail-sasl" }
 mail-dns = { path = "../../crates/mail-dns" }
 mail-smtp-server = { path = "../../crates/mail-smtp-server" }
 mail-storage = { path = "../../crates/mail-storage" }
