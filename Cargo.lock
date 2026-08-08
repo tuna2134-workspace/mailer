@@ -1515,6 +1515,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mail-arc"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "mail-delivery"
 version = "0.1.0"
 dependencies = [
@@ -1523,6 +1530,22 @@ dependencies = [
  "mail-storage",
  "thiserror",
  "uuid",
+]
+
+[[package]]
+name = "mail-dkim"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "ring",
+ "thiserror",
+]
+
+[[package]]
+name = "mail-dmarc"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
 ]
 
 [[package]]
@@ -1696,6 +1719,15 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "uuid",
+]
+
+[[package]]
+name = "mail-spf"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]

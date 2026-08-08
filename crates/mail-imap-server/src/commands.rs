@@ -449,15 +449,8 @@ pub async fn execute<R: ImapRepository>(
                 .imap_store_flags_conditional(user, selected.mailbox.id, &uids, &update)
                 .await
                 .map_err(storage)?;
-            if !result.modified.is_empty() {
-                out.responses.push(
-                    format!(
-                        "* OK [MODIFIED {}] conditional STORE conflicts\r\n",
-                        join_numbers(&result.modified)
-                    )
-                    .into_bytes(),
-                );
-            }
+            let modified_completion = (!result.modified.is_empty())
+                .then(|| format!("[MODIFIED {}] ", join_numbers(&result.modified)));
             if !silent {
                 for state in result.updated {
                     let sequence = messages
@@ -484,7 +477,7 @@ pub async fn execute<R: ImapRepository>(
                     });
                 }
             }
-            out.completion = "STORE completed".into();
+            out.completion = format!("{}STORE completed", modified_completion.unwrap_or_default());
         }
         CommandBody::Copy {
             set,

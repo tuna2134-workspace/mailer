@@ -24,6 +24,8 @@ Phase 10 is complete with PostgreSQL-backed mailbox/message operations, sequence
 
 Phase 11 is complete with IDLE, CONDSTORE, QRESYNC, CHANGEDSINCE, UNCHANGEDSINCE/MODIFIED, HIGHESTMODSEQ, VANISHED, durable reconnect synchronization, and PostgreSQL-backed cross-session notifications; see `docs/phase-11-report.md`.
 
+Phase 12 is complete for SPF, DKIM, DMARC, ARC, aggregate/failure report builders, and explicit external DNS/PSL/key boundaries; see `docs/phase-12-report.md`.
+
 ## Phase 1 detailed plan
 
 1. Create only domain/application/storage/PostgreSQL/migration/testkit crates and migration binary.
