@@ -13,6 +13,7 @@ mail-admin-api = { path = "../../crates/mail-admin-api" }
 mail-migrations = { path = "../../crates/mail-migrations" }
 mail-imap-server = { path = "../../crates/mail-imap-server" }
 mail-postgres = { path = "../../crates/mail-postgres" }
+mail-dns = { path = "../../crates/mail-dns" }
 mail-smtp-server = { path = "../../crates/mail-smtp-server" }
 mail-storage = { path = "../../crates/mail-storage" }
 rustls.workspace = true

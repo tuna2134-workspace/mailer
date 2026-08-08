@@ -3,6 +3,7 @@
 use anyhow::{Context, Result, bail};
 use axum_server::tls_rustls::RustlsConfig;
 use mail_acme::{AcmeSettings, PostgresAcmeCache, RenewalLock, run_tls_alpn_listener, state};
+use mail_dns::MailResolver;
 use mail_postgres::PostgresRepository;
 use mail_storage::SmtpRepository;
 use rustls::ServerConfig;
@@ -89,6 +90,10 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("bind SMTP listener {smtp_addr}"))?;
     let smtp_repository = Arc::new(repository.clone());
+    let inbound_authenticator = Arc::new(mail_smtp_server::InboundAuthenticator::new(
+        MailResolver::system().context("initialize authentication DNS resolver")?,
+        hostname.clone(),
+    ));
     let submission_listener = TcpListener::bind(submission_addr)
         .await
         .with_context(|| format!("bind Submission listener {submission_addr}"))?;
@@ -156,6 +161,7 @@ async fn main() -> Result<()> {
             smtp_repository,
             mail_smtp_server::SmtpConfig {
                 hostname,
+                inbound_authentication: Some(inbound_authenticator),
                 tls: Some(smtp_tls),
                 auth_plain: true,
                 auth_scram: true,

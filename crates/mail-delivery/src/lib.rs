@@ -1,7 +1,7 @@
 use std::time::{Duration, SystemTime};
 
 use mail_dns::{DnsError, MailResolver};
-use mail_smtp_client::{ClientError, SendResult, SmtpClient};
+use mail_smtp_client::{ClientError, DkimSigningConfig, SendResult, SmtpClient};
 use mail_storage::{DeliveryOutcome, MailRepository, QueueLease, StorageError};
 use thiserror::Error;
 use uuid::Uuid;
@@ -30,6 +30,12 @@ impl<R: MailRepository> DeliveryWorker<R> {
             client: SmtpClient::new(hostname),
             worker_id: Uuid::new_v4(),
         }
+    }
+
+    #[must_use]
+    pub fn with_dkim(mut self, config: DkimSigningConfig) -> Self {
+        self.client = self.client.with_dkim(config);
+        self
     }
 
     pub async fn run_once(&self, limit: u32) -> Result<usize, DeliveryError> {

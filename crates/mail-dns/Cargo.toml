@@ -7,6 +7,8 @@ license.workspace = true
 
 [dependencies]
 hickory-resolver.workspace = true
+async-trait.workspace = true
+mail-spf = { path = "../mail-spf" }
 thiserror.workspace = true
 
 [lints]

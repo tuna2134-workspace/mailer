@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 
 mod auth;
+mod authentication;
+
+pub use authentication::InboundAuthenticator;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use mail_smtp_proto::{
@@ -57,6 +60,7 @@ pub struct SmtpConfig {
     pub implicit_tls: bool,
     pub deliver_by_min_seconds: Option<u32>,
     pub future_release_max_seconds: Option<u32>,
+    pub inbound_authentication: Option<Arc<InboundAuthenticator>>,
 }
 
 impl Default for SmtpConfig {
@@ -81,6 +85,7 @@ impl Default for SmtpConfig {
             implicit_tls: false,
             deliver_by_min_seconds: None,
             future_release_max_seconds: None,
+            inbound_authentication: None,
         }
     }
 }
@@ -447,6 +452,16 @@ where
                     let ingestion = bdat.take().ok_or(SmtpError::Storage)?;
                     let received =
                         received_header(&config.hostname, peer, session.peer_name.as_deref());
+                    let authentication = authentication_headers(
+                        config,
+                        repository,
+                        ingestion.id,
+                        peer,
+                        &ingestion.transaction.reverse_path,
+                        session.peer_name.as_deref(),
+                    )
+                    .await?;
+                    let prefix = [received.as_bytes(), authentication.as_slice()].concat();
                     if config.authenticated_relay {
                         repository
                             .commit_submission_ingestion(
@@ -454,7 +469,7 @@ where
                                 authenticated_user.ok_or(SmtpError::Auth)?,
                                 &ingestion.transaction.reverse_path,
                                 &ingestion.submission_recipients,
-                                received.as_bytes(),
+                                &prefix,
                                 &mail_options(&ingestion.transaction),
                             )
                             .await
@@ -465,7 +480,7 @@ where
                                 ingestion.id,
                                 &ingestion.transaction.reverse_path,
                                 &ingestion.recipients,
-                                received.as_bytes(),
+                                &prefix,
                                 &mail_options(&ingestion.transaction),
                             )
                             .await
@@ -692,6 +707,16 @@ async fn receive_data<S: AsyncRead + AsyncWrite + Unpin, R: SmtpRepository>(
         return Err(error);
     }
     let received = received_header(&config.hostname, peer, helo);
+    let authentication = authentication_headers(
+        config,
+        repository,
+        ingestion,
+        peer,
+        &transaction.reverse_path,
+        helo,
+    )
+    .await?;
+    let prefix = [received.as_bytes(), authentication.as_slice()].concat();
     if config.authenticated_relay {
         repository
             .commit_submission_ingestion(
@@ -699,7 +724,7 @@ async fn receive_data<S: AsyncRead + AsyncWrite + Unpin, R: SmtpRepository>(
                 authenticated_user.ok_or(SmtpError::Auth)?,
                 &transaction.reverse_path,
                 submission_recipients,
-                received.as_bytes(),
+                &prefix,
                 &mail_options(transaction),
             )
             .await
@@ -710,13 +735,39 @@ async fn receive_data<S: AsyncRead + AsyncWrite + Unpin, R: SmtpRepository>(
                 ingestion,
                 &transaction.reverse_path,
                 recipients,
-                received.as_bytes(),
+                &prefix,
                 &mail_options(transaction),
             )
             .await
             .map_err(storage)?;
     }
     Ok(())
+}
+
+async fn authentication_headers<R: SmtpRepository>(
+    config: &SmtpConfig,
+    repository: &R,
+    ingestion_id: uuid::Uuid,
+    peer: SocketAddr,
+    sender: &str,
+    helo: Option<&str>,
+) -> Result<Vec<u8>, SmtpError> {
+    if config.authenticated_relay {
+        return Ok(Vec::new());
+    }
+    let Some(authenticator) = &config.inbound_authentication else {
+        return Ok(Vec::new());
+    };
+    authenticator
+        .headers(
+            repository,
+            ingestion_id,
+            peer.ip(),
+            sender,
+            helo.unwrap_or("unknown"),
+        )
+        .await
+        .map_err(storage)
 }
 
 fn mail_options(transaction: &Transaction) -> SmtpMailOptions {

@@ -218,6 +218,20 @@ cargo run -p mailctl -- user --help
 - SPF、DKIM、DMARC
 - 必要に応じてMTA-STSとTLS-RPT
 
+TCP/25で受信したメッセージは、保存確定前にSPF、DKIM、DMARCを評価し、信頼境界側で生成した`Authentication-Results`と`Received-SPF`を付与します。DKIM本文ハッシュはPostgreSQLの受信chunkからストリーミング計算されます。現時点のDMARC discoveryはHeader Fromドメインの直接`_dmarc` recordが対象で、PSLを使う組織ドメインfallbackは未実装です。ARCは構文用crateのみで、暗号検証・seal生成は配送経路へ未接続です。
+
+outbound DKIM署名を有効にする場合は、queue workerへ次をすべて設定します。秘密鍵fileはPKCS#8 DER形式で、未設定時は意図的に署名しません。不完全な設定や署名失敗時はメールを未署名で送らず、一時失敗としてqueueへ戻します。
+
+```console
+export MAIL_DKIM_DOMAIN='example.com'
+export MAIL_DKIM_SELECTOR='mail2026'
+export MAIL_DKIM_KEY_FILE='/run/credentials/mail-dkim.pk8'
+export MAIL_DKIM_ALGORITHM='ed25519-sha256' # または rsa-sha256
+cargo run --release -p mail-queue-worker
+```
+
+秘密鍵はrepositoryや環境変数へ直接格納せず、systemd credential、Kubernetes Secret等からread-only fileとしてmountしてください。対応する`${MAIL_DKIM_SELECTOR}._domainkey.${MAIL_DKIM_DOMAIN}` TXT recordの公開は別途必要です。
+
 DNSSEC、DANE、MTA-STS、TLS-RPTはpolicy coreと外部resolver/providerの境界を持ちます。外部検証器を接続していない状態を「検証済み」とは扱いません。
 
 ## 停止

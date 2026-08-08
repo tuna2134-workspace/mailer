@@ -1,6 +1,7 @@
 use std::net::IpAddr;
 
 use hickory_resolver::TokioResolver;
+use mail_spf::{SpfError, SpfLookup};
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -72,6 +73,82 @@ impl MailResolver {
         } else {
             Ok(MailRoute::Hosts(hosts))
         }
+    }
+
+    pub async fn txt(&self, name: &str) -> Result<Vec<String>, DnsError> {
+        self.0
+            .txt_lookup(name)
+            .await
+            .map(|records| {
+                records
+                    .iter()
+                    .map(|record| {
+                        record
+                            .txt_data()
+                            .iter()
+                            .flat_map(|part| part.iter().copied())
+                            .collect::<Vec<_>>()
+                    })
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                    .collect()
+            })
+            .or_else(|error| {
+                if error.is_no_records_found() {
+                    Ok(Vec::new())
+                } else {
+                    Err(DnsError::Temporary(error.to_string()))
+                }
+            })
+    }
+
+    pub async fn addresses(&self, name: &str) -> Result<Vec<IpAddr>, DnsError> {
+        self.0
+            .lookup_ip(name)
+            .await
+            .map(|records| records.iter().collect())
+            .or_else(|error| {
+                if error.is_no_records_found() {
+                    Ok(Vec::new())
+                } else {
+                    Err(DnsError::Temporary(error.to_string()))
+                }
+            })
+    }
+
+    pub async fn mx_names(&self, name: &str) -> Result<Vec<String>, DnsError> {
+        self.0
+            .mx_lookup(name)
+            .await
+            .map(|records| records.iter().map(|mx| mx.exchange().to_utf8()).collect())
+            .or_else(|error| {
+                if error.is_no_records_found() {
+                    Ok(Vec::new())
+                } else {
+                    Err(DnsError::Temporary(error.to_string()))
+                }
+            })
+    }
+}
+
+#[async_trait::async_trait]
+impl SpfLookup for MailResolver {
+    async fn txt(&self, name: &str) -> Result<Vec<String>, SpfError> {
+        MailResolver::txt(self, name).await.map_err(spf_dns)
+    }
+
+    async fn addresses(&self, name: &str) -> Result<Vec<IpAddr>, SpfError> {
+        MailResolver::addresses(self, name).await.map_err(spf_dns)
+    }
+
+    async fn mx(&self, name: &str) -> Result<Vec<String>, SpfError> {
+        self.mx_names(name).await.map_err(spf_dns)
+    }
+}
+
+fn spf_dns(error: DnsError) -> SpfError {
+    match error {
+        DnsError::Temporary(message) => SpfError::Temporary(message),
+        DnsError::Permanent => SpfError::Invalid,
     }
 }
 

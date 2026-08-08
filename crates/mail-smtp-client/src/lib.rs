@@ -4,6 +4,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use mail_dkim::{BodyHasher, Canonicalization, SigningKey, sign_headers};
 use mail_dns::{MailHost, MailRoute};
 use mail_storage::{MailRepository, QueueLease, StorageError};
 use rustls_platform_verifier::BuilderVerifierExt;
@@ -19,6 +20,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> ClientIo for T {}
 
 const REPLY_LIMIT: usize = 8 * 1024;
 const MESSAGE_CHUNK: u32 = 64 * 1024;
+const MAX_SIGNED_HEADERS: usize = 256 * 1024;
+
+#[derive(Clone, Debug)]
+pub struct DkimSigningConfig {
+    pub domain: String,
+    pub selector: String,
+    pub key: SigningKey,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SendResult {
@@ -44,6 +53,7 @@ pub struct SmtpClient {
     hostname: String,
     connect_timeout: Duration,
     command_timeout: Duration,
+    dkim: Option<DkimSigningConfig>,
 }
 
 impl SmtpClient {
@@ -53,7 +63,14 @@ impl SmtpClient {
             hostname,
             connect_timeout: Duration::from_secs(30),
             command_timeout: Duration::from_secs(60),
+            dkim: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_dkim(mut self, config: DkimSigningConfig) -> Self {
+        self.dkim = Some(config);
+        self
     }
 
     pub async fn send<R: MailRepository>(
@@ -118,6 +135,18 @@ impl SmtpClient {
         host: &MailHost,
         address: SocketAddr,
     ) -> Result<SendResult, ClientError> {
+        let dkim_header = match &self.dkim {
+            Some(config) => match prepare_dkim(repository, lease, config).await? {
+                Ok(header) => Some(header),
+                Err(diagnostic) => {
+                    return Ok(SendResult::Deferred {
+                        code: Some("4.7.5".into()),
+                        diagnostic,
+                    });
+                }
+            },
+            None => None,
+        };
         let stream = match timeout(self.connect_timeout, TcpStream::connect(address)).await {
             Ok(Ok(stream)) => stream,
             Ok(Err(error)) => return Ok(deferred_io(host, &error)),
@@ -366,6 +395,15 @@ impl SmtpClient {
         let mut offset = 0_u64;
         let mut line_start = true;
         let mut tail = [0_u8; 2];
+        if let Some(header) = &dkim_header {
+            let stuffed = dot_stuff(header, &mut line_start);
+            if let Err(error) = self.write(connection.get_mut(), &stuffed).await {
+                return Ok(deferred_io(host, &error));
+            }
+            for byte in header.iter().copied() {
+                tail = [tail[1], byte];
+            }
+        }
         loop {
             let chunk = repository
                 .read_message_chunk(lease.message_id, offset, MESSAGE_CHUNK)
@@ -420,6 +458,70 @@ impl SmtpClient {
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "SMTP write timeout"))?
     }
+}
+
+async fn prepare_dkim<R: MailRepository>(
+    repository: &R,
+    lease: &QueueLease,
+    config: &DkimSigningConfig,
+) -> Result<Result<Vec<u8>, String>, StorageError> {
+    if has_line_break(&config.domain)
+        || has_line_break(&config.selector)
+        || config.domain.is_empty()
+        || config.selector.is_empty()
+    {
+        return Ok(Err("invalid DKIM signing identity".into()));
+    }
+    let mut offset = 0_u64;
+    let mut headers = Vec::new();
+    let mut body = BodyHasher::new(Canonicalization::Relaxed);
+    let mut in_headers = true;
+    let mut boundary = Vec::with_capacity(3);
+    loop {
+        let chunk = repository
+            .read_message_chunk(lease.message_id, offset, MESSAGE_CHUNK)
+            .await?;
+        if chunk.is_empty() {
+            break;
+        }
+        for byte in chunk.iter().copied() {
+            if in_headers {
+                headers.push(byte);
+                if headers.len() > MAX_SIGNED_HEADERS {
+                    return Ok(Err("message headers exceed DKIM signing limit".into()));
+                }
+                boundary.push(byte);
+                if boundary.len() > 4 {
+                    boundary.remove(0);
+                }
+                if boundary == b"\r\n\r\n" {
+                    headers.truncate(headers.len() - 2);
+                    in_headers = false;
+                }
+            } else {
+                body.update(&[byte]);
+            }
+        }
+        offset = offset.saturating_add(chunk.len() as u64);
+        if chunk.len() < MESSAGE_CHUNK as usize {
+            break;
+        }
+    }
+    if in_headers {
+        return Ok(Err("message has no RFC 5322 header/body separator".into()));
+    }
+    let hash = body.finish();
+    Ok(sign_headers(
+        &headers,
+        &hash,
+        &config.domain,
+        &config.selector,
+        config.key.clone(),
+        &["From", "To", "Cc", "Subject", "Date", "Message-ID"],
+        Canonicalization::Relaxed,
+        Canonicalization::Relaxed,
+    )
+    .map_err(|error| format!("DKIM signing failed: {error}")))
 }
 
 fn has_line_break(value: &str) -> bool {

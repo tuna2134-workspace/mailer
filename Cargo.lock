@@ -1552,7 +1552,9 @@ dependencies = [
 name = "mail-dns"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "hickory-resolver",
+ "mail-spf",
  "thiserror",
 ]
 
@@ -1688,8 +1690,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "mail-delivery",
+ "mail-dkim",
  "mail-dns",
  "mail-postgres",
+ "mail-smtp-client",
  "sqlx",
  "tokio",
 ]
@@ -1715,6 +1719,7 @@ dependencies = [
 name = "mail-smtp-client"
 version = "0.1.0"
 dependencies = [
+ "mail-dkim",
  "mail-dns",
  "mail-storage",
  "rustls",
@@ -1739,9 +1744,15 @@ dependencies = [
  "argon2",
  "async-trait",
  "base64",
+ "mail-address",
+ "mail-dkim",
+ "mail-dmarc",
+ "mail-dns",
  "mail-domain",
+ "mail-policy",
  "mail-sasl",
  "mail-smtp-proto",
+ "mail-spf",
  "mail-storage",
  "rcgen",
  "ring",
@@ -1814,6 +1825,7 @@ dependencies = [
  "axum-server",
  "mail-acme",
  "mail-admin-api",
+ "mail-dns",
  "mail-imap-server",
  "mail-migrations",
  "mail-postgres",

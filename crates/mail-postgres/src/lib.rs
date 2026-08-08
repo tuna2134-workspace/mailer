@@ -964,6 +964,22 @@ impl SmtpRepository for PostgresRepository {
         Ok(())
     }
 
+    async fn read_smtp_chunk(
+        &self,
+        ingestion_id: Uuid,
+        position: u32,
+    ) -> Result<Vec<u8>, StorageError> {
+        sqlx::query_scalar(
+            "SELECT content FROM smtp_ingestion_chunks WHERE ingestion_id=$1 AND position=$2",
+        )
+        .bind(ingestion_id)
+        .bind(i32::try_from(position).map_err(|_| StorageError::Conflict)?)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)
+        .map(Option::unwrap_or_default)
+    }
+
     async fn commit_smtp_ingestion(
         &self,
         ingestion_id: Uuid,

@@ -26,6 +26,97 @@ pub enum DkimError {
     Verify,
 }
 
+#[allow(clippy::struct_excessive_bools)] // Each flag tracks independent streaming wire state.
+pub struct BodyHasher {
+    mode: Canonicalization,
+    digest: digest::Context,
+    line_has_content: bool,
+    pending_space: bool,
+    pending_empty_lines: usize,
+    any_content: bool,
+    pending_cr: bool,
+}
+
+impl BodyHasher {
+    #[must_use]
+    pub fn new(mode: Canonicalization) -> Self {
+        Self {
+            mode,
+            digest: digest::Context::new(&digest::SHA256),
+            line_has_content: false,
+            pending_space: false,
+            pending_empty_lines: 0,
+            any_content: false,
+            pending_cr: false,
+        }
+    }
+
+    pub fn update(&mut self, input: &[u8]) {
+        for byte in input.iter().copied() {
+            if self.pending_cr {
+                self.pending_cr = false;
+                if byte == b'\n' {
+                    self.end_line();
+                    continue;
+                }
+                if self.mode == Canonicalization::Simple {
+                    self.content(b'\r');
+                }
+            }
+            match byte {
+                b'\r' => self.pending_cr = true,
+                b'\n' => self.end_line(),
+                value => self.content(value),
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn finish(mut self) -> String {
+        if self.pending_cr && self.mode == Canonicalization::Simple {
+            self.content(b'\r');
+        }
+        if self.line_has_content {
+            self.digest.update(b"\r\n");
+            self.any_content = true;
+        }
+        if !self.any_content {
+            self.digest.update(b"\r\n");
+        }
+        STANDARD.encode(self.digest.finish().as_ref())
+    }
+
+    fn content(&mut self, byte: u8) {
+        if self.mode == Canonicalization::Relaxed && matches!(byte, b' ' | b'\t') {
+            self.pending_space = true;
+            return;
+        }
+        if !self.line_has_content {
+            for _ in 0..self.pending_empty_lines {
+                self.digest.update(b"\r\n");
+            }
+            self.pending_empty_lines = 0;
+        }
+        if self.pending_space && self.line_has_content {
+            self.digest.update(b" ");
+        }
+        self.pending_space = false;
+        self.digest.update(&[byte]);
+        self.line_has_content = true;
+    }
+
+    fn end_line(&mut self) {
+        self.pending_space = false;
+        if self.line_has_content {
+            self.digest.update(b"\r\n");
+            self.any_content = true;
+            self.line_has_content = false;
+        } else {
+            self.pending_empty_lines = self.pending_empty_lines.saturating_add(1);
+        }
+    }
+}
+
 pub fn canonicalize_body(body: &[u8], mode: Canonicalization) -> Vec<u8> {
     let mut lines = body
         .split(|byte| *byte == b'\n')
@@ -87,6 +178,38 @@ pub fn sign(
     .into_bytes())
 }
 
+#[allow(clippy::too_many_arguments)] // Mirrors sign(), with the body replaced by its hash.
+pub fn sign_headers(
+    message_headers: &[u8],
+    precomputed_body_hash: &str,
+    domain: &str,
+    selector: &str,
+    key: SigningKey,
+    headers: &[&str],
+    header_canon: Canonicalization,
+    body_canon: Canonicalization,
+) -> Result<Vec<u8>, DkimError> {
+    let names = headers.join(":");
+    let algorithm = match key {
+        SigningKey::RsaPkcs8(_) => "rsa-sha256",
+        SigningKey::Ed25519Pkcs8(_) => "ed25519-sha256",
+    };
+    let unsigned = format!(
+        "v=1; a={algorithm}; c={}:{}; d={domain}; s={selector}; h={names}; bh={precomputed_body_hash}; b=",
+        canon_name(header_canon),
+        canon_name(body_canon)
+    );
+    let dkim_line = format!("DKIM-Signature: {unsigned}\r\n");
+    let signing = signing_input(message_headers, dkim_line.as_bytes(), headers, header_canon);
+    let signature = sign_bytes(&signing, key)?;
+    let prefix = unsigned.strip_suffix("b=").ok_or(DkimError::Malformed)?;
+    Ok(format!(
+        "DKIM-Signature: {prefix}b={}\r\n",
+        STANDARD.encode(signature)
+    )
+    .into_bytes())
+}
+
 pub fn verify(message: &[u8], dkim_header: &[u8], public_key: &[u8]) -> Result<bool, DkimError> {
     let tags = parse_tags(dkim_header)?;
     let algorithm = tags.get("a").ok_or(DkimError::Malformed)?;
@@ -129,6 +252,74 @@ pub fn verify(message: &[u8], dkim_header: &[u8], public_key: &[u8]) -> Result<b
         _ => return Err(DkimError::Algorithm),
     };
     Ok(valid)
+}
+
+pub fn verify_headers(
+    message_headers: &[u8],
+    dkim_header: &[u8],
+    public_key: &[u8],
+    precomputed_body_hash: &str,
+) -> Result<bool, DkimError> {
+    let tags = parse_tags(dkim_header)?;
+    if tags.get("bh").map(String::as_str) != Some(precomputed_body_hash) {
+        return Ok(false);
+    }
+    let algorithm = tags.get("a").ok_or(DkimError::Malformed)?;
+    let header_canon = if tags
+        .get("c")
+        .is_some_and(|value| value.starts_with("relaxed"))
+    {
+        Canonicalization::Relaxed
+    } else {
+        Canonicalization::Simple
+    };
+    let names = tags
+        .get("h")
+        .ok_or(DkimError::Malformed)?
+        .split(':')
+        .collect::<Vec<_>>();
+    let unsigned = remove_tag_value(dkim_header, "b")?;
+    let signing = signing_input(message_headers, &unsigned, &names, header_canon);
+    let signature_bytes = STANDARD
+        .decode(tags.get("b").ok_or(DkimError::Malformed)?)
+        .map_err(|_| DkimError::Malformed)?;
+    match algorithm.as_str() {
+        "rsa-sha256" => Ok(signature::UnparsedPublicKey::new(
+            &signature::RSA_PKCS1_2048_8192_SHA256,
+            public_key,
+        )
+        .verify(&signing, &signature_bytes)
+        .is_ok()),
+        "ed25519-sha256" => Ok(
+            signature::UnparsedPublicKey::new(&signature::ED25519, public_key)
+                .verify(&signing, &signature_bytes)
+                .is_ok(),
+        ),
+        _ => Err(DkimError::Algorithm),
+    }
+}
+
+pub fn identity(dkim_header: &[u8]) -> Result<(String, String), DkimError> {
+    let tags = parse_tags(dkim_header)?;
+    Ok((
+        tags.get("d").ok_or(DkimError::Malformed)?.clone(),
+        tags.get("s").ok_or(DkimError::Malformed)?.clone(),
+    ))
+}
+
+pub fn body_canonicalization(dkim_header: &[u8]) -> Result<Canonicalization, DkimError> {
+    let tags = parse_tags(dkim_header)?;
+    Ok(
+        if tags
+            .get("c")
+            .and_then(|value| value.split_once(':').map(|(_, body)| body))
+            .is_some_and(|body| body.eq_ignore_ascii_case("relaxed"))
+        {
+            Canonicalization::Relaxed
+        } else {
+            Canonicalization::Simple
+        },
+    )
 }
 
 fn sign_bytes(data: &[u8], key: SigningKey) -> Result<Vec<u8>, DkimError> {
@@ -277,6 +468,32 @@ mod tests {
             b"a\r\n"
         );
         assert!(!body_hash(b"a", Canonicalization::Simple).is_empty());
+    }
+
+    #[test]
+    fn streaming_body_hash_matches_whole_body_at_every_boundary() {
+        for mode in [Canonicalization::Simple, Canonicalization::Relaxed] {
+            for body in [
+                b"".as_slice(),
+                b"a",
+                b"a\r\n",
+                b"a  \r\n\r\n",
+                b"a\nb\r\nc\rd",
+                b" \t\r\nbody\t \r\n\r\n",
+            ] {
+                let expected = body_hash(body, mode);
+                for split in 0..=body.len() {
+                    let mut hasher = BodyHasher::new(mode);
+                    hasher.update(&body[..split]);
+                    hasher.update(&body[split..]);
+                    assert_eq!(
+                        hasher.finish(),
+                        expected,
+                        "mode {mode:?}, split {split} for {body:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

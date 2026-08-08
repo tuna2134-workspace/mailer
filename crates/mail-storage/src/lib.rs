@@ -522,6 +522,15 @@ pub trait SmtpRepository: Send + Sync {
         position: u32,
         bytes: &[u8],
     ) -> Result<(), StorageError>;
+    async fn read_smtp_chunk(
+        &self,
+        _ingestion_id: Uuid,
+        _position: u32,
+    ) -> Result<Vec<u8>, StorageError> {
+        Err(StorageError::Unavailable(
+            "SMTP ingestion reads are unsupported".into(),
+        ))
+    }
     async fn commit_smtp_ingestion(
         &self,
         ingestion_id: Uuid,

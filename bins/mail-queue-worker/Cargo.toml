@@ -7,9 +7,11 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+mail-dkim = { path = "../../crates/mail-dkim" }
 mail-delivery = { path = "../../crates/mail-delivery" }
 mail-dns = { path = "../../crates/mail-dns" }
 mail-postgres = { path = "../../crates/mail-postgres" }
+mail-smtp-client = { path = "../../crates/mail-smtp-client" }
 sqlx.workspace = true
 tokio.workspace = true
 
