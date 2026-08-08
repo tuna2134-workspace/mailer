@@ -16,6 +16,7 @@ mail-mime = { path = "../mail-mime" }
 mail-storage = { path = "../mail-storage" }
 rustls.workspace = true
 thiserror.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
 time.workspace = true

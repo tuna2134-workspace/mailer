@@ -12,6 +12,9 @@ pub(super) fn response(message: &ImapMessage, items: &str) -> Vec<u8> {
     if upper.contains("UID") {
         fields.push(format!("UID {}", message.uid).into_bytes());
     }
+    if upper.contains("MODSEQ") {
+        fields.push(format!("MODSEQ ({})", message.modseq).into_bytes());
+    }
     if upper.contains("RFC822.SIZE") {
         fields.push(format!("RFC822.SIZE {}", message.raw.len()).into_bytes());
     }
@@ -25,9 +28,9 @@ pub(super) fn response(message: &ImapMessage, items: &str) -> Vec<u8> {
         fields.push(envelope(&message.raw).into_bytes());
     }
     if upper.contains("BODYSTRUCTURE") {
-        fields.push(format!("BODYSTRUCTURE {}", body_structure(&message.raw)).into_bytes());
+        fields.push(format!("BODYSTRUCTURE {}", body_structure(&message.raw, true)).into_bytes());
     } else if upper.split_whitespace().any(|item| item == "BODY") {
-        fields.push(format!("BODY {}", body_structure(&message.raw)).into_bytes());
+        fields.push(format!("BODY {}", body_structure(&message.raw, false)).into_bytes());
     }
     for request in section_requests(&upper) {
         fields.push(literal_field(&message.raw, &request));
@@ -309,9 +312,9 @@ fn mailbox_address(mailbox: &Mailbox) -> String {
     )
 }
 
-fn body_structure(raw: &[u8]) -> String {
+fn body_structure(raw: &[u8], extended: bool) -> String {
     if let Ok(root) = parse_message(raw, mime_limits(raw.len())) {
-        return structure(&root);
+        return structure(&root, extended);
     }
     let content_type = header(raw, "Content-Type").unwrap_or_else(|| b"text/plain".to_vec());
     let media = String::from_utf8_lossy(&content_type);
@@ -331,6 +334,21 @@ fn body_structure(raw: &[u8]) -> String {
 }
 
 fn mime_section(raw: &[u8], section: &str) -> Option<Vec<u8>> {
+    if let Some(at) = section.find(".HEADER.FIELDS") {
+        let root = parse_message(raw, mime_limits(raw.len())).ok()?;
+        let selected = part(&root, &section[..at])?;
+        let headers =
+            if selected.media_type.top == "message" && selected.media_type.subtype == "rfc822" {
+                header_body(selected.body).0
+            } else {
+                selected.headers.raw()
+            };
+        return Some(filter_headers(
+            headers,
+            &section[at + 1..],
+            section[at + 1..].starts_with("HEADER.FIELDS.NOT "),
+        ));
+    }
     let mut components = section.split('.').collect::<Vec<_>>();
     let suffix = components
         .last()
@@ -349,37 +367,43 @@ fn mime_section(raw: &[u8], section: &str) -> Option<Vec<u8>> {
     let root = parse_message(raw, mime_limits(raw.len())).ok()?;
     let part = part(&root, &components.join("."))?;
     Some(match suffix {
+        Some("HEADER")
+            if part.media_type.top == "message" && part.media_type.subtype == "rfc822" =>
+        {
+            header_body(part.body).0.to_vec()
+        }
         Some("MIME" | "HEADER") => part.headers.raw().to_vec(),
+        Some("TEXT") if part.media_type.top == "message" && part.media_type.subtype == "rfc822" => {
+            header_body(part.body).1.to_vec()
+        }
         Some("TEXT") | None => part.body.to_vec(),
         _ => return None,
     })
 }
 
-fn structure(part: &MimePart<'_>) -> String {
+fn structure(part: &MimePart<'_>, extended: bool) -> String {
     if !part.children.is_empty() && part.media_type.top == "multipart" {
-        return format!(
+        let basic = format!(
             "({} \"{}\")",
             part.children
                 .iter()
-                .map(structure)
+                .map(|child| structure(child, extended))
                 .collect::<Vec<_>>()
                 .join(" "),
             part.media_type.subtype.to_ascii_uppercase()
         );
+        if !extended {
+            return basic;
+        }
+        return format!(
+            "{} {} {} {} NIL)",
+            basic.strip_suffix(')').unwrap_or(&basic),
+            parameters(&part.media_type.parameters),
+            disposition(part),
+            language(part)
+        );
     }
-    let parameters = if part.media_type.parameters.is_empty() {
-        "NIL".into()
-    } else {
-        format!(
-            "({})",
-            part.media_type
-                .parameters
-                .iter()
-                .map(|(name, value)| format!("\"{}\" {}", name.to_ascii_uppercase(), quoted(value)))
-                .collect::<Vec<_>>()
-                .join(" ")
-        )
-    };
+    let parameters = parameters(&part.media_type.parameters);
     let encoding = match &part.transfer_encoding {
         TransferEncoding::SevenBit => "7BIT",
         TransferEncoding::EightBit => "8BIT",
@@ -395,7 +419,7 @@ fn structure(part: &MimePart<'_>) -> String {
         encoding.to_ascii_uppercase(),
         part.body.len()
     );
-    if part.media_type.top == "text" {
+    let mut result = if part.media_type.top == "text" {
         format!(
             "{base} {})",
             part.body
@@ -403,9 +427,67 @@ fn structure(part: &MimePart<'_>) -> String {
                 .count()
                 .saturating_sub(1)
         )
+    } else if part.media_type.top == "message" && part.media_type.subtype == "rfc822" {
+        let child = part.children.first();
+        let embedded = child.map_or_else(|| "NIL".into(), |child| structure(child, extended));
+        format!(
+            "{base} {} {} {})",
+            envelope(part.body)
+                .strip_prefix("ENVELOPE ")
+                .unwrap_or("NIL"),
+            embedded,
+            part.body
+                .split(|byte| *byte == b'\n')
+                .count()
+                .saturating_sub(1)
+        )
     } else {
         format!("{base})")
+    };
+    if extended {
+        result.pop();
+        result.push_str(" NIL ");
+        result.push_str(&disposition(part));
+        result.push(' ');
+        result.push_str(&language(part));
+        result.push_str(" NIL)");
     }
+    result
+}
+
+fn parameters(values: &[(String, Vec<u8>)]) -> String {
+    if values.is_empty() {
+        "NIL".into()
+    } else {
+        format!(
+            "({})",
+            values
+                .iter()
+                .map(|(name, value)| format!("\"{}\" {}", name.to_ascii_uppercase(), quoted(value)))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+    }
+}
+
+fn disposition(part: &MimePart<'_>) -> String {
+    part.disposition.as_ref().map_or_else(
+        || "NIL".into(),
+        |value| {
+            format!(
+                "(\"{}\" {})",
+                value.kind.to_ascii_uppercase(),
+                parameters(&value.parameters)
+            )
+        },
+    )
+}
+
+fn language(part: &MimePart<'_>) -> String {
+    part.headers
+        .get_all("Content-Language")
+        .next()
+        .map_or_else(|| "NIL".into(), |value| quoted(value.trim_ascii()))
 }
 
 fn mime_limits(size: usize) -> MimeLimits {
@@ -450,13 +532,31 @@ mod tests {
         );
         assert!(envelope(raw).contains("\"test\""));
         assert!(envelope(raw).contains("\"alice\" \"example.test\""));
-        assert!(body_structure(raw).starts_with("(\"TEXT\" \"PLAIN\""));
+        assert!(body_structure(raw, false).starts_with("(\"TEXT\" \"PLAIN\""));
         let multipart=b"Content-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\nContent-Type: text/plain\r\n\r\none\r\n--x\r\nContent-Type: text/html\r\n\r\n<b>two</b>\r\n--x--\r\n";
         assert_eq!(
             mime_section(multipart, "2").as_deref(),
             Some(b"<b>two</b>".as_slice())
         );
-        assert!(body_structure(multipart).contains("\"MIXED\""));
+        assert!(body_structure(multipart, true).contains("\"MIXED\""));
+        let attached = b"Content-Type: application/octet-stream; name=x\r\nContent-Disposition: attachment; filename=x\r\nContent-Language: en\r\n\r\nx";
+        let extended = body_structure(attached, true);
+        assert!(extended.contains("(\"ATTACHMENT\""));
+        assert!(extended.contains("\"en\""));
+        let encapsulated =
+            b"Content-Type: message/rfc822\r\n\r\nSubject: nested\r\nX-Drop: no\r\n\r\ninside\r\n";
+        assert_eq!(
+            mime_section(encapsulated, "1.HEADER").as_deref(),
+            Some(b"Subject: nested\r\nX-Drop: no\r\n\r\n".as_slice())
+        );
+        assert_eq!(
+            mime_section(encapsulated, "1.TEXT").as_deref(),
+            Some(b"inside\r\n".as_slice())
+        );
+        assert!(
+            mime_section(encapsulated, "1.HEADER.FIELDS (SUBJECT)")
+                .is_some_and(|headers| headers.starts_with(b"Subject: nested"))
+        );
         let encoded = b"Content-Transfer-Encoding: base64\r\n\r\nYm9keQ==";
         assert_eq!(decoded_section(encoded, ""), Some(b"body".to_vec()));
         assert!(binary_requests("BINARY.SIZE[]")[0].size_only);

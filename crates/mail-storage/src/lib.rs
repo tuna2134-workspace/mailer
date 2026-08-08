@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use mail_domain::{Alias, Domain, Mailbox, MailboxId, QueueId, Tenant, TenantId, User};
 use mail_mailbox::{FlagSet, StoreMode};
 use serde::{Deserialize, Serialize};
+use std::fs::File;
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use uuid::Uuid;
@@ -119,6 +120,22 @@ pub struct ImapMessage {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImapChange {
+    pub sequence: Option<u32>,
+    pub uid: u32,
+    pub modseq: u64,
+    pub flags: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImapChanges {
+    pub highest_modseq: u64,
+    pub message_count: u64,
+    pub changed: Vec<ImapChange>,
+    pub vanished: Vec<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ImapAppend<'a> {
     pub raw: &'a [u8],
     pub flags: &'a FlagSet,
@@ -130,6 +147,12 @@ pub struct StoreFlags {
     pub mode: StoreMode,
     pub values: FlagSet,
     pub unchanged_since: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConditionalStoreResult {
+    pub updated: Vec<MailboxMessageState>,
+    pub modified: Vec<u32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -631,6 +654,17 @@ pub trait ImapRepository: Send + Sync {
         ))
     }
 
+    async fn imap_changes(
+        &self,
+        _user_id: Uuid,
+        _mailbox_id: MailboxId,
+        _since_modseq: u64,
+    ) -> Result<ImapChanges, StorageError> {
+        Err(StorageError::Unavailable(
+            "IMAP synchronization is unsupported".into(),
+        ))
+    }
+
     async fn imap_append(
         &self,
         _user_id: Uuid,
@@ -639,6 +673,19 @@ pub trait ImapRepository: Send + Sync {
     ) -> Result<(u32, u32), StorageError> {
         Err(StorageError::Unavailable(
             "IMAP APPEND is unsupported".into(),
+        ))
+    }
+
+    async fn imap_append_file(
+        &self,
+        _user_id: Uuid,
+        _mailbox: &str,
+        _file: &File,
+        _flags: &FlagSet,
+        _internal_date: SystemTime,
+    ) -> Result<(u32, u32), StorageError> {
+        Err(StorageError::Unavailable(
+            "streaming IMAP APPEND is unsupported".into(),
         ))
     }
 
@@ -663,6 +710,21 @@ pub trait ImapRepository: Send + Sync {
         Err(StorageError::Unavailable(
             "IMAP STORE is unsupported".into(),
         ))
+    }
+
+    async fn imap_store_flags_conditional(
+        &self,
+        user_id: Uuid,
+        mailbox: MailboxId,
+        uids: &[u32],
+        update: &StoreFlags,
+    ) -> Result<ConditionalStoreResult, StorageError> {
+        self.imap_store_flags(user_id, mailbox, uids, update)
+            .await
+            .map(|updated| ConditionalStoreResult {
+                updated,
+                modified: Vec::new(),
+            })
     }
 
     async fn imap_expunge(

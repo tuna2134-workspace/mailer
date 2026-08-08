@@ -67,6 +67,7 @@ enum Query {
     Larger(usize, bool),
     Date(DateKind, Date),
     Set(SequenceSet, bool),
+    Modseq(u64),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -145,6 +146,23 @@ impl Parser<'_> {
                             .map_err(|_| CommandError::Bad("invalid UID set"))?,
                         true,
                     )),
+                    "MODSEQ" => {
+                        let first = self.value()?;
+                        let value = if first.parse::<u64>().is_ok() {
+                            first
+                        } else {
+                            let kind = self.value()?.to_ascii_lowercase();
+                            if !matches!(kind.as_str(), "shared" | "priv" | "all") {
+                                return Err(CommandError::Bad("invalid MODSEQ entry type"));
+                            }
+                            self.value()?
+                        };
+                        Ok(Query::Modseq(
+                            value
+                                .parse()
+                                .map_err(|_| CommandError::Bad("invalid MODSEQ value"))?,
+                        ))
+                    }
                     _ => SequenceSet::parse(value)
                         .map(|set| Query::Set(set, false))
                         .map_err(|_| CommandError::Bad("unsupported search criterion")),
@@ -227,6 +245,7 @@ impl Query {
                     value >= a.min(b) && value <= a.max(b)
                 })
             }
+            Self::Modseq(value) => message.modseq > *value,
         }
     }
 }
@@ -264,27 +283,32 @@ mod tests {
     }
     #[test]
     fn compound_header_body_size_uid_and_not() {
-        let message = message();
+        let sample = message();
         let values = ["OR", "FROM", "alice", "NOT", "BODY", "missing"]
             .map(|value| AString(value.as_bytes().to_vec()));
         assert_eq!(
-            messages(std::slice::from_ref(&message), &values).map_or(0, |found| found.len()),
+            messages(std::slice::from_ref(&sample), &values).map_or(0, |found| found.len()),
             1
         );
         let values = ["UID", "9", "LARGER", "10", "SUBJECT", "Quarterly report"]
             .map(|value| AString(value.as_bytes().to_vec()));
         assert_eq!(
-            messages(std::slice::from_ref(&message), &values).map_or(0, |found| found.len()),
+            messages(std::slice::from_ref(&sample), &values).map_or(0, |found| found.len()),
             1
         );
-        let mut first = message.clone();
+        let mut first = sample.clone();
         first.sequence = 1;
         first.uid = 8;
-        let last = message;
+        let last = sample;
         let values = [AString(b"*".to_vec())];
         let found = messages(&[first, last], &values).map_or(Vec::new(), |found| {
             found.into_iter().map(|message| message.uid).collect()
         });
         assert_eq!(found, [9]);
+        let values = [AString(b"MODSEQ".to_vec()), AString(b"0".to_vec())];
+        assert_eq!(
+            messages(std::slice::from_ref(&message()), &values).map_or(0, |found| found.len()),
+            1
+        );
     }
 }

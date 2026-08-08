@@ -45,6 +45,7 @@ pub enum CommandBody {
     Select {
         mailbox: MailboxName,
         examine: bool,
+        options: Option<String>,
     },
     Create(MailboxName),
     Delete(MailboxName),
@@ -79,12 +80,15 @@ pub enum CommandBody {
         set: SequenceSet,
         items: String,
         uid: bool,
+        changed_since: Option<u64>,
+        vanished: bool,
     },
     Store {
         set: SequenceSet,
         operation: String,
         flags: String,
         uid: bool,
+        unchanged_since: Option<u64>,
     },
     Search {
         criteria: Vec<AString>,
@@ -99,6 +103,7 @@ pub enum CommandBody {
     Expunge {
         uid_set: Option<SequenceSet>,
     },
+    Idle,
     Unknown(String),
 }
 
@@ -173,8 +178,8 @@ pub fn parse_command(line: &[u8], literals: &[Vec<u8>]) -> Result<Command, Parse
                 .map(|value| ascii(value).map(|item| item.to_ascii_uppercase()))
                 .collect::<Result<_, _>>()?,
         ),
-        "SELECT" if args.len() == 1 => select(args, false)?,
-        "EXAMINE" if args.len() == 1 => select(args, true)?,
+        "SELECT" if !args.is_empty() => select(args, false)?,
+        "EXAMINE" if !args.is_empty() => select(args, true)?,
         "CREATE" if args.len() == 1 => CommandBody::Create(mailbox(&args[0])?),
         "DELETE" if args.len() == 1 => CommandBody::Delete(mailbox(&args[0])?),
         "RENAME" if args.len() == 2 => CommandBody::Rename {
@@ -202,9 +207,7 @@ pub fn parse_command(line: &[u8], literals: &[Vec<u8>]) -> Result<Command, Parse
         "CLOSE" if args.is_empty() => CommandBody::Close,
         "UNSELECT" if args.is_empty() => CommandBody::Unselect,
         "CHECK" if args.is_empty() => CommandBody::Check,
-        "APPEND" if args.len() >= 2 && literals.len() == 1 && args.last() == literals.first() => {
-            append(args)?
-        }
+        "APPEND" if args.len() >= 2 && args.last() == literals.last() => append(args)?,
         "FETCH" if args.len() >= 2 => fetch(args, false)?,
         "STORE" if args.len() >= 3 => store(args, false)?,
         "SEARCH" if !args.is_empty() => CommandBody::Search {
@@ -213,6 +216,7 @@ pub fn parse_command(line: &[u8], literals: &[Vec<u8>]) -> Result<Command, Parse
         },
         "COPY" | "MOVE" if args.len() == 2 => copy(args, name == "MOVE", false)?,
         "EXPUNGE" if args.is_empty() => CommandBody::Expunge { uid_set: None },
+        "IDLE" if args.is_empty() => CommandBody::Idle,
         "UID" if !args.is_empty() => uid_command(args)?,
         _ => CommandBody::Unknown(name),
     };
@@ -234,6 +238,9 @@ fn select(args: &[Vec<u8>], examine: bool) -> Result<CommandBody, ParseError> {
     Ok(CommandBody::Select {
         mailbox: mailbox(&args[0])?,
         examine,
+        options: (!args[1..].is_empty())
+            .then(|| join_ascii(&args[1..]))
+            .transpose()?,
     })
 }
 
@@ -262,19 +269,60 @@ fn append(args: &[Vec<u8>]) -> Result<CommandBody, ParseError> {
 }
 
 fn fetch(args: &[Vec<u8>], uid: bool) -> Result<CommandBody, ParseError> {
+    let mut items = join_ascii(&args[1..])?;
+    let upper = items.to_ascii_uppercase();
+    let (changed_since, vanished) = if let Some(start) = upper.rfind(" (CHANGEDSINCE ") {
+        let modifier = upper[start + 2..]
+            .strip_suffix(')')
+            .ok_or(ParseError::InvalidSyntax)?;
+        let mut words = modifier.split_whitespace();
+        if words.next() != Some("CHANGEDSINCE") {
+            return Err(ParseError::InvalidSyntax);
+        }
+        let value = words
+            .next()
+            .ok_or(ParseError::InvalidSyntax)?
+            .parse()
+            .map_err(|_| ParseError::InvalidSyntax)?;
+        let vanished = match words.next() {
+            None => false,
+            Some("VANISHED") if words.next().is_none() => true,
+            _ => return Err(ParseError::InvalidSyntax),
+        };
+        items.truncate(start);
+        (Some(value), vanished)
+    } else {
+        (None, false)
+    };
     Ok(CommandBody::Fetch {
         set: SequenceSet::parse(&ascii(&args[0])?)?,
-        items: join_ascii(&args[1..])?,
+        items,
         uid,
+        changed_since,
+        vanished,
     })
 }
 
 fn store(args: &[Vec<u8>], uid: bool) -> Result<CommandBody, ParseError> {
+    let (offset, unchanged_since) = if args[1].eq_ignore_ascii_case(b"(UNCHANGEDSINCE") {
+        if args.len() < 5 {
+            return Err(ParseError::InvalidSyntax);
+        }
+        let value = ascii(&args[2])?
+            .strip_suffix(')')
+            .ok_or(ParseError::InvalidSyntax)?
+            .parse()
+            .map_err(|_| ParseError::InvalidSyntax)?;
+        (3, Some(value))
+    } else {
+        (1, None)
+    };
     Ok(CommandBody::Store {
         set: SequenceSet::parse(&ascii(&args[0])?)?,
-        operation: ascii(&args[1])?.to_ascii_uppercase(),
-        flags: join_ascii(&args[2..])?,
+        operation: ascii(&args[offset])?.to_ascii_uppercase(),
+        flags: join_ascii(&args[offset + 1..])?,
         uid,
+        unchanged_since,
     })
 }
 
@@ -486,6 +534,42 @@ mod tests {
             parse_command(b"A4 MOVE 2:4 Archive\r\n", &[])?.body,
             CommandBody::Copy {
                 move_messages: true,
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn parses_phase11_synchronization_commands() -> Result<(), ParseError> {
+        assert!(matches!(
+            parse_command(b"A IDLE\r\n", &[])?.body,
+            CommandBody::Idle
+        ));
+        assert!(matches!(
+            parse_command(b"A SELECT INBOX (QRESYNC (7 42))\r\n", &[])?.body,
+            CommandBody::Select { options: Some(value), .. } if value == "(QRESYNC (7 42))"
+        ));
+        assert!(matches!(
+            parse_command(
+                b"A UID FETCH 1:* (FLAGS MODSEQ) (CHANGEDSINCE 9 VANISHED)\r\n",
+                &[]
+            )?
+            .body,
+            CommandBody::Fetch {
+                changed_since: Some(9),
+                vanished: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_command(
+                b"A UID STORE 1:* (UNCHANGEDSINCE 9) +FLAGS (\\Seen)\r\n",
+                &[]
+            )?
+            .body,
+            CommandBody::Store {
+                unchanged_since: Some(9),
                 ..
             }
         ));

@@ -9,7 +9,7 @@ use mail_storage::ImapRepository;
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 use thiserror::Error;
 use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpListener,
     sync::Semaphore,
     time::timeout,
@@ -32,7 +32,7 @@ impl Default for ImapConfig {
     fn default() -> Self {
         Self {
             max_connections: 1024,
-            max_literal_size: 64 * 1024,
+            max_literal_size: 50 * 1024 * 1024,
             command_timeout: Duration::from_secs(300),
             tls: None,
             implicit_tls: false,
@@ -130,6 +130,9 @@ where
             }
         };
         let Some(frame) = frame else { return Ok(()) };
+        if let (Some(user), Some(mailbox)) = (authenticated_user, selected.as_mut()) {
+            write_sync_updates(&mut stream, repository, user, mailbox).await?;
+        }
         let Ok(command) = parse_command(&frame.line, &frame.literals) else {
             let tag = frame
                 .line
@@ -160,6 +163,23 @@ where
                     .await?;
                 stream = accept_tls(stream, config).await?;
                 session.tls_started();
+            }
+            Action::Idle { tag } => {
+                let (Some(user), Some(mailbox)) = (authenticated_user, selected.as_mut()) else {
+                    stream
+                        .write_all(tagged(&tag, Status::Bad, "no mailbox selected").as_bytes())
+                        .await?;
+                    continue;
+                };
+                run_idle(
+                    &mut stream,
+                    repository,
+                    user,
+                    mailbox,
+                    &tag,
+                    config.command_timeout,
+                )
+                .await?;
             }
             Action::Login {
                 tag,
@@ -230,7 +250,16 @@ where
                         .await?;
                     continue;
                 };
-                let outcome = commands::execute(repository, user, selected.as_ref(), command).await;
+                let outcome = commands::execute(
+                    repository,
+                    user,
+                    selected.as_ref(),
+                    command,
+                    frame.spooled_append.as_ref(),
+                    session.qresync_enabled(),
+                    session.condstore_enabled(),
+                )
+                .await;
                 match outcome {
                     Ok(result) => {
                         for response in result.responses {
@@ -243,6 +272,9 @@ where
                         if result.unselect {
                             selected = None;
                             session.mailbox_unselected();
+                        }
+                        if let Some(mailbox) = selected.as_mut() {
+                            write_sync_updates(&mut stream, repository, user, mailbox).await?;
                         }
                         stream
                             .write_all(tagged(&tag, Status::Ok, &result.completion).as_bytes())
@@ -268,6 +300,121 @@ where
             return Ok(());
         }
     }
+}
+
+async fn write_sync_updates<S: AsyncWrite + Unpin, R: ImapRepository>(
+    stream: &mut S,
+    repository: &R,
+    user: Uuid,
+    selected: &mut commands::Selected,
+) -> Result<(), ImapError> {
+    let changes = repository
+        .imap_changes(user, selected.mailbox.id, selected.observed_modseq)
+        .await
+        .map_err(|_| ImapError::Storage)?;
+    if changes.highest_modseq == selected.observed_modseq {
+        return Ok(());
+    }
+    if !changes.vanished.is_empty() {
+        if selected.qresync {
+            stream
+                .write_all(format!("* VANISHED {}\r\n", join_uids(&changes.vanished)).as_bytes())
+                .await?;
+        } else {
+            let mut sequences = changes
+                .vanished
+                .iter()
+                .filter_map(|uid| {
+                    selected
+                        .known_uids
+                        .iter()
+                        .position(|known| known == uid)
+                        .map(|position| u32::try_from(position + 1).unwrap_or(u32::MAX))
+                })
+                .collect::<Vec<_>>();
+            sequences.sort_unstable_by(|left, right| right.cmp(left));
+            for sequence in sequences {
+                stream
+                    .write_all(format!("* {sequence} EXPUNGE\r\n").as_bytes())
+                    .await?;
+            }
+        }
+        selected
+            .known_uids
+            .retain(|uid| !changes.vanished.contains(uid));
+    }
+    let new_message = changes
+        .changed
+        .iter()
+        .any(|change| !selected.known_uids.contains(&change.uid));
+    for change in &changes.changed {
+        if !selected.known_uids.contains(&change.uid) {
+            selected.known_uids.push(change.uid);
+        }
+    }
+    selected.known_uids.sort_unstable();
+    if new_message || changes.message_count != selected.mailbox.message_count {
+        stream
+            .write_all(format!("* {} EXISTS\r\n", changes.message_count).as_bytes())
+            .await?;
+    }
+    for response in commands::change_responses(&changes.changed, selected.condstore) {
+        stream.write_all(&response).await?;
+    }
+    selected.observed_modseq = changes.highest_modseq;
+    selected.mailbox.highest_modseq = changes.highest_modseq;
+    selected.mailbox.message_count = changes.message_count;
+    Ok(())
+}
+
+async fn run_idle<S: AsyncRead + AsyncWrite + Unpin, R: ImapRepository>(
+    stream: &mut S,
+    repository: &R,
+    user: Uuid,
+    selected: &mut commands::Selected,
+    tag: &str,
+    idle_timeout: Duration,
+) -> Result<(), ImapError> {
+    stream.write_all(b"+ idling\r\n").await?;
+    stream.flush().await?;
+    let deadline = tokio::time::sleep(idle_timeout);
+    tokio::pin!(deadline);
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut line = Vec::with_capacity(8);
+    loop {
+        let mut byte = [0_u8; 1];
+        tokio::select! {
+            () = &mut deadline => {
+                stream.write_all(b"* BYE IDLE timeout\r\n").await?;
+                return Err(ImapError::Timeout);
+            }
+            _ = interval.tick() => write_sync_updates(stream, repository, user, selected).await?,
+            read = stream.read(&mut byte) => {
+                if read? == 0 { return Ok(()); }
+                line.push(byte[0]);
+                if line.len() > 6 || (line.ends_with(b"\n") && !line.ends_with(b"\r\n")) {
+                    stream.write_all(tagged(tag, Status::Bad, "invalid IDLE continuation").as_bytes()).await?;
+                    return Ok(());
+                }
+                if line.ends_with(b"\r\n") {
+                    write_sync_updates(stream, repository, user, selected).await?;
+                    let status = if line.eq_ignore_ascii_case(b"DONE\r\n") { Status::Ok } else { Status::Bad };
+                    let message = if status == Status::Ok { "IDLE completed" } else { "invalid IDLE continuation" };
+                    stream.write_all(tagged(tag, status, message).as_bytes()).await?;
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+fn join_uids(values: &[u32]) -> String {
+    values
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn valid_recovery_tag(tag: &[u8]) -> bool {
@@ -336,12 +483,61 @@ mod tests {
     use super::*;
     use argon2::PasswordHasher as _;
     use async_trait::async_trait;
-    use mail_storage::{SmtpAuthAccount, StorageError};
+    use mail_domain::MailboxId;
+    use mail_storage::{ImapChange, ImapChanges, ImapMailbox, SmtpAuthAccount, StorageError};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, duplex};
     use uuid::Uuid;
 
     struct Repository {
         hash: Option<String>,
+    }
+
+    struct SyncRepository(AtomicBool);
+
+    #[async_trait]
+    impl ImapRepository for SyncRepository {
+        async fn imap_auth_account(
+            &self,
+            _identity: &str,
+        ) -> Result<Option<SmtpAuthAccount>, StorageError> {
+            Ok(None)
+        }
+
+        async fn record_imap_auth(
+            &self,
+            _user_id: Uuid,
+            _success: bool,
+        ) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        async fn imap_changes(
+            &self,
+            _user_id: Uuid,
+            _mailbox_id: MailboxId,
+            since_modseq: u64,
+        ) -> Result<ImapChanges, StorageError> {
+            if since_modseq == 1 && !self.0.swap(true, Ordering::SeqCst) {
+                return Ok(ImapChanges {
+                    highest_modseq: 2,
+                    message_count: 1,
+                    changed: vec![ImapChange {
+                        sequence: Some(1),
+                        uid: 1,
+                        modseq: 2,
+                        flags: vec!["\\Seen".into()],
+                    }],
+                    vanished: Vec::new(),
+                });
+            }
+            Ok(ImapChanges {
+                highest_modseq: 2,
+                message_count: 1,
+                changed: Vec::new(),
+                vanished: Vec::new(),
+            })
+        }
     }
 
     #[async_trait]
@@ -452,6 +648,55 @@ mod tests {
         line.clear();
         reader.read_line(&mut line).await?;
         assert_eq!(line, "* BYE [TOOBIG] literal exceeds configured limit\r\n");
+        task.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn idle_pushes_cross_session_changes_and_accepts_done()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut client, mut server) = duplex(4096);
+        let repository = SyncRepository(AtomicBool::new(false));
+        let task = tokio::spawn(async move {
+            let mut selected = commands::Selected {
+                mailbox: ImapMailbox {
+                    id: MailboxId::new(Uuid::new_v4()),
+                    name: "INBOX".into(),
+                    uid_validity: 1,
+                    uid_next: 1,
+                    highest_modseq: 1,
+                    message_count: 0,
+                    unseen_count: 0,
+                    subscribed: false,
+                },
+                read_only: false,
+                observed_modseq: 1,
+                qresync: true,
+                condstore: true,
+                known_uids: Vec::new(),
+            };
+            run_idle(
+                &mut server,
+                &repository,
+                Uuid::nil(),
+                &mut selected,
+                "A1",
+                Duration::from_secs(5),
+            )
+            .await
+        });
+        let mut buffer = vec![0; 256];
+        let count = timeout(Duration::from_secs(3), client.read(&mut buffer)).await??;
+        let mut output = buffer[..count].to_vec();
+        assert!(String::from_utf8_lossy(&output).contains("+ idling"));
+        client.write_all(b"DONE\r\n").await?;
+        while !String::from_utf8_lossy(&output).contains("A1 OK IDLE completed") {
+            let count = timeout(Duration::from_secs(3), client.read(&mut buffer)).await??;
+            output.extend_from_slice(&buffer[..count]);
+        }
+        let output = String::from_utf8_lossy(&output);
+        assert!(output.contains("* 1 EXISTS"));
+        assert!(output.contains("MODSEQ (2)"));
         task.await??;
         Ok(())
     }

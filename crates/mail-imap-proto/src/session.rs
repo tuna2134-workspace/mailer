@@ -29,6 +29,9 @@ pub enum Action {
         command: CommandBody,
     },
     Close(Vec<String>),
+    Idle {
+        tag: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -36,6 +39,13 @@ pub struct Session {
     state: State,
     tls_active: bool,
     tls_available: bool,
+    enabled: Enabled,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Enabled {
+    condstore: bool,
+    qresync: bool,
 }
 
 impl Session {
@@ -45,6 +55,10 @@ impl Session {
             state: State::NotAuthenticated,
             tls_active,
             tls_available,
+            enabled: Enabled {
+                condstore: false,
+                qresync: false,
+            },
         }
     }
 
@@ -64,6 +78,9 @@ impl Session {
             "UIDPLUS".into(),
             "MOVE".into(),
             "BINARY".into(),
+            "IDLE".into(),
+            "CONDSTORE".into(),
+            "QRESYNC".into(),
         ];
         if self.tls_available && !self.tls_active && self.state == State::NotAuthenticated {
             values.extend(["STARTTLS".into(), "LOGINDISABLED".into()]);
@@ -115,10 +132,24 @@ impl Session {
                     password: password.0,
                 }
             }
-            CommandBody::Enable(_)
+            CommandBody::Enable(capabilities)
                 if matches!(self.state, State::Authenticated | State::Selected) =>
             {
-                let enabled: Vec<String> = Vec::new();
+                let mut enabled = Vec::new();
+                for capability in capabilities {
+                    match capability.as_str() {
+                        "CONDSTORE" => {
+                            self.enabled.condstore = true;
+                            enabled.push(capability);
+                        }
+                        "QRESYNC" => {
+                            self.enabled.condstore = true;
+                            self.enabled.qresync = true;
+                            enabled.push(capability);
+                        }
+                        _ => {}
+                    }
+                }
                 let response = if enabled.is_empty() {
                     untagged("ENABLED")
                 } else {
@@ -151,6 +182,7 @@ impl Session {
             {
                 Action::Execute { tag, command }
             }
+            CommandBody::Idle if self.state == State::Selected => Action::Idle { tag },
             CommandBody::Unknown(_) => {
                 Action::Responses(vec![tagged(&tag, Status::Bad, "unknown command")])
             }
@@ -165,6 +197,17 @@ impl Session {
     pub fn tls_started(&mut self) {
         self.state = State::NotAuthenticated;
         self.tls_active = true;
+        self.enabled = Enabled::default();
+    }
+
+    #[must_use]
+    pub const fn condstore_enabled(&self) -> bool {
+        self.enabled.condstore
+    }
+
+    #[must_use]
+    pub const fn qresync_enabled(&self) -> bool {
+        self.enabled.qresync
     }
 
     pub fn authentication_succeeded(&mut self) {
@@ -210,6 +253,12 @@ mod tests {
             session.command(parse_command(b"A3 ENABLE UNKNOWN\r\n", &[])?),
             Action::Responses(_)
         ));
+        assert!(matches!(
+            session.command(parse_command(b"A4 ENABLE QRESYNC\r\n", &[])?),
+            Action::Responses(_)
+        ));
+        assert!(session.qresync_enabled());
+        assert!(session.condstore_enabled());
         Ok(())
     }
 }

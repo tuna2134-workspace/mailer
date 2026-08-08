@@ -1564,6 +1564,7 @@ dependencies = [
  "mail-storage",
  "rcgen",
  "rustls",
+ "tempfile",
  "thiserror",
  "time",
  "tokio",
@@ -1628,6 +1629,7 @@ dependencies = [
  "mail-migrations",
  "mail-storage",
  "sqlx",
+ "tempfile",
  "tokio",
  "uuid",
 ]

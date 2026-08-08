@@ -20,7 +20,9 @@ Phase 8 mailbox storage state, UID/UIDVALIDITY/MODSEQ allocation, flags, expunge
 
 Phase 9 IMAP4rev2 framing, parser/serializer, connection states, STARTTLS/implicit TLS, TLS-only authentication, and basic commands are implemented; see `docs/phase-9-report.md`.
 
-Phase 10 now has a PostgreSQL-backed command path for mailbox and message operations, including sequence/UID separation, UIDPLUS response codes, broad SEARCH, nested MIME FETCH sections, APPEND options, atomic STORE, COPY/MOVE, and EXPUNGE; see `docs/phase-10-report.md`. Large-literal streaming and remaining extended FETCH serialization edge cases remain before Phase 10 can be marked complete.
+Phase 10 is complete with PostgreSQL-backed mailbox/message operations, sequence/UID separation, UIDPLUS responses, SEARCH, nested MIME FETCH, extended BODYSTRUCTURE, streaming APPEND, atomic STORE, COPY/MOVE, and EXPUNGE; see `docs/phase-10-report.md`.
+
+Phase 11 is complete with IDLE, CONDSTORE, QRESYNC, CHANGEDSINCE, UNCHANGEDSINCE/MODIFIED, HIGHESTMODSEQ, VANISHED, durable reconnect synchronization, and PostgreSQL-backed cross-session notifications; see `docs/phase-11-report.md`.
 
 ## Phase 1 detailed plan
 

@@ -6,11 +6,15 @@ use async_trait::async_trait;
 use mail_domain::MailboxId;
 use mail_mailbox::{FlagSet, SystemFlag};
 use mail_storage::{
-    ImapAppend, ImapMailbox, ImapMessage, ImapRepository, MailboxMessageState, SmtpAuthAccount,
-    StorageError, StoreFlags,
+    ConditionalStoreResult, ImapAppend, ImapChange, ImapChanges, ImapMailbox, ImapMessage,
+    ImapRepository, MailboxMessageState, SmtpAuthAccount, StorageError, StoreFlags,
 };
 use sqlx::Row;
-use std::time::{Duration, UNIX_EPOCH};
+use std::{
+    fs::File,
+    time::{Duration, UNIX_EPOCH},
+};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use uuid::Uuid;
 
 #[async_trait]
@@ -133,6 +137,49 @@ impl ImapRepository for PostgresRepository {
         rows.iter().map(message).collect()
     }
 
+    async fn imap_changes(
+        &self,
+        user_id: Uuid,
+        mailbox_id: MailboxId,
+        since_modseq: u64,
+    ) -> Result<ImapChanges, StorageError> {
+        let since = i64::try_from(since_modseq).map_err(|_| StorageError::Conflict)?;
+        let mailbox = sqlx::query(
+            "SELECT highest_modseq,message_count FROM mailboxes WHERE id=$1 AND user_id=$2",
+        )
+        .bind(mailbox_id.into_uuid())
+        .bind(user_id)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(map_sqlx)?
+        .ok_or(StorageError::NotFound)?;
+        let rows = sqlx::query("WITH active AS (SELECT mm.uid,mm.modseq,mm.flags||mm.keywords AS flags,row_number() OVER(ORDER BY mm.uid)::bigint AS sequence FROM mailbox_messages mm WHERE mm.mailbox_id=$1 AND mm.expunged_at IS NULL) SELECT uid,modseq,flags,sequence FROM active WHERE modseq>$2 ORDER BY uid")
+            .bind(mailbox_id.into_uuid()).bind(since).fetch_all(self.pool()).await.map_err(map_sqlx)?;
+        let changed = rows
+            .iter()
+            .map(|row| {
+                Ok(ImapChange {
+                    sequence: Some(convert(row, "sequence")?),
+                    uid: convert(row, "uid")?,
+                    modseq: convert64(row, "modseq")?,
+                    flags: row.try_get("flags").map_err(map_sqlx)?,
+                })
+            })
+            .collect::<Result<Vec<_>, StorageError>>()?;
+        let vanished_rows = sqlx::query("SELECT uid FROM mailbox_messages WHERE mailbox_id=$1 AND expunged_at IS NOT NULL AND modseq>$2 ORDER BY uid")
+            .bind(mailbox_id.into_uuid()).bind(since).fetch_all(self.pool()).await.map_err(map_sqlx)?;
+        let vanished = vanished_rows
+            .iter()
+            .map(|row| convert(row, "uid"))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ImapChanges {
+            highest_modseq: convert64(&mailbox, "highest_modseq")?,
+            message_count: convert64(&mailbox, "message_count")?,
+            changed,
+            vanished,
+        })
+    }
+
     async fn imap_append(
         &self,
         user_id: Uuid,
@@ -156,6 +203,84 @@ impl ImapRepository for PostgresRepository {
         let uid: i64 = allocated.try_get("uid").map_err(map_sqlx)?;
         sqlx::query("INSERT INTO mailbox_messages(mailbox_id,message_id,uid,modseq,flags,keywords,internal_date,object_id) SELECT $1,$2,$3,highest_modseq,$4,$5,to_timestamp($6),$7 FROM mailboxes WHERE id=$1")
             .bind(mailbox_id).bind(message_id).bind(uid).bind(append.flags.system_names()).bind(append.flags.keywords.iter().cloned().collect::<Vec<_>>()).bind(unix_seconds(Some(append.internal_date))?).bind(Uuid::new_v4()).execute(&mut *tx).await.map_err(map_sqlx)?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok((
+            u32::try_from(owner.try_get::<i64, _>("uid_validity").map_err(map_sqlx)?)
+                .map_err(|_| StorageError::Conflict)?,
+            u32::try_from(uid).map_err(|_| StorageError::Conflict)?,
+        ))
+    }
+
+    async fn imap_append_file(
+        &self,
+        user_id: Uuid,
+        mailbox_name: &str,
+        file: &File,
+        flags: &FlagSet,
+        internal_date: std::time::SystemTime,
+    ) -> Result<(u32, u32), StorageError> {
+        let ingestion_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO smtp_ingestions(id,state) VALUES($1,'receiving')")
+            .bind(ingestion_id)
+            .execute(self.pool())
+            .await
+            .map_err(map_sqlx)?;
+        let mut file = tokio::fs::File::from_std(
+            file.try_clone()
+                .map_err(|error| StorageError::Unavailable(error.to_string()))?,
+        );
+        file.rewind()
+            .await
+            .map_err(|error| StorageError::Unavailable(error.to_string()))?;
+        let mut buffer = vec![0; 64 * 1024];
+        let mut position = 0_i32;
+        let mut size = 0_i64;
+        loop {
+            let count = file
+                .read(&mut buffer)
+                .await
+                .map_err(|error| StorageError::Unavailable(error.to_string()))?;
+            if count == 0 {
+                break;
+            }
+            sqlx::query(
+                "INSERT INTO smtp_ingestion_chunks(ingestion_id,position,content) VALUES($1,$2,$3)",
+            )
+            .bind(ingestion_id)
+            .bind(position)
+            .bind(&buffer[..count])
+            .execute(self.pool())
+            .await
+            .map_err(map_sqlx)?;
+            position = position
+                .checked_add(1)
+                .ok_or(StorageError::CounterExhausted)?;
+            size = size
+                .checked_add(i64::try_from(count).map_err(|_| StorageError::CounterExhausted)?)
+                .ok_or(StorageError::CounterExhausted)?;
+        }
+
+        let mut tx = self.pool().begin().await.map_err(map_sqlx)?;
+        let owner = sqlx::query("SELECT m.id,m.tenant_id,m.uid_validity FROM mailboxes m JOIN users u ON u.id=m.user_id WHERE m.user_id=$1 AND m.name=$2 AND u.status='active' FOR UPDATE OF m,u")
+            .bind(user_id).bind(mailbox_name).fetch_optional(&mut *tx).await.map_err(map_sqlx)?.ok_or(StorageError::NotFound)?;
+        let mailbox_id: Uuid = owner.try_get("id").map_err(map_sqlx)?;
+        let tenant_id: Uuid = owner.try_get("tenant_id").map_err(map_sqlx)?;
+        if sqlx::query("UPDATE users SET used_bytes=used_bytes+$2 WHERE id=$1 AND used_bytes<=quota_bytes-$2").bind(user_id).bind(size).execute(&mut *tx).await.map_err(map_sqlx)?.rows_affected()!=1
+            || sqlx::query("UPDATE tenants SET used_bytes=used_bytes+$2 WHERE id=$1 AND used_bytes<=quota_bytes-$2").bind(tenant_id).bind(size).execute(&mut *tx).await.map_err(map_sqlx)?.rows_affected()!=1 { return Err(StorageError::QuotaExceeded); }
+        let message_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO messages(id,tenant_id,raw_message,envelope_sender,received_at,message_size,content_hash,storage_state) SELECT $1,$2,mail_bytea_concat(content),'',clock_timestamp(),$4,digest(mail_bytea_concat(content),'sha256'),'committed' FROM smtp_ingestion_chunks WHERE ingestion_id=$3")
+            .bind(message_id).bind(tenant_id).bind(ingestion_id).bind(size).execute(&mut *tx).await.map_err(map_sqlx)?;
+        let unseen = i64::from(!flags.system.contains(&SystemFlag::Seen));
+        let allocated=sqlx::query("UPDATE mailboxes SET uid_next=uid_next+1,highest_modseq=highest_modseq+1,message_count=message_count+1,unseen_count=unseen_count+$2 WHERE id=$1 AND uid_next<4294967295 AND highest_modseq<9223372036854775807 RETURNING uid_next-1 AS uid")
+            .bind(mailbox_id).bind(unseen).fetch_optional(&mut *tx).await.map_err(map_sqlx)?.ok_or(StorageError::CounterExhausted)?;
+        let uid: i64 = allocated.try_get("uid").map_err(map_sqlx)?;
+        sqlx::query("INSERT INTO mailbox_messages(mailbox_id,message_id,uid,modseq,flags,keywords,internal_date,object_id) SELECT $1,$2,$3,highest_modseq,$4,$5,to_timestamp($6),$7 FROM mailboxes WHERE id=$1")
+            .bind(mailbox_id).bind(message_id).bind(uid).bind(flags.system_names()).bind(flags.keywords.iter().cloned().collect::<Vec<_>>()).bind(unix_seconds(Some(internal_date))?).bind(Uuid::new_v4()).execute(&mut *tx).await.map_err(map_sqlx)?;
+        sqlx::query("DELETE FROM smtp_ingestions WHERE id=$1")
+            .bind(ingestion_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
         tx.commit().await.map_err(map_sqlx)?;
         Ok((
             u32::try_from(owner.try_get::<i64, _>("uid_validity").map_err(map_sqlx)?)
@@ -239,6 +364,41 @@ impl ImapRepository for PostgresRepository {
         }
         tx.commit().await.map_err(map_sqlx)?;
         Ok(states)
+    }
+
+    async fn imap_store_flags_conditional(
+        &self,
+        user_id: Uuid,
+        mailbox: MailboxId,
+        uids: &[u32],
+        update: &StoreFlags,
+    ) -> Result<ConditionalStoreResult, StorageError> {
+        let mut tx = self.pool().begin().await.map_err(map_sqlx)?;
+        let mut updated = Vec::with_capacity(uids.len());
+        let mut modified = Vec::new();
+        for uid in uids {
+            let row=sqlx::query("SELECT mm.message_id,mm.uid,mm.modseq,mm.flags,mm.keywords FROM mailbox_messages mm JOIN mailboxes m ON m.id=mm.mailbox_id WHERE m.user_id=$1 AND m.id=$2 AND mm.uid=$3 AND mm.expunged_at IS NULL FOR UPDATE OF mm,m")
+                .bind(user_id).bind(mailbox.into_uuid()).bind(i64::from(*uid)).fetch_optional(&mut *tx).await.map_err(map_sqlx)?.ok_or(StorageError::NotFound)?;
+            let current_modseq: i64 = row.try_get("modseq").map_err(map_sqlx)?;
+            if update.unchanged_since.is_some_and(|limit| {
+                u64::try_from(current_modseq).map_or(true, |current| current > limit)
+            }) {
+                modified.push(*uid);
+                continue;
+            }
+            let current = stored_flags(&row)?;
+            let next = apply_store(current.clone(), update);
+            let next =
+                FlagSet::new(next.system, next.keywords).map_err(|_| StorageError::Conflict)?;
+            let unseen_delta = i64::from(next_seen(&current)) - i64::from(next_seen(&next));
+            let modseq:i64=sqlx::query_scalar("UPDATE mailboxes SET highest_modseq=highest_modseq+1,unseen_count=unseen_count+$3,version=version+1 WHERE id=$1 AND user_id=$2 AND highest_modseq<9223372036854775807 AND unseen_count+$3 BETWEEN 0 AND message_count RETURNING highest_modseq")
+                .bind(mailbox.into_uuid()).bind(user_id).bind(unseen_delta).fetch_optional(&mut *tx).await.map_err(map_sqlx)?.ok_or(StorageError::CounterExhausted)?;
+            let state=sqlx::query("UPDATE mailbox_messages SET flags=$4,keywords=$5,modseq=$6 WHERE mailbox_id=$1 AND uid=$2 AND message_id=$3 RETURNING message_id,uid,modseq,flags,keywords,extract(epoch FROM internal_date)::bigint AS internal_date,extract(epoch FROM saved_date)::bigint AS saved_date,object_id,expunged_at IS NOT NULL AS expunged")
+                .bind(mailbox.into_uuid()).bind(i64::from(*uid)).bind(row.try_get::<Uuid,_>("message_id").map_err(map_sqlx)?).bind(next.system_names()).bind(next.keywords.into_iter().collect::<Vec<_>>()).bind(modseq).fetch_one(&mut *tx).await.map_err(map_sqlx)?;
+            updated.push(mailbox_message_state(&state)?);
+        }
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(ConditionalStoreResult { updated, modified })
     }
 
     async fn imap_expunge(

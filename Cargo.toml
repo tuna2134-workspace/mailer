@@ -53,7 +53,7 @@ sha2 = "0.10.9"
 subtle = "2.6.1"
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres", "migrate", "macros", "uuid"] }
 thiserror = "2.0.19"
-tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = "0.26.4"
 tokio-rustls-acme = "0.9.1"
 rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
@@ -66,6 +66,7 @@ tower-http = { version = "0.7.0", features = ["catch-panic", "cors", "limit", "r
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "query", "rustls"] }
 rcgen = "0.14.8"
 uuid = { version = "1.24.0", features = ["serde", "v4"] }
+tempfile = "3.23.0"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

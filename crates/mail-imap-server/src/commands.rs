@@ -6,7 +6,7 @@ use mail_mailbox::{FlagSet, StoreMode, SystemFlag};
 use mail_storage::{
     ImapAppend, ImapMailbox, ImapMessage, ImapRepository, StorageError, StoreFlags,
 };
-use std::time::SystemTime;
+use std::{fs::File, time::SystemTime};
 use time::{OffsetDateTime, format_description};
 use uuid::Uuid;
 
@@ -14,6 +14,10 @@ use uuid::Uuid;
 pub struct Selected {
     pub mailbox: ImapMailbox,
     pub read_only: bool,
+    pub observed_modseq: u64,
+    pub qresync: bool,
+    pub condstore: bool,
+    pub known_uids: Vec<u32>,
 }
 
 pub struct Outcome {
@@ -34,6 +38,9 @@ pub async fn execute<R: ImapRepository>(
     user: Uuid,
     selected: Option<&Selected>,
     command: CommandBody,
+    spooled_append: Option<&File>,
+    qresync_enabled: bool,
+    condstore_enabled: bool,
 ) -> Result<Outcome, CommandError> {
     let mut out = Outcome {
         responses: Vec::new(),
@@ -42,7 +49,11 @@ pub async fn execute<R: ImapRepository>(
         unselect: false,
     };
     match command {
-        CommandBody::Select { mailbox, examine } => {
+        CommandBody::Select {
+            mailbox,
+            examine,
+            options,
+        } => {
             let name = text(&mailbox)?;
             let mailbox = repo
                 .imap_mailboxes(user)
@@ -51,7 +62,45 @@ pub async fn execute<R: ImapRepository>(
                 .into_iter()
                 .find(|item| item.name.eq_ignore_ascii_case(name))
                 .ok_or(CommandError::No("mailbox not found"))?;
+            let observed_modseq = mailbox.highest_modseq;
+            let known_uids = repo
+                .imap_messages(user, mailbox.id)
+                .await
+                .map_err(storage)?
+                .into_iter()
+                .map(|message| message.uid)
+                .collect();
+            let selection = selection_options(options.as_deref(), qresync_enabled)?;
             out.responses.extend(select_responses(&mailbox));
+            if let Some(request) = &selection.qresync {
+                if request.uid_validity == mailbox.uid_validity {
+                    let changes = repo
+                        .imap_changes(user, mailbox.id, request.modseq)
+                        .await
+                        .map_err(storage)?;
+                    let vanished = request.known_uids.as_ref().map_or_else(
+                        || changes.vanished.clone(),
+                        |known| {
+                            changes
+                                .vanished
+                                .iter()
+                                .copied()
+                                .filter(|uid| {
+                                    set_contains(known, *uid, mailbox.uid_next.saturating_sub(1))
+                                })
+                                .collect()
+                        },
+                    );
+                    if !vanished.is_empty() {
+                        out.responses.push(
+                            format!("* VANISHED (EARLIER) {}\r\n", join_numbers(&vanished))
+                                .into_bytes(),
+                        );
+                    }
+                    out.responses
+                        .extend(change_responses(&changes.changed, true));
+                }
+            }
             out.completion = if examine {
                 "[READ-ONLY] EXAMINE completed"
             } else {
@@ -61,6 +110,10 @@ pub async fn execute<R: ImapRepository>(
             out.select = Some(Selected {
                 mailbox,
                 read_only: examine,
+                observed_modseq,
+                qresync: selection.qresync.is_some(),
+                condstore: selection.condstore || condstore_enabled,
+                known_uids,
             });
         }
         CommandBody::Create(name) => {
@@ -242,8 +295,11 @@ pub async fn execute<R: ImapRepository>(
                 .map(parse_internal_date)
                 .transpose()?
                 .unwrap_or_else(SystemTime::now);
-            let (validity, uid) = repo
-                .imap_append(
+            let result = if let Some(path) = spooled_append {
+                repo.imap_append_file(user, text(&mailbox)?, path, &flags, internal_date)
+                    .await
+            } else {
+                repo.imap_append(
                     user,
                     text(&mailbox)?,
                     &ImapAppend {
@@ -253,11 +309,21 @@ pub async fn execute<R: ImapRepository>(
                     },
                 )
                 .await
-                .map_err(storage)?;
+            };
+            let (validity, uid) = result.map_err(storage)?;
             out.completion = format!("[APPENDUID {validity} {uid}] APPEND completed");
         }
-        CommandBody::Fetch { set, items, uid } => {
+        CommandBody::Fetch {
+            set,
+            items,
+            uid,
+            changed_since,
+            vanished,
+        } => {
             let selected = selected.ok_or(CommandError::Bad("no mailbox selected"))?;
+            if changed_since.is_some() && !selected.condstore {
+                return Err(CommandError::Bad("CHANGEDSINCE requires CONDSTORE"));
+            }
             let mut items = match items.to_ascii_uppercase().as_str() {
                 "ALL" => "FLAGS INTERNALDATE RFC822.SIZE ENVELOPE".into(),
                 "FAST" => "FLAGS INTERNALDATE RFC822.SIZE".into(),
@@ -298,38 +364,75 @@ pub async fn execute<R: ImapRepository>(
                     .await
                     .map_err(storage)?;
             }
-            for message in chosen(&messages, &set, uid) {
+            if vanished {
+                if !selected.qresync || changed_since.is_none() {
+                    return Err(CommandError::Bad(
+                        "VANISHED requires QRESYNC and CHANGEDSINCE",
+                    ));
+                }
+                let changes = repo
+                    .imap_changes(user, selected.mailbox.id, changed_since.unwrap_or(0))
+                    .await
+                    .map_err(storage)?;
+                if !changes.vanished.is_empty() {
+                    out.responses.push(
+                        format!("* VANISHED {}\r\n", join_numbers(&changes.vanished)).into_bytes(),
+                    );
+                }
+            }
+            for message in chosen(&messages, &set, uid)
+                .into_iter()
+                .filter(|message| changed_since.is_none_or(|since| message.modseq > since))
+            {
                 out.responses.push(fetch::response(message, &items));
             }
             out.completion = "FETCH completed".into();
         }
         CommandBody::Search { criteria, uid } => {
             let selected = selected.ok_or(CommandError::Bad("no mailbox selected"))?;
+            let (criteria, charset) = search_criteria(&criteria)?;
             let messages = repo
                 .imap_messages(user, selected.mailbox.id)
                 .await
                 .map_err(storage)?;
-            let found = search::messages(&messages, &criteria)?;
+            let found = search::messages(&messages, criteria)?;
+            let uses_modseq = criteria
+                .iter()
+                .any(|value| value.0.eq_ignore_ascii_case(b"MODSEQ"));
+            if uses_modseq && !selected.condstore {
+                return Err(CommandError::Bad("MODSEQ requires CONDSTORE"));
+            }
+            let suffix = if uses_modseq {
+                format!(" (MODSEQ {})", selected.mailbox.highest_modseq)
+            } else {
+                String::new()
+            };
             out.responses.push(
                 format!(
-                    "* SEARCH {}\r\n",
+                    "* SEARCH {}{}\r\n",
                     found
                         .iter()
                         .map(|m| if uid { m.uid } else { m.sequence }.to_string())
                         .collect::<Vec<_>>()
-                        .join(" ")
+                        .join(" "),
+                    suffix
                 )
                 .into_bytes(),
             );
             out.completion = "SEARCH completed".into();
+            let _ = charset;
         }
         CommandBody::Store {
             set,
             operation,
             flags,
             uid,
+            unchanged_since,
         } => {
             let selected = selected.ok_or(CommandError::Bad("no mailbox selected"))?;
+            if unchanged_since.is_some() && !selected.condstore {
+                return Err(CommandError::Bad("UNCHANGEDSINCE requires CONDSTORE"));
+            }
             if selected.read_only {
                 return Err(CommandError::No("mailbox is read-only"));
             }
@@ -339,23 +442,46 @@ pub async fn execute<R: ImapRepository>(
                 .map_err(storage)?;
             let targets = chosen(&messages, &set, uid);
             let uids = targets.iter().map(|m| m.uid).collect::<Vec<_>>();
-            let update = store_update(&operation, &flags)?;
+            let mut update = store_update(&operation, &flags)?;
+            update.unchanged_since = unchanged_since;
             let silent = operation.ends_with(".SILENT");
-            let states = repo
-                .imap_store_flags(user, selected.mailbox.id, &uids, &update)
+            let result = repo
+                .imap_store_flags_conditional(user, selected.mailbox.id, &uids, &update)
                 .await
                 .map_err(storage)?;
+            if !result.modified.is_empty() {
+                out.responses.push(
+                    format!(
+                        "* OK [MODIFIED {}] conditional STORE conflicts\r\n",
+                        join_numbers(&result.modified)
+                    )
+                    .into_bytes(),
+                );
+            }
             if !silent {
-                for (message, state) in targets.into_iter().zip(states) {
-                    out.responses.push(
+                for state in result.updated {
+                    let sequence = messages
+                        .iter()
+                        .find(|message| message.uid == state.uid)
+                        .map_or(state.uid, |message| message.sequence);
+                    out.responses.push(if selected.condstore {
+                        format!(
+                            "* {} FETCH (FLAGS ({}) UID {} MODSEQ ({}))\r\n",
+                            sequence,
+                            flags_text(&state.flags),
+                            state.uid,
+                            state.modseq,
+                        )
+                        .into_bytes()
+                    } else {
                         format!(
                             "* {} FETCH (FLAGS ({}) UID {})\r\n",
-                            message.sequence,
+                            sequence,
                             flags_text(&state.flags),
                             state.uid
                         )
-                        .into_bytes(),
-                    );
+                        .into_bytes()
+                    });
                 }
             }
             out.completion = "STORE completed".into();
@@ -419,25 +545,151 @@ pub async fn execute<R: ImapRepository>(
                     .map(|m| m.uid)
                     .collect::<Vec<_>>()
             });
-            let removed = repo
-                .imap_expunge(user, selected.mailbox.id, filter.as_deref())
+            repo.imap_expunge(user, selected.mailbox.id, filter.as_deref())
                 .await
                 .map_err(storage)?;
-            let mut sequences = before
-                .iter()
-                .filter(|m| removed.contains(&m.uid))
-                .map(|m| m.sequence)
-                .collect::<Vec<_>>();
-            sequences.sort_unstable_by(|a, b| b.cmp(a));
-            for sequence in sequences {
-                out.responses
-                    .push(format!("* {sequence} EXPUNGE\r\n").into_bytes());
-            }
             out.completion = "EXPUNGE completed".into();
         }
         _ => return Err(CommandError::Bad("unsupported command")),
     }
     Ok(out)
+}
+
+fn search_criteria(
+    criteria: &[mail_imap_proto::AString],
+) -> Result<(&[mail_imap_proto::AString], Option<&str>), CommandError> {
+    if !criteria
+        .first()
+        .is_some_and(|value| value.0.eq_ignore_ascii_case(b"CHARSET"))
+    {
+        return Ok((criteria, None));
+    }
+    let charset = criteria
+        .get(1)
+        .and_then(|value| std::str::from_utf8(&value.0).ok())
+        .ok_or(CommandError::Bad("missing SEARCH charset"))?;
+    if !charset.eq_ignore_ascii_case("UTF-8") && !charset.eq_ignore_ascii_case("US-ASCII") {
+        return Err(CommandError::No(
+            "[BADCHARSET (UTF-8 US-ASCII)] unsupported charset",
+        ));
+    }
+    if criteria.len() == 2 {
+        return Err(CommandError::Bad("missing SEARCH criterion"));
+    }
+    Ok((&criteria[2..], Some(charset)))
+}
+
+struct SelectionOptions {
+    qresync: Option<QresyncRequest>,
+    condstore: bool,
+}
+
+struct QresyncRequest {
+    uid_validity: u32,
+    modseq: u64,
+    known_uids: Option<SequenceSet>,
+}
+
+fn selection_options(value: Option<&str>, enabled: bool) -> Result<SelectionOptions, CommandError> {
+    let Some(value) = value else {
+        return Ok(SelectionOptions {
+            qresync: None,
+            condstore: false,
+        });
+    };
+    let upper = value.to_ascii_uppercase();
+    if upper == "(CONDSTORE)" {
+        return Ok(SelectionOptions {
+            qresync: None,
+            condstore: true,
+        });
+    }
+    if !enabled || !upper.starts_with("(QRESYNC (") || !upper.ends_with("))") {
+        return Err(CommandError::Bad("invalid or disabled SELECT option"));
+    }
+    let inner = &upper[10..upper.len() - 2];
+    let mut values = inner.split_whitespace();
+    let validity = values
+        .next()
+        .ok_or(CommandError::Bad("invalid QRESYNC parameters"))?
+        .parse()
+        .map_err(|_| CommandError::Bad("invalid QRESYNC UIDVALIDITY"))?;
+    let modseq = values
+        .next()
+        .ok_or(CommandError::Bad("invalid QRESYNC parameters"))?
+        .parse()
+        .map_err(|_| CommandError::Bad("invalid QRESYNC MODSEQ"))?;
+    let rest = values.collect::<Vec<_>>();
+    let has_known = rest.first().is_some_and(|value| !value.starts_with('('));
+    let known_uids = rest
+        .first()
+        .filter(|_| has_known)
+        .map(|value| SequenceSet::parse(value))
+        .transpose()
+        .map_err(|_| CommandError::Bad("invalid QRESYNC known UID set"))?;
+    let remaining = rest[usize::from(has_known)..].join(" ");
+    if !remaining.is_empty() {
+        let mapping = remaining
+            .strip_prefix('(')
+            .and_then(|value| value.strip_suffix(')'))
+            .ok_or(CommandError::Bad("invalid QRESYNC sequence match data"))?;
+        let mut sets = mapping.split_whitespace();
+        SequenceSet::parse(
+            sets.next()
+                .ok_or(CommandError::Bad("invalid QRESYNC sequence match data"))?,
+        )
+        .map_err(|_| CommandError::Bad("invalid QRESYNC sequence match data"))?;
+        SequenceSet::parse(
+            sets.next()
+                .ok_or(CommandError::Bad("invalid QRESYNC sequence match data"))?,
+        )
+        .map_err(|_| CommandError::Bad("invalid QRESYNC sequence match data"))?;
+        if sets.next().is_some() {
+            return Err(CommandError::Bad("invalid QRESYNC sequence match data"));
+        }
+    }
+    Ok(SelectionOptions {
+        qresync: Some(QresyncRequest {
+            uid_validity: validity,
+            modseq,
+            known_uids,
+        }),
+        condstore: true,
+    })
+}
+
+fn set_contains(set: &SequenceSet, value: u32, largest: u32) -> bool {
+    set.0.iter().any(|range| {
+        let start = sequence(range.start, largest);
+        let end = sequence(range.end, largest);
+        (start.min(end)..=start.max(end)).contains(&value)
+    })
+}
+
+pub fn change_responses(changes: &[mail_storage::ImapChange], modseq: bool) -> Vec<Vec<u8>> {
+    changes
+        .iter()
+        .filter_map(|change| {
+            change.sequence.map(|sequence| {
+                if modseq {
+                    format!(
+                        "* {sequence} FETCH (UID {} FLAGS ({}) MODSEQ ({}))\r\n",
+                        change.uid,
+                        change.flags.join(" "),
+                        change.modseq
+                    )
+                    .into_bytes()
+                } else {
+                    format!(
+                        "* {sequence} FETCH (UID {} FLAGS ({}))\r\n",
+                        change.uid,
+                        change.flags.join(" ")
+                    )
+                    .into_bytes()
+                }
+            })
+        })
+        .collect()
 }
 
 fn text(name: &MailboxName) -> Result<&str, CommandError> {
@@ -563,5 +815,22 @@ mod tests {
     fn patterns_and_partial_fetch() {
         assert!(matches_pattern("Archive/2026", "Archive/%"));
         assert!(!matches_pattern("Archive/2026/Aug", "Archive/%"));
+    }
+
+    #[test]
+    fn validates_qresync_selection_parameters() {
+        let options = selection_options(Some("(QRESYNC (7 42 1:9 (1:2 1:2)))"), true)
+            .map_err(|_| "valid QRESYNC")
+            .unwrap_or_else(|message| panic!("{message}"));
+        let request = options.qresync.unwrap_or_else(|| panic!("QRESYNC"));
+        assert_eq!(request.uid_validity, 7);
+        assert_eq!(request.modseq, 42);
+        assert!(request.known_uids.is_some());
+        assert!(set_contains(
+            &SequenceSet::parse("*").unwrap_or_else(|_| panic!("set")),
+            9,
+            9
+        ));
+        assert!(selection_options(Some("(QRESYNC (7 42))"), false).is_err());
     }
 }

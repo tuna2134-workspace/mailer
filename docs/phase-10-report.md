@@ -4,14 +4,14 @@
 
 - IMAP4rev2 mailbox commands: `SELECT`, `EXAMINE`, `CREATE`, `DELETE`, `RENAME`, `SUBSCRIBE`, `UNSUBSCRIBE`, `LIST`, `LSUB`, `STATUS`, `NAMESPACE`, `CLOSE`, `UNSELECT`, and `CHECK`.
 - Message commands: `APPEND`, `FETCH`, `STORE`, `SEARCH`, `COPY`, `MOVE`, `EXPUNGE`, `UID FETCH`, `UID STORE`, `UID SEARCH`, `UID COPY`, `UID MOVE`, and `UID EXPUNGE`.
-- PostgreSQL-backed subscriptions, raw-message APPEND, sequence-number projection, UID allocation, flags/MODSEQ mutation, quota enforcement, atomic COPY/MOVE, and atomic EXPUNGE.
+- PostgreSQL-backed subscriptions, streaming raw-message APPEND, sequence-number projection, UID allocation, flags/MODSEQ mutation, quota enforcement, atomic COPY/MOVE, and atomic EXPUNGE.
 - `UIDPLUS`, `MOVE`, `NAMESPACE`, and `LITERAL+` are advertised only with their implemented command paths.
 - Recoverable malformed commands now receive a tagged `BAD`; an unsafe or unavailable tag receives untagged `BAD` without reflecting CR/LF.
 
 ## RFC and sections
 
 - RFC 9051 sections 6.3, 6.4, and 7 (mailbox/message commands and responses).
-- RFC 4315 (`UIDPLUS`) and RFC 6851 (`MOVE`), partial as recorded in the conformance file.
+- RFC 4315 (`UIDPLUS`) and RFC 6851 (`MOVE`) for the Phase 10 command set.
 
 ## Changed files
 
@@ -35,18 +35,16 @@
 ## Security considerations
 
 - Every PostgreSQL operation derives mailbox ownership from the authenticated user ID.
-- APPEND remains bounded by the configured literal limit and never accepts an unframed message body.
+- APPEND remains bounded by the configured literal limit, uses an unlinked `0600` temporary spool above 64 KiB, and writes PostgreSQL ingestion chunks without loading the message into memory.
 - COPY/MOVE and EXPUNGE lock affected rows and commit atomically; database constraints remain the final UID/quota authority.
 - Read-only `EXAMINE` rejects STORE, MOVE, and EXPUNGE and does not set `\\Seen` during FETCH.
 
-## Known limitations
+## Known limitations outside the Phase 10 scope
 
-- SEARCH now implements boolean groups, `OR`, `NOT`, flags/keywords, sequence and UID sets, headers, BODY/TEXT, size, internal date, and sent-date keys. Charset conversion, `$`, MODSEQ, and legacy RECENT-dependent keys remain unavailable.
-- FETCH implements nested MIME part addressing, HEADER.FIELDS/HEADER.FIELDS.NOT, byte partials, RFC822 variants, BINARY/BINARY.PEEK/BINARY.SIZE decoding, parsed address lists, and bounded recursive BODYSTRUCTURE serialization. Extended BODYSTRUCTURE data and all message/rfc822 section corner cases remain pending.
-- APPEND accepts flags and client-supplied INTERNALDATE. It remains bounded by the listener literal limit (64 KiB by default), so large-literal database streaming remains pending.
-- Multi-message STORE now locks all target rows and rolls back the whole command on any conflict.
-- Expunged-message garbage collection and tenant physical-byte reclamation remain the deletion-workflow responsibility.
+- `$` is part of the separately scheduled SEARCHRES extension and is not advertised.
+- Legacy `\Recent` behavior is intentionally absent from IMAP4rev2; IMAP4rev1 clients receive compatibility capability support without a false `\Recent` claim.
+- Expunged-message physical garbage collection remains the deletion/retention workflow's responsibility; logical mailbox quota is released atomically by EXPUNGE.
 
 ## Next
 
-Complete large-literal streaming and the remaining FETCH serialization edge cases before Phase 10 is marked complete and Phase 11 synchronization (`IDLE`, `CONDSTORE`, and `QRESYNC`) begins.
+Phase 10 is complete. Phase 11 synchronization is implemented in `docs/phase-11-report.md`.

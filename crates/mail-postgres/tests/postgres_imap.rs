@@ -6,12 +6,15 @@ use mail_mailbox::{FlagSet, StoreMode, SystemFlag};
 use mail_postgres::PostgresRepository;
 use mail_storage::{ImapAppend, ImapRepository, MailRepository, StoreFlags};
 use sqlx::postgres::PgPoolOptions;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    io::Write,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use uuid::Uuid;
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // One isolated end-to-end PostgreSQL contract fixture.
-async fn phase10_mailbox_message_and_uid_contract() -> Result<(), Box<dyn std::error::Error>> {
+async fn phase10_and_phase11_mailbox_sync_contract() -> Result<(), Box<dyn std::error::Error>> {
     let Ok(database_url) = std::env::var("MAIL_TEST_DATABASE_URL") else {
         return Ok(());
     };
@@ -97,6 +100,29 @@ async fn phase10_mailbox_message_and_uid_contract() -> Result<(), Box<dyn std::e
             },
         )
         .await?;
+    let large = vec![b'x'; 70 * 1024];
+    let mut spool = tempfile::NamedTempFile::new()?;
+    spool.write_all(&large)?;
+    spool.as_file().sync_data()?;
+    let (_, large_uid) = repository
+        .imap_append_file(
+            user_id.into_uuid(),
+            "INBOX",
+            spool.as_file(),
+            &FlagSet::default(),
+            SystemTime::now(),
+        )
+        .await?;
+    assert_eq!(
+        repository
+            .imap_messages(user_id.into_uuid(), inbox.id)
+            .await?
+            .into_iter()
+            .find(|message| message.uid == large_uid)
+            .ok_or("large APPEND")?
+            .raw,
+        large
+    );
     let flagged = StoreFlags {
         mode: StoreMode::Add,
         values: FlagSet::new([SystemFlag::Flagged], [])?,
@@ -125,6 +151,32 @@ async fn phase10_mailbox_message_and_uid_contract() -> Result<(), Box<dyn std::e
     repository
         .imap_store_flags(user_id.into_uuid(), inbox.id, &[uid], &seen)
         .await?;
+    let conditional = StoreFlags {
+        mode: StoreMode::Add,
+        values: FlagSet::new([SystemFlag::Flagged], [])?,
+        unchanged_since: Some(3),
+    };
+    let conditional_result = repository
+        .imap_store_flags_conditional(
+            user_id.into_uuid(),
+            inbox.id,
+            &[uid, second_uid],
+            &conditional,
+        )
+        .await?;
+    assert_eq!(conditional_result.modified, [uid]);
+    assert_eq!(conditional_result.updated.len(), 1);
+    assert_eq!(conditional_result.updated[0].uid, second_uid);
+    let synchronization = repository
+        .imap_changes(user_id.into_uuid(), inbox.id, 3)
+        .await?;
+    assert!(synchronization.highest_modseq > 3);
+    assert!(
+        synchronization
+            .changed
+            .iter()
+            .any(|change| change.uid == uid)
+    );
     let copied = repository
         .imap_copy(user_id.into_uuid(), inbox.id, &[uid], "Archive", false)
         .await?;
@@ -151,6 +203,10 @@ async fn phase10_mailbox_message_and_uid_contract() -> Result<(), Box<dyn std::e
             .await?,
         [uid]
     );
+    let expunge_changes = repository
+        .imap_changes(user_id.into_uuid(), inbox.id, 0)
+        .await?;
+    assert!(expunge_changes.vanished.contains(&uid));
     assert!(
         !repository
             .imap_messages(user_id.into_uuid(), inbox.id)
@@ -158,7 +214,12 @@ async fn phase10_mailbox_message_and_uid_contract() -> Result<(), Box<dyn std::e
             .is_empty()
     );
     repository
-        .imap_store_flags(user_id.into_uuid(), inbox.id, &[second_uid], &deleted)
+        .imap_store_flags(
+            user_id.into_uuid(),
+            inbox.id,
+            &[second_uid, large_uid],
+            &deleted,
+        )
         .await?;
     repository
         .imap_expunge(user_id.into_uuid(), inbox.id, None)
@@ -203,6 +264,47 @@ async fn phase10_mailbox_message_and_uid_contract() -> Result<(), Box<dyn std::e
             .await?
             .iter()
             .any(|mailbox| mailbox.name == "Archive" && mailbox.subscribed)
+    );
+    let inbox = repository
+        .imap_mailboxes(user_id.into_uuid())
+        .await?
+        .into_iter()
+        .find(|mailbox| mailbox.name == "INBOX")
+        .ok_or("INBOX")?;
+    let destination = repository
+        .imap_create_mailbox(user_id.into_uuid(), "MoveTarget")
+        .await?;
+    let (_, move_uid) = repository
+        .imap_append(
+            user_id.into_uuid(),
+            "INBOX",
+            &ImapAppend {
+                raw: b"Subject: concurrent move\r\n\r\nbody",
+                flags: &FlagSet::default(),
+                internal_date: SystemTime::now(),
+            },
+        )
+        .await?;
+    let first = repository.clone();
+    let second = repository.clone();
+    let user = user_id.into_uuid();
+    let source = inbox.id;
+    let move_uids = [move_uid];
+    let (left, right) = tokio::join!(
+        first.imap_copy(user, source, &move_uids, "MoveTarget", true),
+        second.imap_copy(user, source, &move_uids, "MoveTarget", true),
+    );
+    assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+    assert!(
+        repository
+            .imap_messages(user, source)
+            .await?
+            .iter()
+            .all(|message| message.uid != move_uid)
+    );
+    assert_eq!(
+        repository.imap_messages(user, destination.id).await?.len(),
+        1
     );
     Ok(())
 }
