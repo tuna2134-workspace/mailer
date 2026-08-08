@@ -228,6 +228,8 @@ TCP/25で受信したメッセージは、保存確定前にSPF、DKIM、DMARC�
 
 メール認証機能はいずれも`partial`です。SPFの評価coreとDNS予算、DKIMのRSA/Ed25519・canonicalization・鍵record検査、DMARC policy discovery、ARC chain検証を実装していますが、OpenDKIM/OpenDMARC等との自動differential test、外部ARC chainとのinterop、RFC 9990/9991完全report生成は未完了です。DKIMの`l=`はmessage全体を渡す検証APIでは対応し、受信streaming検証経路では明示的に未対応エラーとします。
 
+本実装は一般的な無人Internet公開に対するproduction-ready宣言ではありません。残る運用blocker、暗号依存境界、TCP black-box test範囲は`docs/security-hardening-report.md`、外部provider検証は`docs/external-mail-interop.md`を参照してください。
+
 outbound DKIM署名を有効にする場合は、queue workerへ次をすべて設定します。秘密鍵fileはPKCS#8 DER形式で、未設定時は意図的に署名しません。不完全な設定や署名失敗時はメールを未署名で送らず、一時失敗としてqueueへ戻します。
 
 ```console

@@ -21,6 +21,7 @@ mail-dkim = { version = "0.1.0", path = "../crates/mail-dkim" }
 mail-dmarc = { version = "0.1.0", path = "../crates/mail-dmarc" }
 mail-arc = { version = "0.1.0", path = "../crates/mail-arc" }
 mail-sieve = { version = "0.1.0", path = "../crates/mail-sieve" }
+mail-dsn = { version = "0.1.0", path = "../crates/mail-dsn" }
 
 [[bin]]
 name = "smtp_command"
@@ -67,6 +68,13 @@ bench = false
 [[bin]]
 name = "sieve"
 path = "fuzz_targets/sieve.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dsn_mdn"
+path = "fuzz_targets/dsn_mdn.rs"
 test = false
 doc = false
 bench = false

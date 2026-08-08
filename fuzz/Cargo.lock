@@ -685,6 +685,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mail-dsn"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "mail-fuzz"
 version = "0.0.0"
 dependencies = [
@@ -693,6 +700,7 @@ dependencies = [
  "mail-arc",
  "mail-dkim",
  "mail-dmarc",
+ "mail-dsn",
  "mail-imap-proto",
  "mail-mailbox",
  "mail-message",

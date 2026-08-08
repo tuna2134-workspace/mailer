@@ -1,7 +1,4 @@
 [advisories]
-ignore = [
-    { id = "RUSTSEC-2023-0071", reason = "unresolved sqlx-mysql optional lockfile entry; PostgreSQL-only graph contains no rsa crate" },
-]
 
 [licenses]
 allow = [

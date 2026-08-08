@@ -6,6 +6,9 @@ use mail_message::{MessageLimits, MessageParser};
 use mail_mime::{MimeLimits, parse_message};
 
 fuzz_target!(|input: &[u8]| {
+    if input.len() > 1024 * 1024 {
+        return;
+    }
     let split = input.len() / 2;
     let limits = MessageLimits {
         max_header_bytes: 64 * 1024,

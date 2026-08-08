@@ -31,9 +31,17 @@ pub fn failure_message(notice: &FailureNotice<'_>) -> Result<Vec<u8>, DsnError> 
         notice.action,
         notice.diagnostic,
     ] {
-        if value.contains(['\r', '\n']) {
-            return Err(DsnError::HeaderInjection);
-        }
+        reject_line_break(value)?;
+    }
+    for value in [
+        notice.original_recipient,
+        notice.remote_mta,
+        notice.envelope_id,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        reject_line_break(value)?;
     }
     if notice.diagnostic.len() > 2_000 {
         return Err(DsnError::FieldTooLong);
@@ -61,9 +69,6 @@ pub fn failure_message(notice: &FailureNotice<'_>) -> Result<Vec<u8>, DsnError> 
     fields.push_str(notice.status);
     fields.push_str("\r\n");
     if let Some(mta) = notice.remote_mta {
-        if mta.contains(['\r', '\n']) {
-            return Err(DsnError::HeaderInjection);
-        }
         fields.push_str("Remote-MTA: dns; ");
         fields.push_str(mta);
         fields.push_str("\r\n");
@@ -104,6 +109,14 @@ fn valid_status(value: &str) -> bool {
         && value.split('.').count() == 3
 }
 
+fn reject_line_break(value: &str) -> Result<(), DsnError> {
+    if value.contains(['\r', '\n']) {
+        Err(DsnError::HeaderInjection)
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,6 +147,24 @@ mod tests {
             envelope_id: None,
         };
         assert!(failure_message(&injected).is_err());
+        for field in ["original-recipient", "envelope-id", "remote-mta"] {
+            let mut injected = FailureNotice {
+                sender: "a@example.test",
+                recipient: "b@example.test",
+                original_recipient: None,
+                action: "failed",
+                status: "5.1.1",
+                diagnostic: "rejected",
+                remote_mta: None,
+                envelope_id: None,
+            };
+            match field {
+                "original-recipient" => injected.original_recipient = Some("a\r\nX: injected"),
+                "envelope-id" => injected.envelope_id = Some("id\r\nX: injected"),
+                _ => injected.remote_mta = Some("mx\r\nX: injected"),
+            }
+            assert_eq!(failure_message(&injected), Err(DsnError::HeaderInjection));
+        }
     }
 
     #[test]

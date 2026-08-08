@@ -19,6 +19,8 @@ Automated interoperability is a release-qualification suite separate from unit a
 | Postfix/Exim | strict transport | REQUIRETLS advertisement/absence; injected valid MTA-STS state; injected DNSSEC-Secure DANE match/mismatch | no plaintext under strict policy; no unvalidated DNS result activates DANE |
 | Dovecot | IMAP | CAPABILITY/STARTTLS reset, LOGIN/AUTHENTICATE, SELECT/EXAMINE, UID operations, APPEND/FETCH/STORE/SEARCH/COPY/MOVE/EXPUNGE, IDLE, CONDSTORE/QRESYNC/VANISHED, literals | protocol transcript and mailbox UID/MODSEQ state |
 | OpenDKIM/Rspamd | authentication differential | RSA/Ed25519, simple/relaxed, repeated/folded headers, empty body, expiry/revocation, ARC one-hop/multi-hop/broken seal | semantic result comparison; fixture keys and DNS remain local |
+
+The always-on black-box suites are `mail-smtp-server/tests/black_box.rs` and `mail-imap-server/tests/black_box.rs`. They bind an ephemeral localhost TCP listener and use only public server entry points. External Gmail, Outlook and Yahoo staging probes are documented in `docs/external-mail-interop.md` and are never part of public CI.
 | pyspf or another maintained SPF oracle | SPF differential | mechanisms, dual CIDR, modifiers, macro transformers, recursion/lookup/void limits, DNS error classes | compare semantic SPF result, never raw diagnostic wording |
 
 ## Negative/resource suites

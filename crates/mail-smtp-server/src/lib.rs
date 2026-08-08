@@ -973,7 +973,7 @@ async fn receive_data_inner<S: AsyncRead + Unpin, R: SmtpRepository>(
             ))
         })?;
         if line.len() > DATA_LINE_LIMIT {
-            drain_data(stream, config.allow_bare_lf).await?;
+            drain_data(stream, config).await?;
             return Err(DataError::LineTooLong.into());
         }
         let Some(content) = unstuff_data_line(&line, config.allow_bare_lf)? else {
@@ -984,14 +984,14 @@ async fn receive_data_inner<S: AsyncRead + Unpin, R: SmtpRepository>(
                 Ok(ParseProgress::Complete { .. }) => headers_complete = true,
                 Ok(ParseProgress::NeedMore) => {}
                 Err(_) => {
-                    drain_data(stream, config.allow_bare_lf).await?;
+                    drain_data(stream, config).await?;
                     return Err(DataError::InvalidMessage.into());
                 }
             }
         }
         size = size.saturating_add(content.len() as u64);
         if size > config.max_message_size {
-            drain_data(stream, config.allow_bare_lf).await?;
+            drain_data(stream, config).await?;
             return Err(DataError::TooLarge.into());
         }
         chunk.extend_from_slice(content);
@@ -1034,13 +1034,19 @@ fn progress_budget(started: tokio::time::Instant, received: u64, config: &SmtpCo
 
 async fn drain_data<S: AsyncRead + Unpin>(
     stream: &mut S,
-    allow_bare_lf: bool,
+    config: &SmtpConfig,
 ) -> Result<(), SmtpError> {
     loop {
-        let Some(line) = read_line_bounded(stream, DATA_LINE_LIMIT).await? else {
+        let Some(line) = timeout(
+            config.data_timeout,
+            read_line_bounded(stream, DATA_LINE_LIMIT),
+        )
+        .await
+        .map_err(|_| SmtpError::Timeout)??
+        else {
             return Ok(());
         };
-        if line == b".\r\n" || (allow_bare_lf && line == b".\n") {
+        if line == b".\r\n" || (config.allow_bare_lf && line == b".\n") {
             return Ok(());
         }
     }
@@ -1466,6 +1472,26 @@ mod tests {
             receive_data_inner(&mut server, &Repository::default(), &config, Uuid::nil()).await;
         assert!(matches!(result, Err(SmtpError::Timeout)));
         assert!(writer.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn rejected_data_drain_has_a_deadline() {
+        let (mut client, mut server) = duplex(2 * 1024);
+        let writer = tokio::spawn(async move {
+            let mut line = vec![b'a'; DATA_LINE_LIMIT];
+            line.extend_from_slice(b"\r\n");
+            let _ = client.write_all(&line).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let config = SmtpConfig {
+            data_timeout: Duration::from_millis(10),
+            data_progress_grace: Duration::from_secs(1),
+            ..SmtpConfig::default()
+        };
+        let result =
+            receive_data_inner(&mut server, &Repository::default(), &config, Uuid::nil()).await;
+        assert!(matches!(result, Err(SmtpError::Timeout)));
+        writer.abort();
     }
 
     #[tokio::test]

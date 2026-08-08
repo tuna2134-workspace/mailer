@@ -29,7 +29,9 @@ jobs:
     env:
       MAIL_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/mailer
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
       - name: Install Rust 1.88
         run: |
           rustup toolchain install 1.88 --profile minimal --component rustfmt,clippy
@@ -45,7 +47,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal
       - name: Check stable build
@@ -57,17 +61,38 @@ jobs:
       contents: read
       checks: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2.0.0
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Assert vulnerable RSA is not in the resolved graph
+        run: |
+          if cargo tree --workspace --all-features --target all -i rsa@0.9.10 2>/dev/null | grep -q '^rsa '; then
+            echo 'RUSTSEC-2023-0071 is reachable in the workspace dependency graph'
+            exit 1
+          fi
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          ignore: RUSTSEC-2023-0071
 
   deny:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902 # v2
         with:
           rust-version: "1.88"
           command: check advisories bans licenses sources
+
+  fuzz-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Build bounded parser fuzz harnesses
+        run: cargo +stable check --manifest-path fuzz/Cargo.toml --bins

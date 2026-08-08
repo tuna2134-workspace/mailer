@@ -6,8 +6,12 @@ use mail_spf::{SpfContext, expand_domain};
 use std::net::{IpAddr, Ipv4Addr};
 
 fuzz_target!(|input: &[u8]| {
+    if input.len() > 256 * 1024 {
+        return;
+    }
     let _ = DkimSignature::parse(input);
     if let Ok(text) = std::str::from_utf8(input) {
+        let _ = mail_spf::validate_record(text);
         let _ = DkimKeyRecord::parse(text);
         let _ = mail_dmarc::parse(text);
         let _ = expand_domain(

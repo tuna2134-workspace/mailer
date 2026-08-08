@@ -11,6 +11,11 @@ use thiserror::Error;
 pub use evaluator::evaluate;
 pub use macro_expand::expand_domain;
 
+/// Validates one complete SPF record without performing DNS lookups.
+pub fn validate_record(record: &str) -> Result<(), SpfError> {
+    parser::parse(record).map(|_| ())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SpfResult {
     Pass,

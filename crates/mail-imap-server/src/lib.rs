@@ -672,7 +672,7 @@ mod tests {
         write.write_all(b"secret\r\nA2 LOGOUT\r\n").await?;
         line.clear();
         reader.read_line(&mut line).await?;
-        assert!(line.starts_with("A1 BAD"), "unexpected response: {line:?}");
+        assert!(line.starts_with("A1 NO"), "unexpected response: {line:?}");
         write.shutdown().await?;
         task.await??;
         Ok(())

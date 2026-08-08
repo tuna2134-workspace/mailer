@@ -82,8 +82,11 @@ impl Session {
             "CONDSTORE".into(),
             "QRESYNC".into(),
         ];
-        if self.tls_available && !self.tls_active && self.state == State::NotAuthenticated {
-            values.extend(["STARTTLS".into(), "LOGINDISABLED".into()]);
+        if !self.tls_active && self.state == State::NotAuthenticated {
+            values.push("LOGINDISABLED".into());
+            if self.tls_available {
+                values.push("STARTTLS".into());
+            }
         }
         if self.tls_active && self.state == State::NotAuthenticated {
             values.extend(["AUTH=PLAIN".into(), "SASL-IR".into()]);
@@ -94,19 +97,13 @@ impl Session {
     pub fn command(&mut self, command: Command) -> Action {
         let tag = command.tag;
         match command.body {
-            CommandBody::Capability => Action::Responses(vec![
-                untagged(&format!("CAPABILITY {}", self.capabilities().join(" "))),
-                tagged(&tag, Status::Ok, "CAPABILITY completed"),
-            ]),
+            CommandBody::Capability => self.capability_response(&tag),
             CommandBody::Noop => {
                 Action::Responses(vec![tagged(&tag, Status::Ok, "NOOP completed")])
             }
             CommandBody::Logout => {
                 self.state = State::Logout;
-                Action::Close(vec![
-                    untagged("BYE logging out"),
-                    tagged(&tag, Status::Ok, "LOGOUT completed"),
-                ])
+                logout(&tag)
             }
             CommandBody::StartTls
                 if self.state == State::NotAuthenticated
@@ -131,6 +128,11 @@ impl Session {
                     username: username.0,
                     password: password.0,
                 }
+            }
+            command @ (CommandBody::Login { .. } | CommandBody::Authenticate { .. })
+                if self.state == State::NotAuthenticated && !self.tls_active =>
+            {
+                authentication_requires_tls(&tag, matches!(command, CommandBody::Login { .. }))
             }
             CommandBody::Enable(capabilities)
                 if matches!(self.state, State::Authenticated | State::Selected) =>
@@ -214,6 +216,13 @@ impl Session {
         self.state = State::Authenticated;
     }
 
+    fn capability_response(&self, tag: &str) -> Action {
+        Action::Responses(vec![
+            untagged(&format!("CAPABILITY {}", self.capabilities().join(" "))),
+            tagged(tag, Status::Ok, "CAPABILITY completed"),
+        ])
+    }
+
     pub fn mailbox_selected(&mut self) {
         if self.state == State::Authenticated {
             self.state = State::Selected;
@@ -225,6 +234,22 @@ impl Session {
             self.state = State::Authenticated;
         }
     }
+}
+
+fn authentication_requires_tls(tag: &str, login: bool) -> Action {
+    let message = if login {
+        "LOGIN disabled until TLS is active"
+    } else {
+        "authentication disabled until TLS is active"
+    };
+    Action::Responses(vec![tagged(tag, Status::No, message)])
+}
+
+fn logout(tag: &str) -> Action {
+    Action::Close(vec![
+        untagged("BYE logging out"),
+        tagged(tag, Status::Ok, "LOGOUT completed"),
+    ])
 }
 
 #[cfg(test)]
@@ -260,5 +285,22 @@ mod tests {
         assert!(session.qresync_enabled());
         assert!(session.condstore_enabled());
         Ok(())
+    }
+
+    #[test]
+    fn plaintext_without_starttls_still_advertises_login_disabled() {
+        let mut session = Session::new(false, false);
+        assert!(session.capabilities().contains(&"LOGINDISABLED".into()));
+        assert!(!session.capabilities().contains(&"STARTTLS".into()));
+        assert!(matches!(
+            session.command(Command {
+                tag: "A1".into(),
+                body: CommandBody::Login {
+                    username: crate::AString(b"alice".to_vec()),
+                    password: crate::AString(b"secret".to_vec()),
+                },
+            }),
+            Action::Responses(responses) if responses == ["A1 NO LOGIN disabled until TLS is active\r\n"]
+        ));
     }
 }
