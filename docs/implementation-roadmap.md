@@ -34,6 +34,8 @@ Phase 15 implements local MTA-STS/TLS-RPT/DANE/REQUIRETLS policy parsing and dec
 
 Phase 16 implements bounded mailing-list header generation, RFC 8058 one-click markers, authenticated VERP, bounce correlation, hop/List-Id loop rejection, and DMARC/ARC-aware From mitigation; see `docs/phase-16-report.md`.
 
+Phase 17 implements bounded S/MIME and OpenPGP/MIME envelope recognition plus RFC 2231 parameter decoding. CMS/OpenPGP cryptography, private-key custody, and user key lifecycle remain explicit external security-provider boundaries; see `docs/phase-17-report.md`.
+
 ## Phase 1 detailed plan
 
 1. Create only domain/application/storage/PostgreSQL/migration/testkit crates and migration binary.

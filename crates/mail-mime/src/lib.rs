@@ -54,6 +54,14 @@ pub enum TransferEncoding {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CryptoEnvelope {
+    SmimeEnveloped,
+    SmimeSigned,
+    OpenPgpEncrypted,
+    OpenPgpSigned,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StreamEvent {
     Data(Vec<u8>),
     Boundary { closing: bool },
@@ -338,6 +346,98 @@ impl MimePart<'_> {
             _ => Ok(self.body.to_vec()),
         }
     }
+
+    #[must_use]
+    pub fn crypto_envelope(&self) -> Option<CryptoEnvelope> {
+        let protocol = parameter(&self.media_type.parameters, "protocol")
+            .map(|value| String::from_utf8_lossy(value).to_ascii_lowercase());
+        match (
+            self.media_type.top.as_str(),
+            self.media_type.subtype.as_str(),
+        ) {
+            ("application", "pkcs7-mime" | "x-pkcs7-mime") => {
+                let kind = parameter(&self.media_type.parameters, "smime-type")?;
+                match kind.to_ascii_lowercase().as_slice() {
+                    b"enveloped-data" => Some(CryptoEnvelope::SmimeEnveloped),
+                    b"signed-data" => Some(CryptoEnvelope::SmimeSigned),
+                    _ => None,
+                }
+            }
+            ("multipart", "signed")
+                if protocol.as_deref() == Some("application/pkcs7-signature")
+                    || protocol.as_deref() == Some("application/x-pkcs7-signature") =>
+            {
+                Some(CryptoEnvelope::SmimeSigned)
+            }
+            ("multipart", "encrypted")
+                if protocol.as_deref() == Some("application/pgp-encrypted")
+                    && self.children.len() == 2 =>
+            {
+                Some(CryptoEnvelope::OpenPgpEncrypted)
+            }
+            ("multipart", "signed")
+                if protocol.as_deref() == Some("application/pgp-signature")
+                    && self.children.len() == 2 =>
+            {
+                Some(CryptoEnvelope::OpenPgpSigned)
+            }
+            _ => None,
+        }
+    }
+}
+
+#[must_use]
+pub fn decoded_parameter(parameters: &Parameters, name: &str) -> Option<Vec<u8>> {
+    if let Some(value) = parameter(parameters, name) {
+        return Some(value.to_vec());
+    }
+    if let Some(value) = parameter(parameters, &format!("{name}*")) {
+        return decode_extended(value);
+    }
+    let mut joined = Vec::new();
+    for index in 0..100 {
+        let plain = format!("{name}*{index}");
+        let encoded = format!("{plain}*");
+        if let Some(value) = parameter(parameters, &encoded) {
+            joined.extend(decode_extended_piece(value, index == 0)?);
+        } else if let Some(value) = parameter(parameters, &plain) {
+            joined.extend_from_slice(value);
+        } else {
+            return (!joined.is_empty()).then_some(joined);
+        }
+    }
+    (!joined.is_empty()).then_some(joined)
+}
+
+fn decode_extended(value: &[u8]) -> Option<Vec<u8>> {
+    let first = value.iter().position(|byte| *byte == b'\'')?;
+    let second = value[first + 1..].iter().position(|byte| *byte == b'\'')? + first + 1;
+    percent_decode(&value[second + 1..])
+}
+
+fn decode_extended_piece(value: &[u8], first: bool) -> Option<Vec<u8>> {
+    if first {
+        decode_extended(value)
+    } else {
+        percent_decode(value)
+    }
+}
+
+fn percent_decode(value: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(value.len());
+    let mut index = 0;
+    while index < value.len() {
+        if value[index] == b'%' {
+            let pair = value.get(index + 1..index + 3)?;
+            let text = std::str::from_utf8(pair).ok()?;
+            out.push(u8::from_str_radix(text, 16).ok()?);
+            index += 3;
+        } else {
+            out.push(value[index]);
+            index += 1;
+        }
+    }
+    Some(out)
 }
 
 fn split_headers(input: &[u8], limits: MessageLimits) -> Result<(HeaderBlock, &[u8]), MimeError> {
@@ -614,6 +714,29 @@ mod tests {
                 ..
             })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn recognizes_crypto_envelopes_and_rfc2231_parameters() -> Result<(), MimeError> {
+        let raw = b"MIME-Version: 1.0\r\nContent-Type: application/pkcs7-mime; smime-type=enveloped-data; name*=utf-8''report%20signed.p7m\r\n\r\ndata";
+        let parsed = parse_message(raw, MimeLimits::default())?;
+        assert_eq!(
+            parsed.crypto_envelope(),
+            Some(CryptoEnvelope::SmimeEnveloped)
+        );
+        assert_eq!(
+            decoded_parameter(&parsed.media_type.parameters, "name"),
+            Some(b"report signed.p7m".to_vec())
+        );
+        let pgp = parse_message(
+            b"MIME-Version: 1.0\r\nContent-Type: multipart/encrypted; protocol=application/pgp-encrypted; boundary=x\r\n\r\n--x\r\nContent-Type: application/pgp-encrypted\r\n\r\nVersion: 1\r\n--x\r\nContent-Type: application/octet-stream\r\n\r\nciphertext\r\n--x--\r\n",
+            MimeLimits::default(),
+        )?;
+        assert_eq!(
+            pgp.crypto_envelope(),
+            Some(CryptoEnvelope::OpenPgpEncrypted)
+        );
         Ok(())
     }
 
