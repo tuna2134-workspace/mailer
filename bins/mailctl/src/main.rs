@@ -443,11 +443,13 @@ async fn main() -> Result<()> {
         Command::Audit {
             command: AuditCommand::List(arg),
         } => client.get("/api/v1/audit", Some(&arg.tenant_id)).await?,
-        Command::Config { .. }
-        | Command::Database { .. }
-        | Command::Migration { .. }
-        | Command::Rfc { .. }
-        | Command::Conformance { .. } => {
+        Command::Database {
+            command: CheckCommand::Check,
+        } => client.database_check().await?,
+        Command::Migration {
+            command: StatusCommand::Status,
+        } => client.migration_status().await?,
+        Command::Config { .. } | Command::Rfc { .. } | Command::Conformance { .. } => {
             Value::String("not exposed by the Phase 2 HTTP API".into())
         }
     };

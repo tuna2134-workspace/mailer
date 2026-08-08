@@ -60,6 +60,9 @@ pub fn parse_command(line: &[u8], allow_bare_lf: bool) -> Result<Command, ParseE
         None if line.ends_with(b"\n") => return Err(ParseError::BareLf),
         None => return Err(ParseError::InvalidSyntax),
     };
+    if content.contains(&b'\r') || content.contains(&b'\n') {
+        return Err(ParseError::InvalidSyntax);
+    }
     let text = std::str::from_utf8(content).map_err(|_| ParseError::InvalidEncoding)?;
     let (verb, argument) = text
         .split_once(' ')
@@ -558,6 +561,10 @@ pub enum DataError {
     BareLf,
     #[error("DATA line exceeds the protocol limit")]
     LineTooLong,
+    #[error("DATA line has no valid line ending")]
+    InvalidLineEnding,
+    #[error("message headers are malformed")]
+    InvalidMessage,
 }
 
 pub fn unstuff_data_line(line: &[u8], allow_bare_lf: bool) -> Result<Option<&[u8]>, DataError> {
@@ -566,6 +573,9 @@ pub fn unstuff_data_line(line: &[u8], allow_bare_lf: bool) -> Result<Option<&[u8
     }
     if line.ends_with(b"\n") && !line.ends_with(b"\r\n") && !allow_bare_lf {
         return Err(DataError::BareLf);
+    }
+    if !(line.ends_with(b"\r\n") || allow_bare_lf && line.ends_with(b"\n")) {
+        return Err(DataError::InvalidLineEnding);
     }
     Ok(Some(if line.starts_with(b"..") {
         &line[1..]
@@ -624,8 +634,34 @@ mod tests {
         );
         assert_eq!(parse_command(b"NOOP\n", false), Err(ParseError::BareLf));
         assert_eq!(
-            parse_command(&vec![b'A'; 513], false),
+            parse_command(b"NOOP safe\rRCPT TO:<x@y>\r\n", false),
+            Err(ParseError::InvalidSyntax)
+        );
+        assert_eq!(
+            parse_command(b"NOOP safe\nRCPT TO:<x@y>\r\n", false),
+            Err(ParseError::InvalidSyntax)
+        );
+        let mut boundary = b"NOOP ".to_vec();
+        boundary.resize(MAX_COMMAND_LINE - 2, b'a');
+        boundary.extend_from_slice(b"\r\n");
+        assert!(parse_command(&boundary, false).is_ok());
+        boundary.insert(MAX_COMMAND_LINE - 2, b'a');
+        assert_eq!(
+            parse_command(&boundary, false),
             Err(ParseError::LineTooLong)
+        );
+    }
+
+    #[test]
+    fn rejects_incomplete_data_terminators_without_panicking() {
+        assert_eq!(
+            unstuff_data_line(b".\r", false),
+            Err(DataError::InvalidLineEnding)
+        );
+        assert_eq!(unstuff_data_line(b".\n", false), Err(DataError::BareLf));
+        assert_eq!(
+            unstuff_data_line(b".\r\nextra", false),
+            Err(DataError::InvalidLineEnding)
         );
     }
 

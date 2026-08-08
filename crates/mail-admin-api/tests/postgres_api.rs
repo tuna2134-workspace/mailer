@@ -1,4 +1,5 @@
 use axum::{
+    Router,
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
@@ -11,6 +12,7 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // One PostgreSQL lifecycle avoids repeating expensive setup.
 async fn postgres_crud_occ_and_idempotency() -> Result<(), Box<dyn std::error::Error>> {
     let Ok(url) = std::env::var("MAIL_TEST_DATABASE_URL") else {
         return Ok(());
@@ -39,10 +41,12 @@ async fn postgres_crud_occ_and_idempotency() -> Result<(), Box<dyn std::error::E
         "mailboxes:read",
         "mailboxes:write",
         "audit:read",
+        "metrics:read",
     ])
     .execute(&pool)
     .await?;
     let app = router(PostgresRepository::new(pool));
+    assert_operational_checks(&app, &secret).await?;
     let key = Uuid::new_v4().to_string();
     let make = || {
         Request::builder()
@@ -111,5 +115,30 @@ async fn postgres_crud_occ_and_idempotency() -> Result<(), Box<dyn std::error::E
         StatusCode::OK
     );
     assert_eq!(app.oneshot(patch()?).await?.status(), StatusCode::CONFLICT);
+    Ok(())
+}
+
+async fn assert_operational_checks(
+    app: &Router,
+    secret: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for (path, expected_status) in [
+        ("/api/v1/database/check", "ok"),
+        ("/api/v1/migrations/status", "current"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header("authorization", format!("Bearer {secret}"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await?)?;
+        assert_eq!(value["status"], expected_status);
+    }
     Ok(())
 }

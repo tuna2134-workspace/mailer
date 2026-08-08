@@ -65,6 +65,14 @@ impl Client {
         self.request(Method::GET, path, tenant_id, None, None, false)
             .await
     }
+
+    pub async fn database_check(&self) -> Result<Value, ClientError> {
+        self.get("/api/v1/database/check", None).await
+    }
+
+    pub async fn migration_status(&self) -> Result<Value, ClientError> {
+        self.get("/api/v1/migrations/status", None).await
+    }
     pub async fn patch(
         &self,
         path: &str,

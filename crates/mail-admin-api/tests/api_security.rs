@@ -143,3 +143,37 @@ async fn idempotency_replays_completed_response() -> Result<(), Box<dyn std::err
     assert_eq!(value["next_cursor"], "1");
     Ok(())
 }
+
+#[tokio::test]
+async fn operational_checks_require_system_metrics_scope() -> Result<(), Box<dyn std::error::Error>>
+{
+    let repository = InMemoryRepository::default();
+    repository.add_api_credential(
+        Sha256::digest(b"system-token").to_vec(),
+        ApiCredential {
+            token_id: Uuid::new_v4(),
+            tenant_id: None,
+            scopes: vec!["metrics:read".into()],
+        },
+    )?;
+    let app = router(repository);
+    for (path, expected_status) in [
+        ("/api/v1/database/check", "ok"),
+        ("/api/v1/migrations/status", "current"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header("authorization", "Bearer system-token")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await?)?;
+        assert_eq!(value["status"], expected_status);
+    }
+    Ok(())
+}

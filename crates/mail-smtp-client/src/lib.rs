@@ -424,10 +424,10 @@ impl SmtpClient {
                 break;
             }
         }
-        if tail != *b"\r\n" {
-            if let Err(error) = self.write(connection.get_mut(), b"\r\n").await {
-                return Ok(deferred_io(host, &error));
-            }
+        if tail != *b"\r\n"
+            && let Err(error) = self.write(connection.get_mut(), b"\r\n").await
+        {
+            return Ok(deferred_io(host, &error));
         }
         if let Err(error) = self.write(connection.get_mut(), b".\r\n").await {
             return Ok(deferred_io(host, &error));

@@ -1,9 +1,6 @@
 #![forbid(unsafe_code)]
 
-use argon2::{
-    Argon2, PasswordHasher,
-    password_hash::{SaltString, rand_core::OsRng},
-};
+use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
 use axum::{
     Json, Router,
     body::{Body, to_bytes},
@@ -20,7 +17,9 @@ use mail_domain::{
     Alias, AliasId, AliasKind, Domain, DomainId, DomainName, EntityStatus, LocalPart, QuotaBytes,
     Tenant, TenantId, User, UserId,
 };
-use mail_storage::{AdminRepository, ApiCredential, ApiTokenInfo, MailRepository};
+use mail_storage::{
+    AdminRepository, ApiCredential, ApiTokenInfo, DatabaseStatus, MailRepository, MigrationStatus,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -149,6 +148,8 @@ pub fn router<R: AdminRepository + 'static>(repository: R) -> Router {
             axum::routing::delete(revoke_token::<R>),
         )
         .route("/api/v1/audit", get(list_audit::<R>))
+        .route("/api/v1/database/check", get(database_check::<R>))
+        .route("/api/v1/migrations/status", get(migration_status::<R>))
         .route("/health", get(|| async { StatusCode::NO_CONTENT }))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -574,6 +575,38 @@ async fn list_aliases<R: MailRepository>(
         .await
         .map_err(|error| application_error(error, id))?;
     Ok(Json(page(items, limit, offset)))
+}
+
+async fn database_check<R: AdminRepository>(
+    State(state): State<AppState<R>>,
+    headers: HeaderMap,
+) -> Result<Json<DatabaseStatus>, ApiError> {
+    let (id, actor) = authz(&headers, &state, "metrics:read", None).await?;
+    if actor.tenant_id.is_some() {
+        return Err(application_error(ApplicationError::NotFound, id));
+    }
+    state
+        .service
+        .database_status()
+        .await
+        .map(Json)
+        .map_err(|error| application_error(error, id))
+}
+
+async fn migration_status<R: AdminRepository>(
+    State(state): State<AppState<R>>,
+    headers: HeaderMap,
+) -> Result<Json<MigrationStatus>, ApiError> {
+    let (id, actor) = authz(&headers, &state, "metrics:read", None).await?;
+    if actor.tenant_id.is_some() {
+        return Err(application_error(ApplicationError::NotFound, id));
+    }
+    state
+        .service
+        .migration_status()
+        .await
+        .map(Json)
+        .map_err(|error| application_error(error, id))
 }
 
 #[derive(Deserialize)]
@@ -1295,14 +1328,15 @@ async fn hash_password(
     }
     tokio::task::spawn_blocking(move || {
         use ring::rand::{SecureRandom as _, SystemRandom};
+        let mut salts = [0_u8; 32];
+        SystemRandom::new().fill(&mut salts).map_err(|_| ())?;
+        let argon2_salt = SaltString::encode_b64(&salts[..16]).map_err(|_| ())?;
         let argon2_hash = Argon2::default()
-            .hash_password(password.as_bytes(), &SaltString::generate(&mut OsRng))
+            .hash_password(password.as_bytes(), &argon2_salt)
             .map(|v| v.to_string())
             .map_err(|_| ())?;
-        let mut salt = [0_u8; 16];
-        SystemRandom::new().fill(&mut salt).map_err(|_| ())?;
         let iterations = std::num::NonZeroU32::new(4096).ok_or(())?;
-        let scram = mail_sasl::derive_credential(password.as_bytes(), &salt, iterations);
+        let scram = mail_sasl::derive_credential(password.as_bytes(), &salts[16..], iterations);
         Ok::<_, ()>(mail_storage::PasswordCredential {
             argon2_hash,
             scram: Some(mail_storage::SmtpScramCredential {

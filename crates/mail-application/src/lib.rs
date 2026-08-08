@@ -2,8 +2,8 @@
 
 use mail_domain::{Alias, Domain, Mailbox, Tenant, TenantId, User};
 use mail_storage::{
-    AdminRepository, ApiTokenInfo, ApplicationPasswordInfo, AuditRecord, IdempotencyRecord,
-    MailboxInfo, PasswordCredential, Versioned,
+    AdminRepository, ApiTokenInfo, ApplicationPasswordInfo, AuditRecord, DatabaseStatus,
+    IdempotencyRecord, MailboxInfo, MigrationStatus, PasswordCredential, Versioned,
 };
 use mail_storage::{ApiCredential, AuditEvent, MailRepository, StorageError};
 use thiserror::Error;
@@ -229,6 +229,14 @@ pub fn audit_event(
 }
 
 impl<R: AdminRepository> AdministrationService<R> {
+    pub async fn database_status(&self) -> Result<DatabaseStatus, ApplicationError> {
+        self.repository.database_status().await.map_err(Into::into)
+    }
+
+    pub async fn migration_status(&self) -> Result<MigrationStatus, ApplicationError> {
+        self.repository.migration_status().await.map_err(Into::into)
+    }
+
     pub async fn get_tenant(&self, id: TenantId) -> Result<Versioned<Tenant>, ApplicationError> {
         self.repository.get_tenant(id).await.map_err(Into::into)
     }

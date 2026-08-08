@@ -11,9 +11,9 @@ use mail_dsn::{FailureNotice, failure_message};
 use mail_mailbox::{FlagSet, StoreMode, SystemFlag};
 use mail_storage::{
     AdminRepository, ApiCredential, ApiTokenInfo, ApplicationPasswordInfo, AuditEvent, AuditRecord,
-    DeliveryOutcome, IdempotencyRecord, LocalRecipient, MailRepository, MailboxInfo,
-    MailboxMessageState, MailboxRepository, PasswordCredential, QueueLease, SmtpRepository,
-    StorageError, StoreFlags, StoredMessage, Versioned,
+    DatabaseStatus, DeliveryOutcome, IdempotencyRecord, LocalRecipient, MailRepository,
+    MailboxInfo, MailboxMessageState, MailboxRepository, MigrationStatus, PasswordCredential,
+    QueueLease, SmtpRepository, StorageError, StoreFlags, StoredMessage, Versioned,
 };
 use sqlx::{PgPool, Row};
 use std::{
@@ -539,6 +539,71 @@ pub async fn check(pool: &PgPool) -> Result<(), StorageError> {
 
 #[async_trait]
 impl AdminRepository for PostgresRepository {
+    async fn database_status(&self) -> Result<DatabaseStatus, StorageError> {
+        check(&self.pool).await?;
+        Ok(DatabaseStatus {
+            status: "ok".into(),
+        })
+    }
+
+    async fn migration_status(&self) -> Result<MigrationStatus, StorageError> {
+        let applied: Vec<(i64, bool, Vec<u8>)> = sqlx::query_as(
+            "SELECT version,success,checksum FROM _sqlx_migrations ORDER BY version",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        let expected: Vec<_> = mail_migrations::MIGRATOR.iter().collect();
+        let pending_versions = expected
+            .iter()
+            .filter(|migration| {
+                !applied
+                    .iter()
+                    .any(|row| row.0 == migration.version && row.1)
+            })
+            .map(|migration| migration.version)
+            .collect::<Vec<_>>();
+        let failed_versions = applied
+            .iter()
+            .filter(|row| !row.1)
+            .map(|row| row.0)
+            .collect::<Vec<_>>();
+        let unexpected_versions = applied
+            .iter()
+            .filter(|row| !expected.iter().any(|migration| migration.version == row.0))
+            .map(|row| row.0)
+            .collect::<Vec<_>>();
+        let checksum_mismatches = applied
+            .iter()
+            .filter(|row| {
+                row.1
+                    && expected.iter().any(|migration| {
+                        migration.version == row.0 && migration.checksum.as_ref() != row.2
+                    })
+            })
+            .map(|row| row.0)
+            .collect::<Vec<_>>();
+        let status = if !failed_versions.is_empty()
+            || !unexpected_versions.is_empty()
+            || !checksum_mismatches.is_empty()
+        {
+            "diverged"
+        } else if pending_versions.is_empty() {
+            "current"
+        } else {
+            "pending"
+        };
+        Ok(MigrationStatus {
+            status: status.into(),
+            applied_version: applied.iter().filter(|row| row.1).map(|row| row.0).max(),
+            expected_version: expected.iter().map(|migration| migration.version).max(),
+            pending_versions,
+            failed_versions,
+            unexpected_versions,
+            checksum_mismatches,
+        })
+    }
+
     async fn get_tenant(&self, id: TenantId) -> Result<Versioned<Tenant>, StorageError> {
         let row = sqlx::query("SELECT name,status,version FROM tenants WHERE id=$1")
             .bind(id.into_uuid())

@@ -12,6 +12,7 @@ mail-address = { path = "../mail-address" }
 mail-arc = { path = "../mail-arc" }
 mail-dkim = { path = "../mail-dkim" }
 mail-dmarc = { path = "../mail-dmarc" }
+mail-message = { path = "../mail-message" }
 mail-dns = { path = "../mail-dns" }
 mail-policy = { path = "../mail-policy" }
 mail-spf = { path = "../mail-spf" }

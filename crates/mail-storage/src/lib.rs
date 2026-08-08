@@ -47,6 +47,22 @@ pub struct AuditRecord {
     pub resource_id: Option<Uuid>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DatabaseStatus {
+    pub status: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MigrationStatus {
+    pub status: String,
+    pub applied_version: Option<i64>,
+    pub expected_version: Option<i64>,
+    pub pending_versions: Vec<i64>,
+    pub failed_versions: Vec<i64>,
+    pub unexpected_versions: Vec<i64>,
+    pub checksum_mismatches: Vec<i64>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IdempotencyRecord {
     pub request_hash: Vec<u8>,
@@ -329,6 +345,16 @@ pub trait MailRepository: Send + Sync {
 
 #[async_trait]
 pub trait AdminRepository: MailRepository {
+    async fn database_status(&self) -> Result<DatabaseStatus, StorageError> {
+        Err(StorageError::Unavailable(
+            "database status is unsupported".into(),
+        ))
+    }
+    async fn migration_status(&self) -> Result<MigrationStatus, StorageError> {
+        Err(StorageError::Unavailable(
+            "migration status is unsupported".into(),
+        ))
+    }
     async fn get_tenant(&self, _id: TenantId) -> Result<Versioned<Tenant>, StorageError> {
         Err(StorageError::NotFound)
     }

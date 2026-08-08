@@ -7,6 +7,7 @@ mod authentication;
 pub use authentication::InboundAuthenticator;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use mail_message::{MessageLimits, MessageParser, ParseProgress};
 use mail_smtp_proto::{
     Action, Command, DataError, ParseError, Reply, Session, SessionExtensions, Transaction,
     parse_command, unstuff_data_line,
@@ -668,6 +669,19 @@ where
                         )
                         .await?
                     }
+                    Ok(Err(SmtpError::Data(
+                        DataError::InvalidLineEnding | DataError::InvalidMessage,
+                    ))) => {
+                        write_reply(
+                            &mut stream,
+                            &Reply {
+                                code: 554,
+                                enhanced: Some("5.6.0"),
+                                text: "Malformed message data",
+                            },
+                        )
+                        .await?
+                    }
                     Ok(Err(SmtpError::Storage)) => {
                         write_reply(
                             &mut stream,
@@ -879,6 +893,8 @@ async fn receive_data_inner<S: AsyncRead + Unpin, R: SmtpRepository>(
     let mut chunk = Vec::with_capacity(CHUNK_SIZE);
     let mut position = 0_u32;
     let mut size = 0_u64;
+    let mut message = MessageParser::new(MessageLimits::default());
+    let mut headers_complete = false;
     loop {
         let line = read_line_bounded(stream, DATA_LINE_LIMIT)
             .await?
@@ -895,6 +911,16 @@ async fn receive_data_inner<S: AsyncRead + Unpin, R: SmtpRepository>(
         let Some(content) = unstuff_data_line(&line, config.allow_bare_lf)? else {
             break;
         };
+        if !headers_complete {
+            match message.push(content) {
+                Ok(ParseProgress::Complete { .. }) => headers_complete = true,
+                Ok(ParseProgress::NeedMore) => {}
+                Err(_) => {
+                    drain_data(stream, config.allow_bare_lf).await?;
+                    return Err(DataError::InvalidMessage.into());
+                }
+            }
+        }
         size = size.saturating_add(content.len() as u64);
         if size > config.max_message_size {
             drain_data(stream, config.allow_bare_lf).await?;
@@ -909,6 +935,9 @@ async fn receive_data_inner<S: AsyncRead + Unpin, R: SmtpRepository>(
             position = position.checked_add(1).ok_or(SmtpError::Storage)?;
             chunk.clear();
         }
+    }
+    if !headers_complete && message.finish().is_err() {
+        return Err(DataError::InvalidMessage.into());
     }
     repository
         .append_smtp_chunk(ingestion, position, &chunk)
@@ -1332,6 +1361,64 @@ mod tests {
         assert!(greeting[..count].starts_with(b"220 "));
         assert!(matches!(task.await?, Err(SmtpError::Timeout)));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_orphan_header_continuation_without_committing() {
+        let repository = Repository::default();
+        let mut input = &b" injected: value\r\nSubject: safe\r\n\r\nbody\r\n.\r\n"[..];
+        let result =
+            receive_data_inner(&mut input, &repository, &SmtpConfig::default(), Uuid::nil()).await;
+        assert!(matches!(
+            result,
+            Err(SmtpError::Data(DataError::InvalidMessage))
+        ));
+        assert!(
+            repository
+                .chunks
+                .lock()
+                .is_ok_and(|chunks| chunks.is_empty())
+        );
+    }
+
+    #[tokio::test]
+    async fn enforces_data_line_limit_at_exact_boundary() {
+        let repository = Repository::default();
+        let mut boundary = b"X: ".to_vec();
+        boundary.resize(DATA_LINE_LIMIT - 2, b'a');
+        boundary.extend_from_slice(b"\r\n\r\n.\r\n");
+        let mut input = boundary.as_slice();
+        assert!(
+            receive_data_inner(&mut input, &repository, &SmtpConfig::default(), Uuid::nil(),)
+                .await
+                .is_ok()
+        );
+
+        let repository = Repository::default();
+        boundary.insert(DATA_LINE_LIMIT - 2, b'a');
+        let mut input = boundary.as_slice();
+        assert!(matches!(
+            receive_data_inner(&mut input, &repository, &SmtpConfig::default(), Uuid::nil(),).await,
+            Err(SmtpError::Data(DataError::LineTooLong))
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_incomplete_dot_terminator_without_committing() {
+        let repository = Repository::default();
+        let mut input = &b"Subject: safe\r\n\r\nbody\r\n.\r"[..];
+        let result =
+            receive_data_inner(&mut input, &repository, &SmtpConfig::default(), Uuid::nil()).await;
+        assert!(matches!(
+            result,
+            Err(SmtpError::Data(DataError::InvalidLineEnding))
+        ));
+        assert!(
+            repository
+                .chunks
+                .lock()
+                .is_ok_and(|chunks| chunks.is_empty())
+        );
     }
 
     #[tokio::test]

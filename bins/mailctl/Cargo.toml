@@ -12,5 +12,13 @@ mail-admin-client = { path = "../../crates/mail-admin-client" }
 serde_json.workspace = true
 tokio.workspace = true
 
+[dev-dependencies]
+axum.workspace = true
+mail-admin-api = { path = "../../crates/mail-admin-api" }
+mail-storage = { path = "../../crates/mail-storage" }
+mail-testkit = { path = "../../crates/mail-testkit" }
+sha2.workspace = true
+uuid.workspace = true
+
 [lints]
 workspace = true

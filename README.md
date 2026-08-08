@@ -2,7 +2,7 @@
 
 Rust/Tokio、PostgreSQL、rustlsで構築されたインターネットメールサーバです。SMTP受信・送信、Submission、IMAP、配送queue、管理API、ACME TLS-ALPN-01を同一workspaceで提供します。POP3は実装しません。
 
-> 現在の実行設定は環境変数方式です。設計文書にあるTOML loaderや外部secret manager adapterは、現行の`maild`実行バイナリにはまだ接続されていません。
+> `maild`はTOML設定と環境変数を読み込みます。優先順位は環境変数、TOML、デフォルト値の順です。外部secret manager adapterはまだ接続されていません。
 
 ## 必要なもの
 
@@ -73,6 +73,8 @@ INSERT INTO api_tokens (
 登録後、平文tokenはsecret managerへ保存します。後続tokenをAPIで作成したらbootstrap tokenを失効させることを推奨します。
 
 ## `maild`の設定と起動
+
+TOMLファイルは`maild --config /etc/maild/maild.toml`または`MAIL_CONFIG_FILE`で指定できます。両方を指定した場合は`--config`が優先されます。各設定値は環境変数がTOMLを上書きします。詳細と完全な対応表は`docs/configuration.md`を参照してください。
 
 必須環境変数:
 
@@ -198,7 +200,7 @@ cargo run -p mailctl -- --help
 cargo run -p mailctl -- user --help
 ```
 
-`mailctl config check`、`database check`、`migration status`、`rfc status`、`conformance report`は現在placeholder responseを返し、運用checkを実行しません。migration確認には`mail-migrate check`を使用してください。
+`mailctl database check`はPostgreSQLへの疎通を確認し、`mailctl migration status`は適用済みmigrationを実行binary内のmigrationと比較します。どちらも`metrics:read` scopeを持つsystem tokenが必要です。`config check`、`rfc status`、`conformance report`は現在placeholder responseです。
 
 ## メールclient設定
 

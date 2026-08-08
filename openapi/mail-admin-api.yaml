@@ -219,6 +219,24 @@ paths:
     get:
       operationId: listAuditEvents
       responses: { '200': { $ref: '#/components/responses/Page' }, default: { $ref: '#/components/responses/Problem' } }
+  /database/check:
+    get:
+      operationId: checkDatabase
+      description: Checks PostgreSQL connectivity. Requires a system token with metrics:read.
+      responses:
+        '200':
+          description: Database is reachable
+          content: { application/json: { schema: { $ref: '#/components/schemas/DatabaseStatus' } } }
+        default: { $ref: '#/components/responses/Problem' }
+  /migrations/status:
+    get:
+      operationId: getMigrationStatus
+      description: Compares applied SQLx migrations with the migrations embedded in the server. Requires a system token with metrics:read.
+      responses:
+        '200':
+          description: Migration status
+          content: { application/json: { schema: { $ref: '#/components/schemas/MigrationStatus' } } }
+        default: { $ref: '#/components/responses/Problem' }
 components:
   securitySchemes:
     bearerToken:
@@ -255,6 +273,24 @@ components:
       description: RFC 9457 problem
       content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
   schemas:
+    DatabaseStatus:
+      type: object
+      required: [status]
+      properties:
+        status: { const: ok }
+      additionalProperties: false
+    MigrationStatus:
+      type: object
+      required: [status, applied_version, expected_version, pending_versions, failed_versions, unexpected_versions, checksum_mismatches]
+      properties:
+        status: { type: string, enum: [current, pending, diverged] }
+        applied_version: { type: [integer, 'null'] }
+        expected_version: { type: [integer, 'null'] }
+        pending_versions: { type: array, items: { type: integer } }
+        failed_versions: { type: array, items: { type: integer } }
+        unexpected_versions: { type: array, items: { type: integer } }
+        checksum_mismatches: { type: array, items: { type: integer } }
+      additionalProperties: false
     Resource:
       type: object
       required: [id, version]

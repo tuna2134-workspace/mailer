@@ -3,8 +3,8 @@
 use async_trait::async_trait;
 use mail_domain::{Alias, Domain, Mailbox, MailboxId, QueueId, Tenant, TenantId, User};
 use mail_storage::{
-    AdminRepository, ApiCredential, AuditEvent, IdempotencyRecord, MailRepository,
-    PasswordCredential, QueueLease, StorageError, Versioned,
+    AdminRepository, ApiCredential, AuditEvent, DatabaseStatus, IdempotencyRecord, MailRepository,
+    MigrationStatus, PasswordCredential, QueueLease, StorageError, Versioned,
 };
 use std::{
     collections::HashMap,
@@ -28,6 +28,24 @@ struct State {
 
 #[async_trait]
 impl AdminRepository for InMemoryRepository {
+    async fn database_status(&self) -> Result<DatabaseStatus, StorageError> {
+        Ok(DatabaseStatus {
+            status: "ok".into(),
+        })
+    }
+
+    async fn migration_status(&self) -> Result<MigrationStatus, StorageError> {
+        Ok(MigrationStatus {
+            status: "current".into(),
+            applied_version: None,
+            expected_version: None,
+            pending_versions: Vec::new(),
+            failed_versions: Vec::new(),
+            unexpected_versions: Vec::new(),
+            checksum_mismatches: Vec::new(),
+        })
+    }
+
     async fn get_tenant(&self, id: TenantId) -> Result<Versioned<Tenant>, StorageError> {
         let state = self
             .state
