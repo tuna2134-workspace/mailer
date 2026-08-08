@@ -228,11 +228,14 @@ impl SmtpClient {
                 return Ok(result);
             }
         } else {
-            let starttls = matches!(&ehlo, Ok((250, text)) if text.split_ascii_whitespace().any(|value| value.eq_ignore_ascii_case("STARTTLS")));
-            requiretls_supported = matches!(&ehlo, Ok((250, text)) if text.split_ascii_whitespace().any(|value| value.eq_ignore_ascii_case("REQUIRETLS")));
-            smtp_utf8_supported = matches!(&ehlo, Ok((250, text)) if text.split_ascii_whitespace().any(|value| value.eq_ignore_ascii_case("SMTPUTF8")));
-            dsn_supported = matches!(&ehlo, Ok((250, text)) if text.split_ascii_whitespace().any(|value| value.eq_ignore_ascii_case("DSN")));
-            deliver_by_supported = matches!(&ehlo, Ok((250, text)) if text.split_ascii_whitespace().any(|value| value.eq_ignore_ascii_case("DELIVERBY")));
+            let starttls = matches!(&ehlo, Ok((250, text)) if has_capability(text, "STARTTLS"));
+            requiretls_supported =
+                matches!(&ehlo, Ok((250, text)) if has_capability(text, "REQUIRETLS"));
+            smtp_utf8_supported =
+                matches!(&ehlo, Ok((250, text)) if has_capability(text, "SMTPUTF8"));
+            dsn_supported = matches!(&ehlo, Ok((250, text)) if has_capability(text, "DSN"));
+            deliver_by_supported =
+                matches!(&ehlo, Ok((250, text)) if has_capability(text, "DELIVERBY"));
             if let Some(result) = classify_reply(ehlo, "EHLO", &[250]) {
                 return Ok(result);
             }
@@ -343,10 +346,13 @@ impl SmtpClient {
                     return Ok(deferred_io(host, &error));
                 }
                 let ehlo = self.reply(&mut connection).await;
-                requiretls_supported = matches!(&ehlo, Ok((250, text)) if text.split_ascii_whitespace().any(|value| value.eq_ignore_ascii_case("REQUIRETLS")));
-                smtp_utf8_supported = matches!(&ehlo, Ok((250, text)) if text.split_ascii_whitespace().any(|value| value.eq_ignore_ascii_case("SMTPUTF8")));
-                dsn_supported = matches!(&ehlo, Ok((250, text)) if text.split_ascii_whitespace().any(|value| value.eq_ignore_ascii_case("DSN")));
-                deliver_by_supported = matches!(&ehlo, Ok((250, text)) if text.split_ascii_whitespace().any(|value| value.eq_ignore_ascii_case("DELIVERBY")));
+                requiretls_supported =
+                    matches!(&ehlo, Ok((250, text)) if has_capability(text, "REQUIRETLS"));
+                smtp_utf8_supported =
+                    matches!(&ehlo, Ok((250, text)) if has_capability(text, "SMTPUTF8"));
+                dsn_supported = matches!(&ehlo, Ok((250, text)) if has_capability(text, "DSN"));
+                deliver_by_supported =
+                    matches!(&ehlo, Ok((250, text)) if has_capability(text, "DELIVERBY"));
                 if let Some(result) = classify_reply(ehlo, "EHLO after TLS", &[250]) {
                     return Ok(result);
                 }
@@ -728,6 +734,14 @@ fn enhanced(text: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn has_capability(reply_text: &str, name: &str) -> bool {
+    reply_text.lines().any(|line| {
+        line.split_ascii_whitespace()
+            .next()
+            .is_some_and(|keyword| keyword.eq_ignore_ascii_case(name))
+    })
+}
+
 async fn read_reply<R: tokio::io::AsyncBufRead + Unpin>(read: &mut R) -> io::Result<(u16, String)> {
     let mut total = 0;
     let mut expected = None;
@@ -752,7 +766,7 @@ async fn read_reply<R: tokio::io::AsyncBufRead + Unpin>(read: &mut R) -> io::Res
             ));
         }
         if !text.is_empty() {
-            text.push(' ');
+            text.push('\n');
         }
         text.push_str(&String::from_utf8_lossy(&line[4..line.len() - 2]));
         if !continued {
@@ -820,6 +834,13 @@ mod tests {
             classify_final_reply(Err(io::Error::new(io::ErrorKind::UnexpectedEof, "lost")),),
             Some(SendResult::Ambiguous { .. })
         ));
+    }
+
+    #[test]
+    fn ehlo_capabilities_are_recognized_only_at_line_start() {
+        assert!(has_capability("mx.example\nSTARTTLS\nSIZE 100", "STARTTLS"));
+        assert!(!has_capability("mx.example says no STARTTLS", "STARTTLS"));
+        assert!(!has_capability("XSTARTTLS", "STARTTLS"));
     }
 
     #[test]

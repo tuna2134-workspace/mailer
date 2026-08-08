@@ -18,6 +18,8 @@ Automated interoperability is a release-qualification suite separate from unit a
 | Postfix/Exim with private CA | outbound TLS | valid private trust, self-signed/expired/name mismatch, handshake abort, STARTTLS stripping simulation | opportunistic fallback reconnects in clear only when policy permits; strict modes defer and never send plaintext |
 | Postfix/Exim | strict transport | REQUIRETLS advertisement/absence; injected valid MTA-STS state; injected DNSSEC-Secure DANE match/mismatch | no plaintext under strict policy; no unvalidated DNS result activates DANE |
 | Dovecot | IMAP | CAPABILITY/STARTTLS reset, LOGIN/AUTHENTICATE, SELECT/EXAMINE, UID operations, APPEND/FETCH/STORE/SEARCH/COPY/MOVE/EXPUNGE, IDLE, CONDSTORE/QRESYNC/VANISHED, literals | protocol transcript and mailbox UID/MODSEQ state |
+| OpenDKIM/Rspamd | authentication differential | RSA/Ed25519, simple/relaxed, repeated/folded headers, empty body, expiry/revocation, ARC one-hop/multi-hop/broken seal | semantic result comparison; fixture keys and DNS remain local |
+| pyspf or another maintained SPF oracle | SPF differential | mechanisms, dual CIDR, modifiers, macro transformers, recursion/lookup/void limits, DNS error classes | compare semantic SPF result, never raw diagnostic wording |
 
 ## Negative/resource suites
 

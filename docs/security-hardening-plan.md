@@ -43,6 +43,12 @@ This plan records the repository audit performed before hardening changes. A row
 - DATA and BDAT reads enforce a configurable rolling minimum-throughput budget in addition to absolute time and size bounds.
 - IMAP now rejects connections above its global admission limit immediately instead of retaining accepted sockets while waiting for a semaphore permit. Per-source admission/rate budgets remain open work.
 - Hickory was upgraded to 0.26.1 for the 2026 CPU/unbounded-loop advisories, the unmaintained PEM parser was removed, and CI now runs RustSec plus cargo-deny license/source/ban policy.
+- SPF now rejects unknown mechanisms/malformed CIDR and multiple policy records as `permerror`, preserves temporary DNS errors, enforces recursive/void/MX/PTR budgets, and implements bounded RFC 7208 macro transformers including forward-confirmed `%{p}`.
+- DKIM rejects duplicate/missing/incompatible signature and DNS-key tags, handles repeated signed headers bottom-up, preserves raw octets while removing `b=`, validates lifetime and body-length semantics, and accepts the RFC 8301 verification key floor without weakening other TLS verification.
+- DMARC targets RFC 9989 rather than obsolete RFC 7489: historic `pct` is ignored, `sp`/`np`/`t` are applied, all passing DKIM identifiers are retained, requested disposition remains separate from local enforcement, and policy/alignment discovery uses a bounded DNS Tree Walk.
+- ARC structure parsing rejects missing/duplicate tags and invalid `cv` sequences; live validation requires a unique algorithm-compatible DNS key, the newest AMS, and every ARC-Seal. Cryptographic success remains input to local trust policy, not an automatic trust grant.
+- SMTP EHLO capability parsing preserves reply-line boundaries and only accepts extension keywords at the start of a capability line.
+- Optional fuzz targets now cover SPF/DKIM/DMARC/ARC parsing and Sieve in addition to the existing SMTP/IMAP/message/MIME/address corpus.
 
 ## Execution order
 

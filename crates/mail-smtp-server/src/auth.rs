@@ -89,15 +89,7 @@ pub(crate) async fn begin_scram<R: SmtpRepository>(
     let user_id = account.as_ref().map(|value| value.user_id);
     let credential = match account.and_then(|value| value.scram) {
         Some(value) => convert_scram(value)?,
-        None => tokio::task::spawn_blocking(|| {
-            Ok::<_, SmtpError>(mail_sasl::derive_credential(
-                b"invalid-account-password",
-                b"maild-scram-dummy-salt",
-                NonZeroU32::new(4096).ok_or(SmtpError::Auth)?,
-            ))
-        })
-        .await
-        .map_err(|_| SmtpError::Storage)??,
+        None => dummy_scram_credential()?,
     };
     let mut nonce = [0_u8; 18];
     SystemRandom::new()
@@ -108,6 +100,26 @@ pub(crate) async fn begin_scram<R: SmtpRepository>(
         ScramExchange::start(mechanism, client_first, credential, &nonce, tls_exporter)
             .map_err(|_| SmtpError::Auth)?;
     Ok((server_first, ServerScramAuth { user_id, exchange }))
+}
+
+fn dummy_scram_credential() -> Result<ScramCredential, SmtpError> {
+    let mut salt = vec![0_u8; 16];
+    let mut stored_key = [0_u8; 32];
+    let mut server_key = [0_u8; 32];
+    let random = SystemRandom::new();
+    random.fill(&mut salt).map_err(|_| SmtpError::Storage)?;
+    random
+        .fill(&mut stored_key)
+        .map_err(|_| SmtpError::Storage)?;
+    random
+        .fill(&mut server_key)
+        .map_err(|_| SmtpError::Storage)?;
+    Ok(ScramCredential {
+        salt,
+        iterations: NonZeroU32::new(4096).ok_or(SmtpError::Auth)?,
+        stored_key,
+        server_key,
+    })
 }
 
 pub(crate) async fn finish_scram<R: SmtpRepository>(
@@ -146,5 +158,13 @@ mod tests {
             Some(("alice@example.test".into(), b"secret".to_vec()))
         );
         assert!(decode_plain("not-base64").is_none());
+    }
+
+    #[test]
+    fn unknown_scram_accounts_use_complete_non_reusable_dummy_credentials() {
+        let first = dummy_scram_credential().unwrap_or_else(|_| panic!("dummy"));
+        let second = dummy_scram_credential().unwrap_or_else(|_| panic!("dummy"));
+        assert_eq!(first.stored_key.len(), 32);
+        assert_ne!(first.salt, second.salt);
     }
 }

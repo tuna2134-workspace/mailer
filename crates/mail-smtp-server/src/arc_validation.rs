@@ -1,12 +1,10 @@
 use mail_arc::parse_sets;
 use mail_dkim::{
-    Canonicalization, body_canonicalization, canonicalize_header_relaxed, identity,
-    signature_header_without_b, verify_headers, verify_signature_data,
+    Canonicalization, DkimKeyRecord, body_canonicalization, canonicalize_header_relaxed, identity,
+    signature_algorithm, signature_header_without_b, verify_headers, verify_signature_data,
 };
 use mail_dns::MailResolver;
 use std::collections::HashMap;
-
-use crate::authentication::dkim_key;
 
 pub(super) async fn validate(
     headers: &[u8],
@@ -80,12 +78,15 @@ async fn public_key(
     if let Some(key) = cache.get(&name) {
         return key.clone();
     }
-    let key = resolver
-        .txt(&name)
-        .await
-        .ok()?
-        .iter()
-        .find_map(|record| dkim_key(record));
+    let records = resolver.txt(&name).await.ok()?;
+    let [record] = records.as_slice() else {
+        cache.insert(name, None);
+        return None;
+    };
+    let key = DkimKeyRecord::parse(record).ok().and_then(|key| {
+        let algorithm = signature_algorithm(signature).ok()?;
+        key.key_for(algorithm, &domain, None).ok().map(Vec::from)
+    });
     cache.insert(name, key.clone());
     key
 }

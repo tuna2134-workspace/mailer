@@ -1,7 +1,7 @@
 use std::net::IpAddr;
 
 use hickory_resolver::TokioResolver;
-use hickory_resolver::proto::rr::RData;
+use hickory_resolver::proto::rr::{Name, RData};
 use mail_spf::{SpfError, SpfLookup};
 use thiserror::Error;
 
@@ -24,6 +24,12 @@ pub enum DnsError {
     Permanent,
     #[error("temporary DNS failure: {0}")]
     Temporary(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TxtLookup {
+    pub records: Vec<String>,
+    pub name_exists: bool,
 }
 
 #[derive(Clone)]
@@ -83,11 +89,17 @@ impl MailResolver {
     }
 
     pub async fn txt(&self, name: &str) -> Result<Vec<String>, DnsError> {
+        self.txt_with_existence(name)
+            .await
+            .map(|lookup| lookup.records)
+    }
+
+    pub async fn txt_with_existence(&self, name: &str) -> Result<TxtLookup, DnsError> {
         self.0
             .txt_lookup(name)
             .await
             .map(|records| {
-                records
+                let records = records
                     .message()
                     .answers
                     .iter()
@@ -101,11 +113,18 @@ impl MailResolver {
                         _ => None,
                     })
                     .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-                    .collect()
+                    .collect();
+                TxtLookup {
+                    records,
+                    name_exists: true,
+                }
             })
             .or_else(|error| {
                 if error.is_no_records_found() {
-                    Ok(Vec::new())
+                    Ok(TxtLookup {
+                        records: Vec::new(),
+                        name_exists: !error.is_nx_domain(),
+                    })
                 } else {
                     Err(DnsError::Temporary(error.to_string()))
                 }
@@ -163,6 +182,30 @@ impl SpfLookup for MailResolver {
 
     async fn mx(&self, name: &str) -> Result<Vec<String>, SpfError> {
         self.mx_names(name).await.map_err(spf_dns)
+    }
+
+    async fn ptr(&self, ip: IpAddr) -> Result<Vec<String>, SpfError> {
+        self.0
+            .reverse_lookup(Name::from(ip))
+            .await
+            .map(|records| {
+                records
+                    .message()
+                    .answers
+                    .iter()
+                    .filter_map(|record| match &record.data {
+                        RData::PTR(name) => Some(name.0.to_utf8()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .or_else(|error| {
+                if error.is_no_records_found() {
+                    Ok(Vec::new())
+                } else {
+                    Err(SpfError::Temporary(error.to_string()))
+                }
+            })
     }
 }
 

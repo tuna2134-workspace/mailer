@@ -1,0 +1,74 @@
+[package]
+name = "mail-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+mail-smtp-proto = { path = "../crates/mail-smtp-proto" }
+mail-smtp-client = { path = "../crates/mail-smtp-client" }
+mail-address = { path = "../crates/mail-address" }
+mail-message = { path = "../crates/mail-message" }
+mail-mime = { path = "../crates/mail-mime" }
+mail-mailbox = { path = "../crates/mail-mailbox" }
+mail-imap-proto = { path = "../crates/mail-imap-proto" }
+mail-spf = { version = "0.1.0", path = "../crates/mail-spf" }
+mail-dkim = { version = "0.1.0", path = "../crates/mail-dkim" }
+mail-dmarc = { version = "0.1.0", path = "../crates/mail-dmarc" }
+mail-arc = { version = "0.1.0", path = "../crates/mail-arc" }
+mail-sieve = { version = "0.1.0", path = "../crates/mail-sieve" }
+
+[[bin]]
+name = "smtp_command"
+path = "fuzz_targets/smtp_command.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "message_mime_address"
+path = "fuzz_targets/message_mime_address.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "smtp_reply"
+path = "fuzz_targets/smtp_reply.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mailbox_flags"
+path = "fuzz_targets/mailbox_flags.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "imap_command"
+path = "fuzz_targets/imap_command.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mail_authentication"
+path = "fuzz_targets/mail_authentication.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sieve"
+path = "fuzz_targets/sieve.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

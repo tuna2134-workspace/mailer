@@ -1,8 +1,15 @@
 #![forbid(unsafe_code)]
 
+mod evaluator;
+mod macro_expand;
+mod parser;
+
 use async_trait::async_trait;
 use std::net::IpAddr;
 use thiserror::Error;
+
+pub use evaluator::evaluate;
+pub use macro_expand::expand_domain;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SpfResult {
@@ -27,9 +34,13 @@ pub trait SpfLookup: Send + Sync {
     async fn txt(&self, name: &str) -> Result<Vec<String>, SpfError>;
     async fn addresses(&self, name: &str) -> Result<Vec<IpAddr>, SpfError>;
     async fn mx(&self, name: &str) -> Result<Vec<String>, SpfError>;
+
+    async fn ptr(&self, _ip: IpAddr) -> Result<Vec<String>, SpfError> {
+        Ok(Vec::new())
+    }
 }
 
-#[derive(Debug, Error)]
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum SpfError {
     #[error("temporary DNS error: {0}")]
     Temporary(String),
@@ -39,222 +50,219 @@ pub enum SpfError {
     Invalid,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct SpfLimits {
-    pub lookups: u8,
-    pub void_lookups: u8,
-    pub recursion: u8,
-}
-
-pub async fn evaluate<L: SpfLookup>(
-    lookup: &L,
-    ctx: &SpfContext<'_>,
-) -> Result<SpfResult, SpfError> {
-    let mut limits = SpfLimits::default();
-    evaluate_domain(lookup, ctx, sender_domain(ctx.sender), &mut limits).await
-}
-
-async fn evaluate_domain<L: SpfLookup>(
-    lookup: &L,
-    ctx: &SpfContext<'_>,
-    domain: &str,
-    limits: &mut SpfLimits,
-) -> Result<SpfResult, SpfError> {
-    if limits.recursion >= 10 {
-        return Err(SpfError::LookupLimit);
-    }
-    limits.recursion += 1;
-    limits.lookups = limits.lookups.checked_add(1).ok_or(SpfError::LookupLimit)?;
-    if limits.lookups > 10 {
-        return Err(SpfError::LookupLimit);
-    }
-    let records = lookup.txt(domain).await?;
-    let Some(record) = records
-        .into_iter()
-        .find(|value| value.to_ascii_lowercase().starts_with("v=spf1"))
-    else {
-        return Ok(SpfResult::None);
-    };
-    let mut redirect = None;
-    for term in record.split_whitespace().skip(1) {
-        if let Some(value) = term.strip_prefix("redirect=") {
-            redirect = Some(expand(value, ctx, domain));
-            continue;
+impl SpfError {
+    #[must_use]
+    pub const fn result(&self) -> SpfResult {
+        match self {
+            Self::Temporary(_) => SpfResult::TempError,
+            Self::LookupLimit | Self::Invalid => SpfResult::PermError,
         }
-        if term.contains('=') {
-            continue;
-        }
-        let (qualifier, mechanism) = term.split_at(usize::from(matches!(
-            term.as_bytes().first(),
-            Some(b'+' | b'-' | b'~' | b'?')
-        )));
-        let result = match_mechanism(lookup, ctx, domain, mechanism, &mut *limits).await?;
-        if let Some(result) = result {
-            return Ok(apply_qualifier(qualifier, result));
-        }
-    }
-    if let Some(target) = redirect {
-        return Box::pin(evaluate_domain(lookup, ctx, &target, limits)).await;
-    }
-    Ok(SpfResult::Neutral)
-}
-
-async fn match_mechanism<L: SpfLookup>(
-    lookup: &L,
-    ctx: &SpfContext<'_>,
-    domain: &str,
-    mechanism: &str,
-    limits: &mut SpfLimits,
-) -> Result<Option<SpfResult>, SpfError> {
-    let (name, arg) = mechanism.split_once(':').map_or(
-        (mechanism.split('/').next().unwrap_or(mechanism), None),
-        |(a, b)| (a, Some(b)),
-    );
-    let name = name.to_ascii_lowercase();
-    match name.as_str() {
-        "all" => Ok(Some(SpfResult::Pass)),
-        "ip4" | "ip6" => Ok(arg
-            .filter(|value| cidr_contains(value, ctx.client_ip))
-            .map(|_| SpfResult::Pass)),
-        "a" => {
-            let target = arg.map_or(domain, |value| value.split('/').next().unwrap_or(value));
-            addresses_match(lookup, ctx, &expand(target, ctx, domain), limits).await
-        }
-        "mx" => {
-            limits.lookups = limits.lookups.checked_add(1).ok_or(SpfError::LookupLimit)?;
-            let target = arg.map_or(domain, |value| value.split('/').next().unwrap_or(value));
-            let hosts = lookup.mx(&expand(target, ctx, domain)).await?;
-            if hosts.is_empty() {
-                limits.void_lookups = limits
-                    .void_lookups
-                    .checked_add(1)
-                    .ok_or(SpfError::LookupLimit)?;
-                if limits.void_lookups > 2 {
-                    return Err(SpfError::LookupLimit);
-                }
-            }
-            let mut found = false;
-            for host in hosts {
-                if addresses_match(lookup, ctx, &host, limits).await?.is_some() {
-                    found = true;
-                    break;
-                }
-            }
-            Ok(found.then_some(SpfResult::Pass))
-        }
-        "include" => {
-            let target = expand(arg.ok_or(SpfError::Invalid)?, ctx, domain);
-            match Box::pin(evaluate_domain(lookup, ctx, &target, limits)).await? {
-                SpfResult::Pass => Ok(Some(SpfResult::Pass)),
-                SpfResult::TempError => Ok(Some(SpfResult::TempError)),
-                SpfResult::PermError => Ok(Some(SpfResult::PermError)),
-                _ => Ok(None),
-            }
-        }
-        "exists" => {
-            let target = expand(arg.ok_or(SpfError::Invalid)?, ctx, domain);
-            limits.lookups = limits.lookups.checked_add(1).ok_or(SpfError::LookupLimit)?;
-            Ok((!lookup.addresses(&target).await?.is_empty()).then_some(SpfResult::Pass))
-        }
-        _ => Ok(None),
-    }
-}
-
-async fn addresses_match<L: SpfLookup>(
-    lookup: &L,
-    ctx: &SpfContext<'_>,
-    domain: &str,
-    limits: &mut SpfLimits,
-) -> Result<Option<SpfResult>, SpfError> {
-    limits.lookups = limits.lookups.checked_add(1).ok_or(SpfError::LookupLimit)?;
-    let addresses = lookup.addresses(domain).await?;
-    if addresses.is_empty() {
-        limits.void_lookups = limits
-            .void_lookups
-            .checked_add(1)
-            .ok_or(SpfError::LookupLimit)?;
-        if limits.void_lookups > 2 {
-            return Err(SpfError::LookupLimit);
-        }
-    }
-    Ok(addresses
-        .contains(&ctx.client_ip)
-        .then_some(SpfResult::Pass))
-}
-
-fn apply_qualifier(qualifier: &str, result: SpfResult) -> SpfResult {
-    match qualifier {
-        "-" => SpfResult::Fail,
-        "~" => SpfResult::SoftFail,
-        "?" => SpfResult::Neutral,
-        _ => result,
-    }
-}
-fn sender_domain(sender: &str) -> &str {
-    sender.rsplit_once('@').map_or(sender, |(_, domain)| domain)
-}
-fn expand(value: &str, ctx: &SpfContext<'_>, domain: &str) -> String {
-    value
-        .replace("%{i}", &ctx.client_ip.to_string())
-        .replace("%{s}", ctx.sender)
-        .replace("%{h}", ctx.helo)
-        .replace("%{d}", domain)
-}
-fn cidr_contains(value: &str, ip: IpAddr) -> bool {
-    let (network, prefix) = value
-        .split_once('/')
-        .map_or((value, if ip.is_ipv4() { 32 } else { 128 }), |(n, p)| {
-            (n, p.parse().ok().unwrap_or(0))
-        });
-    let Ok(network) = network.parse::<IpAddr>() else {
-        return false;
-    };
-    if network.is_ipv4() != ip.is_ipv4() {
-        return false;
-    }
-    match (network, ip) {
-        (IpAddr::V4(a), IpAddr::V4(b)) => {
-            let (a, b) = (u32::from(a), u32::from(b));
-            prefix <= 32 && (a >> (32 - prefix)) == (b >> (32 - prefix))
-        }
-        (IpAddr::V6(a), IpAddr::V6(b)) => {
-            let (a, b) = (u128::from(a), u128::from(b));
-            prefix <= 128 && (a >> (128 - prefix)) == (b >> (128 - prefix))
-        }
-        _ => false,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    struct Dns;
+    use std::collections::HashMap;
+
+    #[derive(Default)]
+    struct Dns {
+        txt: HashMap<String, Vec<String>>,
+        addresses: HashMap<String, Vec<IpAddr>>,
+        mx: HashMap<String, Vec<String>>,
+        ptr: HashMap<IpAddr, Vec<String>>,
+    }
+
     #[async_trait]
     impl SpfLookup for Dns {
         async fn txt(&self, name: &str) -> Result<Vec<String>, SpfError> {
-            Ok(if name == "example.test" {
-                vec!["v=spf1 ip4:192.0.2.0/24 -all".into()]
+            Ok(self.txt.get(name).cloned().unwrap_or_default())
+        }
+
+        async fn addresses(&self, name: &str) -> Result<Vec<IpAddr>, SpfError> {
+            Ok(self.addresses.get(name).cloned().unwrap_or_default())
+        }
+
+        async fn mx(&self, name: &str) -> Result<Vec<String>, SpfError> {
+            Ok(self.mx.get(name).cloned().unwrap_or_default())
+        }
+
+        async fn ptr(&self, ip: IpAddr) -> Result<Vec<String>, SpfError> {
+            Ok(self.ptr.get(&ip).cloned().unwrap_or_default())
+        }
+    }
+
+    fn context() -> SpfContext<'static> {
+        SpfContext {
+            client_ip: IpAddr::from([192, 0, 2, 8]),
+            sender: "strong-bad@email.example.com",
+            helo: "mx.example.com",
+        }
+    }
+
+    fn records(records: &[&str]) -> Dns {
+        Dns {
+            txt: HashMap::from([(
+                "email.example.com".into(),
+                records.iter().map(|value| (*value).into()).collect(),
+            )]),
+            ..Dns::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn evaluates_ip_and_qualifiers() {
+        assert_eq!(
+            evaluate(&records(&["v=spf1 ip4:192.0.2.0/24 -all"]), &context()).await,
+            Ok(SpfResult::Pass)
+        );
+    }
+
+    #[tokio::test]
+    async fn multiple_spf_records_are_not_selected_arbitrarily() {
+        assert_eq!(
+            evaluate(&records(&["v=spf1 +all", "v=spf1 -all"]), &context()).await,
+            Err(SpfError::Invalid)
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_mechanism_and_malformed_cidr_are_permanent_errors() {
+        for record in [
+            "v=spf1 made-up -all",
+            "v=spf1 ip4:192.0.2.1/nope -all",
+            "v=spf1 ip6:2001:db8::1/129 -all",
+            "v=spf1 a/33 -all",
+        ] {
+            assert_eq!(
+                evaluate(&records(&[record]), &context()).await,
+                Err(SpfError::Invalid),
+                "record={record}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_modifiers_are_ignored_but_duplicates_are_validated() {
+        assert_eq!(
+            evaluate(
+                &records(&["v=spf1 unknown=%{d} ip4:192.0.2.8 -all"]),
+                &context()
+            )
+            .await,
+            Ok(SpfResult::Pass)
+        );
+        for record in [
+            "v=spf1 redirect=a.test redirect=b.test",
+            "v=spf1 exp=a.test exp=b.test -all",
+            "v=spf1 exp=%{c}.example.test -all",
+            "v=spf1 bad=%{q} -all",
+        ] {
+            assert_eq!(
+                evaluate(&records(&[record]), &context()).await,
+                Err(SpfError::Invalid)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn redirect_none_and_include_none_are_permanent_errors() {
+        for record in [
+            "v=spf1 redirect=missing.test",
+            "v=spf1 include:missing.test",
+        ] {
+            assert_eq!(
+                evaluate(&records(&[record]), &context()).await,
+                Err(SpfError::Invalid),
+                "record={record}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn void_and_recursive_dns_budgets_are_global() {
+        assert_eq!(
+            evaluate(
+                &records(&["v=spf1 exists:a.test exists:b.test exists:c.test -all"]),
+                &context(),
+            )
+            .await,
+            Err(SpfError::LookupLimit)
+        );
+
+        let mut dns = Dns::default();
+        for index in 0..=10 {
+            let domain = if index == 0 {
+                "email.example.com".to_owned()
             } else {
-                Vec::new()
-            })
+                format!("r{index}.test")
+            };
+            let next = format!("r{}.test", index + 1);
+            dns.txt
+                .insert(domain, vec![format!("v=spf1 redirect={next}")]);
         }
+        assert_eq!(evaluate(&dns, &context()).await, Err(SpfError::LookupLimit));
+    }
+
+    #[tokio::test]
+    async fn dual_cidr_applies_the_client_address_family_prefix() {
+        let mut dns = records(&["v=spf1 a:host.test/24//64 -all"]);
+        dns.addresses.insert(
+            "host.test".into(),
+            vec![
+                IpAddr::from([192, 0, 2, 99]),
+                "2001:db8::99".parse().unwrap_or(IpAddr::from([0, 0, 0, 0])),
+            ],
+        );
+        assert_eq!(evaluate(&dns, &context()).await, Ok(SpfResult::Pass));
+    }
+
+    struct PtrFailure;
+
+    #[async_trait]
+    impl SpfLookup for PtrFailure {
+        async fn txt(&self, _: &str) -> Result<Vec<String>, SpfError> {
+            Ok(vec!["v=spf1 ptr -all".into()])
+        }
+
         async fn addresses(&self, _: &str) -> Result<Vec<IpAddr>, SpfError> {
-            Ok(Vec::new())
+            Err(SpfError::Temporary("forward lookup failed".into()))
         }
+
         async fn mx(&self, _: &str) -> Result<Vec<String>, SpfError> {
             Ok(Vec::new())
         }
+
+        async fn ptr(&self, _: IpAddr) -> Result<Vec<String>, SpfError> {
+            Ok(vec!["ptr.example.test".into()])
+        }
     }
+
     #[tokio::test]
-    async fn evaluates_ip_and_qualifiers() {
-        let ctx = SpfContext {
-            client_ip: "192.0.2.8".parse().unwrap_or_else(|_| panic!("ip")),
-            sender: "a@example.test",
-            helo: "mx.example.test",
-        };
+    async fn ptr_forward_dns_failure_is_not_silently_treated_as_no_match() {
+        assert!(matches!(
+            evaluate(&PtrFailure, &context()).await,
+            Err(SpfError::Temporary(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn validated_domain_macro_uses_forward_confirmed_ptr_name() {
+        let mut dns = records(&["v=spf1 exists:%{p} -all"]);
+        dns.ptr
+            .insert(context().client_ip, vec!["mail.email.example.com".into()]);
+        dns.addresses
+            .insert("mail.email.example.com".into(), vec![context().client_ip]);
+        assert_eq!(evaluate(&dns, &context()).await, Ok(SpfResult::Pass));
+    }
+
+    #[test]
+    fn evaluator_errors_have_non_collapsible_results() {
         assert_eq!(
-            evaluate(&Dns, &ctx).await.unwrap_or(SpfResult::None),
-            SpfResult::Pass
+            SpfError::Temporary("dns".into()).result(),
+            SpfResult::TempError
         );
+        assert_eq!(SpfError::Invalid.result(), SpfResult::PermError);
+        assert_eq!(SpfError::LookupLimit.result(), SpfResult::PermError);
     }
 }

@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
-use mail_dkim::{SigningKey, canonicalize_header_relaxed, sign_headers_named, sign_signature_data};
+use mail_dkim::{
+    DkimSignature, SigningKey, canonicalize_header_relaxed, sign_headers_named, sign_signature_data,
+};
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -132,9 +134,35 @@ pub fn parse_sets(headers: &[(&str, &str)]) -> Result<Vec<ArcSet>, ArcError> {
         ) {
             continue;
         }
-        let Some(instance) = tag(value, "i").and_then(|value| value.parse().ok()) else {
+        let parsed_tags = if upper == "ARC-AUTHENTICATION-RESULTS" {
+            tags(value.split(';').next().ok_or(ArcError::InvalidChain)?)?
+        } else {
+            tags(value)?
+        };
+        let Some(instance) = parsed_tags.get("i").and_then(|value| value.parse().ok()) else {
             return Err(ArcError::InvalidInstance);
         };
+        match upper.as_str() {
+            "ARC-SEAL" => {
+                for required in ["a", "b", "cv", "d", "s"] {
+                    if parsed_tags.get(required).is_none_or(String::is_empty) {
+                        return Err(ArcError::InvalidChain);
+                    }
+                }
+            }
+            "ARC-MESSAGE-SIGNATURE" => {
+                let header = format!("ARC-Message-Signature: {value}\r\n");
+                DkimSignature::parse(header.as_bytes()).map_err(|_| ArcError::InvalidChain)?;
+            }
+            "ARC-AUTHENTICATION-RESULTS"
+                if value
+                    .split_once(';')
+                    .is_none_or(|(_, rest)| rest.trim().is_empty()) =>
+            {
+                return Err(ArcError::InvalidChain);
+            }
+            _ => {}
+        }
         let entry = sets.entry(instance).or_insert_with(|| (None, None, None));
         let slot = match upper.as_str() {
             "ARC-SEAL" => &mut entry.0,
@@ -157,7 +185,7 @@ pub fn parse_sets(headers: &[(&str, &str)]) -> Result<Vec<ArcSet>, ArcError> {
         let seal = seal.ok_or(ArcError::Missing(expected))?;
         let signature = signature.ok_or(ArcError::Missing(expected))?;
         let auth = auth.ok_or(ArcError::Missing(expected))?;
-        let cv = tag(&seal, "cv").unwrap_or_default();
+        let cv = tags(&seal)?.get("cv").cloned().unwrap_or_default();
         if expected == 1 && !cv.eq_ignore_ascii_case("none") {
             return Err(ArcError::InvalidChain);
         }
@@ -180,7 +208,7 @@ pub fn parse_sets(headers: &[(&str, &str)]) -> Result<Vec<ArcSet>, ArcError> {
     Ok(output)
 }
 
-pub fn validate(headers: &[(&str, &str)]) -> Result<ArcValidation, ArcError> {
+pub fn validate_structure(headers: &[(&str, &str)]) -> Result<ArcValidation, ArcError> {
     let sets = parse_sets(headers)?;
     Ok(ArcValidation {
         status: if sets.is_empty() {
@@ -196,19 +224,27 @@ pub fn validate_with<V: ArcSignatureVerifier>(
     headers: &[(&str, &str)],
     verifier: &V,
 ) -> Result<ArcValidation, ArcError> {
-    let validation = validate(headers)?;
+    let validation = validate_structure(headers)?;
     let sets = parse_sets(headers)?;
     if sets.iter().any(|set| !verifier.verify(set)) {
         return Err(ArcError::InvalidChain);
     }
     Ok(validation)
 }
-fn tag(value: &str, target: &str) -> Option<String> {
-    value.split(';').map(str::trim).find_map(|part| {
-        part.split_once('=')
-            .filter(|(name, _)| name.trim().eq_ignore_ascii_case(target))
-            .map(|(_, value)| value.trim().to_owned())
-    })
+fn tags(value: &str) -> Result<std::collections::HashMap<String, String>, ArcError> {
+    let mut output = std::collections::HashMap::new();
+    for part in value
+        .split(';')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        let (name, value) = part.split_once('=').ok_or(ArcError::InvalidChain)?;
+        let name = name.trim().to_ascii_lowercase();
+        if name.is_empty() || output.insert(name, value.trim().to_owned()).is_some() {
+            return Err(ArcError::InvalidChain);
+        }
+    }
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -221,15 +257,21 @@ mod tests {
             true
         }
     }
+    const AS1: &str = "i=1; a=ed25519-sha256; cv=none; d=example.test; s=s1; b=YQ==";
+    const AMS1: &str = "i=1; a=ed25519-sha256; d=example.test; s=s1; h=from; bh=YQ==; b=YQ==";
+    const AAR1: &str = "i=1; mx.example; spf=pass";
+
     #[test]
     fn validates_contiguous_chain() {
         let headers = [
-            ("ARC-Seal", "i=1; cv=none"),
-            ("ARC-Message-Signature", "i=1; a=rsa-sha256"),
-            ("ARC-Authentication-Results", "i=1; mx=example"),
+            ("ARC-Seal", AS1),
+            ("ARC-Message-Signature", AMS1),
+            ("ARC-Authentication-Results", AAR1),
         ];
         assert_eq!(
-            validate(&headers).unwrap_or_else(|_| panic!("arc")).status,
+            validate_structure(&headers)
+                .unwrap_or_else(|_| panic!("arc"))
+                .status,
             ChainStatus::Pass
         );
         assert_eq!(
@@ -243,18 +285,26 @@ mod tests {
     #[test]
     fn rejects_duplicate_fields_and_ignores_unrelated_headers() {
         let duplicate = [
-            ("ARC-Seal", "i=1; cv=none"),
-            ("ARC-Seal", "i=1; cv=none"),
-            ("ARC-Message-Signature", "i=1"),
-            ("ARC-Authentication-Results", "i=1"),
+            ("ARC-Seal", AS1),
+            ("ARC-Seal", AS1),
+            ("ARC-Message-Signature", AMS1),
+            ("ARC-Authentication-Results", AAR1),
         ];
         assert_eq!(parse_sets(&duplicate), Err(ArcError::Duplicate(1)));
         assert_eq!(
-            validate(&[("From", "alice@example.test")]),
+            validate_structure(&[("From", "alice@example.test")]),
             Ok(ArcValidation {
                 status: ChainStatus::None,
                 instances: 0
             })
+        );
+        assert_eq!(
+            parse_sets(&[
+                ("ARC-Seal", "i=1; i=2; a=x; b=x; cv=none; d=x; s=x"),
+                ("ARC-Message-Signature", AMS1),
+                ("ARC-Authentication-Results", AAR1),
+            ]),
+            Err(ArcError::InvalidChain)
         );
     }
 

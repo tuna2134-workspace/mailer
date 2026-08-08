@@ -1,18 +1,22 @@
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use mail_address::{Address, AddressLimits, parse_address_list};
-use mail_dkim::{BodyHasher, Canonicalization, body_canonicalization, identity, verify_headers};
+use mail_dkim::{
+    BodyHasher, Canonicalization, DkimError, DkimKeyRecord, DkimSignature, body_canonicalization,
+    verify_headers,
+};
 use mail_dmarc::{
-    Authentication, DmarcPolicy, evaluate as evaluate_dmarc, organizational_domain,
-    parse as parse_dmarc,
+    AuthenticatedIdentifier, Authentication, DiscoveredPolicy, DmarcPolicy, PolicyScope, Psd,
+    evaluate as evaluate_dmarc, parse as parse_dmarc, tree_walk_domains,
 };
 use mail_dns::MailResolver;
 use mail_policy::{AuthenticationResult, authentication_results};
-use mail_spf::{SpfContext, SpfResult, evaluate};
+use mail_spf::{SpfContext, SpfError, SpfResult, evaluate};
 use mail_storage::{SmtpRepository, StorageError};
-use std::net::IpAddr;
+use std::{collections::HashMap, net::IpAddr, time::Duration};
 use uuid::Uuid;
 
 const MAX_HEADERS: usize = 256 * 1024;
+const MAX_DKIM_SIGNATURES: usize = 16;
+const SPF_EVALUATION_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Clone)]
 pub struct InboundAuthenticator {
@@ -40,23 +44,35 @@ impl InboundAuthenticator {
     ) -> Result<Vec<u8>, StorageError> {
         let scanned = scan(repository, ingestion_id).await?;
         let spf_sender = safe_identity(if sender.is_empty() { helo } else { sender });
-        let spf = evaluate(
-            &self.resolver,
-            &SpfContext {
-                client_ip,
-                sender: &spf_sender,
-                helo,
-            },
+        let spf = match tokio::time::timeout(
+            SPF_EVALUATION_TIMEOUT,
+            evaluate(
+                &self.resolver,
+                &SpfContext {
+                    client_ip,
+                    sender: &spf_sender,
+                    helo,
+                },
+            ),
         )
         .await
-        .unwrap_or(SpfResult::TempError);
+        {
+            Ok(result) => spf_result(result),
+            Err(_) => SpfResult::TempError,
+        };
         let mut dkim = "none";
         let mut dkim_domain = None;
-        for signature in header_fields(&scanned.headers, b"DKIM-Signature") {
-            let Ok((domain, selector)) = identity(&signature) else {
+        let mut dkim_pass_domains = Vec::new();
+        for signature in header_fields(&scanned.headers, b"DKIM-Signature")
+            .into_iter()
+            .take(MAX_DKIM_SIGNATURES)
+        {
+            let Ok(parsed) = DkimSignature::parse(&signature) else {
                 dkim = "permerror";
                 continue;
             };
+            let domain = parsed.domain.clone();
+            let selector = parsed.selector.clone();
             let Ok(records) = self
                 .resolver
                 .txt(&format!("{selector}._domainkey.{domain}"))
@@ -65,7 +81,7 @@ impl InboundAuthenticator {
                 dkim = "temperror";
                 continue;
             };
-            let Some(key) = records.iter().find_map(|record| dkim_key(record)) else {
+            let Ok(key) = dkim_key_for(&records, &parsed) else {
                 dkim = "permerror";
                 continue;
             };
@@ -80,11 +96,12 @@ impl InboundAuthenticator {
             match verify_headers(&scanned.headers, &signature, &key, hash) {
                 Ok(true) => {
                     dkim = "pass";
-                    dkim_domain = Some(domain);
-                    break;
+                    dkim_domain = Some(domain.clone());
+                    dkim_pass_domains.push(domain);
                 }
-                Ok(false) => dkim = "fail",
-                Err(_) => dkim = "permerror",
+                Ok(false) if dkim != "pass" => dkim = "fail",
+                Err(_) if dkim != "pass" => dkim = "permerror",
+                Ok(false) | Err(_) => {}
             }
         }
         let spf_name = spf_name(spf);
@@ -114,27 +131,61 @@ impl InboundAuthenticator {
             None => ("permerror", None),
             Some(domain) => match discover_dmarc(&self.resolver, domain).await {
                 Err(DmarcDiscoveryError::Temporary) => ("temperror", Some(domain.to_owned())),
-                Err(DmarcDiscoveryError::Permanent) => ("permerror", Some(domain.to_owned())),
                 Ok(None) => ("none", Some(domain.to_owned())),
-                Ok(Some((policy_domain, policy))) => {
+                Ok(Some(discovered)) => {
                     let spf_domain = spf_sender
                         .rsplit_once('@')
-                        .map_or(Some(spf_sender.clone()), |(_, domain)| {
-                            Some(domain.to_owned())
+                        .map_or(spf_sender.as_str(), |(_, domain)| domain);
+                    let mut dkim_identifiers = Vec::new();
+                    let mut organizational_domains = HashMap::<String, String>::new();
+                    for domain in dkim_pass_domains {
+                        let organizational = if let Some(cached) =
+                            organizational_domains.get(&domain)
+                        {
+                            cached.clone()
+                        } else {
+                            let discovered =
+                                discover_organizational_domain(&self.resolver, &domain)
+                                    .await
+                                    .map_err(|error| {
+                                        StorageError::Unavailable(format!("DMARC DNS: {error:?}"))
+                                    })?;
+                            organizational_domains.insert(domain.clone(), discovered.clone());
+                            discovered
+                        };
+                        dkim_identifiers.push(AuthenticatedIdentifier {
+                            domain,
+                            organizational_domain: organizational,
+                            pass: true,
                         });
+                    }
+                    let spf_identifier = if spf == SpfResult::Pass {
+                        Some(AuthenticatedIdentifier {
+                            domain: spf_domain.to_owned(),
+                            organizational_domain: discover_organizational_domain(
+                                &self.resolver,
+                                spf_domain,
+                            )
+                            .await
+                            .map_err(|error| {
+                                StorageError::Unavailable(format!("DMARC DNS: {error:?}"))
+                            })?,
+                            pass: true,
+                        })
+                    } else {
+                        None
+                    };
                     let evaluated = evaluate_dmarc(
-                        &policy,
+                        &discovered,
                         &Authentication {
                             header_from: domain.to_owned(),
-                            dkim_domain: dkim_domain.clone(),
-                            dkim_pass: dkim == "pass",
-                            spf_domain,
-                            spf_pass: spf == SpfResult::Pass,
+                            dkim: dkim_identifiers,
+                            spf: spf_identifier,
                         },
                     );
                     (
                         if evaluated.pass { "pass" } else { "fail" },
-                        Some(policy_domain),
+                        Some(discovered.policy_domain),
                     )
                 }
             },
@@ -229,55 +280,122 @@ fn header_fields(headers: &[u8], name: &[u8]) -> Vec<Vec<u8>> {
     fields
 }
 
-pub(super) fn dkim_key(record: &str) -> Option<Vec<u8>> {
-    if !record.split(';').any(|tag| tag.trim() == "v=DKIM1") {
-        return None;
-    }
-    let value = record
-        .split(';')
-        .find_map(|tag| tag.trim().strip_prefix("p="))?;
-    if value.is_empty() {
-        return None;
-    }
-    STANDARD
-        .decode(value.split_ascii_whitespace().collect::<String>())
-        .ok()
+fn dkim_key_for(records: &[String], signature: &DkimSignature) -> Result<Vec<u8>, DkimError> {
+    let [record] = records else {
+        return Err(DkimError::Malformed);
+    };
+    let key = DkimKeyRecord::parse(record)?;
+    key.key_for(
+        signature.algorithm,
+        &signature.domain,
+        signature.identity.as_deref(),
+    )
+    .map(Vec::from)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DmarcDiscoveryError {
     Temporary,
-    Permanent,
 }
 
 async fn discover_dmarc(
     resolver: &MailResolver,
     from_domain: &str,
-) -> Result<Option<(String, DmarcPolicy)>, DmarcDiscoveryError> {
-    let organizational = organizational_domain(from_domain);
-    let mut domains = vec![from_domain];
-    if organizational != from_domain {
-        domains.push(&organizational);
-    }
-    for domain in domains {
+) -> Result<Option<DiscoveredPolicy>, DmarcDiscoveryError> {
+    let author_exists = resolver
+        .txt_with_existence(from_domain)
+        .await
+        .map_err(|_| DmarcDiscoveryError::Temporary)?
+        .name_exists;
+    let walked = walk_dmarc(resolver, from_domain).await?;
+    let Some((policy_domain, policy)) = select_policy(&walked, from_domain) else {
+        return Ok(None);
+    };
+    let organizational_domain = select_organizational_domain(&walked, from_domain);
+    let scope = if policy_domain.eq_ignore_ascii_case(from_domain) {
+        PolicyScope::AuthorDomain
+    } else if author_exists {
+        PolicyScope::ExistingSubdomain
+    } else {
+        PolicyScope::NonexistentSubdomain
+    };
+    Ok(Some(DiscoveredPolicy {
+        policy_domain,
+        organizational_domain,
+        scope,
+        policy,
+    }))
+}
+
+async fn discover_organizational_domain(
+    resolver: &MailResolver,
+    domain: &str,
+) -> Result<String, DmarcDiscoveryError> {
+    let walked = walk_dmarc(resolver, domain).await?;
+    Ok(select_organizational_domain(&walked, domain))
+}
+
+async fn walk_dmarc(
+    resolver: &MailResolver,
+    domain: &str,
+) -> Result<Vec<(String, DmarcPolicy)>, DmarcDiscoveryError> {
+    let mut found = Vec::new();
+    for domain in tree_walk_domains(domain) {
         let records = resolver
             .txt(&format!("_dmarc.{domain}"))
             .await
             .map_err(|_| DmarcDiscoveryError::Temporary)?;
         let matching = records
             .iter()
-            .filter(|record| record.trim_start().starts_with("v=DMARC1"))
+            .filter_map(|record| parse_dmarc(record).ok())
             .collect::<Vec<_>>();
-        match matching.as_slice() {
-            [] => {}
-            [record] => {
-                let policy = parse_dmarc(record).map_err(|_| DmarcDiscoveryError::Permanent)?;
-                return Ok(Some((domain.to_owned(), policy)));
+        if let [record] = matching.as_slice() {
+            found.push((domain, (*record).clone()));
+            if record.psd != Psd::Unknown {
+                break;
             }
-            _ => return Err(DmarcDiscoveryError::Permanent),
         }
     }
-    Ok(None)
+    Ok(found)
+}
+
+fn select_policy(walked: &[(String, DmarcPolicy)], author: &str) -> Option<(String, DmarcPolicy)> {
+    if let Some((domain, policy)) = walked
+        .iter()
+        .find(|(domain, _)| domain.eq_ignore_ascii_case(author))
+    {
+        return Some((domain.clone(), policy.clone()));
+    }
+    let organizational = select_organizational_domain(walked, author);
+    walked
+        .iter()
+        .find(|(domain, _)| domain == &organizational)
+        .or_else(|| walked.last())
+        .map(|(domain, policy)| (domain.clone(), policy.clone()))
+}
+
+fn select_organizational_domain(walked: &[(String, DmarcPolicy)], initial: &str) -> String {
+    for (index, (domain, policy)) in walked.iter().enumerate() {
+        match policy.psd {
+            Psd::No => return domain.clone(),
+            Psd::Yes if index > 0 => {
+                return child_of(initial, domain).unwrap_or_else(|| initial.to_owned());
+            }
+            Psd::Yes | Psd::Unknown => {}
+        }
+    }
+    walked.last().map_or_else(
+        || initial.trim_end_matches('.').to_ascii_lowercase(),
+        |(domain, _)| domain.clone(),
+    )
+}
+
+fn child_of(initial: &str, parent: &str) -> Option<String> {
+    let initial = initial.trim_end_matches('.').to_ascii_lowercase();
+    let parent = parent.trim_end_matches('.').to_ascii_lowercase();
+    let prefix = initial.strip_suffix(&format!(".{parent}"))?;
+    let label = prefix.rsplit('.').next()?;
+    Some(format!("{label}.{parent}"))
 }
 
 fn from_domain(headers: &[u8]) -> Option<String> {
@@ -310,6 +428,10 @@ fn spf_name(result: SpfResult) -> &'static str {
     }
 }
 
+fn spf_result(result: Result<SpfResult, SpfError>) -> SpfResult {
+    result.unwrap_or_else(|error| error.result())
+}
+
 fn safe_identity(value: &str) -> String {
     if !value.is_empty()
         && value.len() <= 320
@@ -340,9 +462,29 @@ mod tests {
     }
 
     #[test]
-    fn accepts_only_non_revoked_dkim_key_records() {
-        assert_eq!(dkim_key("v=DKIM1; k=ed25519; p=YQ=="), Some(vec![b'a']));
-        assert_eq!(dkim_key("v=DKIM1; p="), None);
-        assert_eq!(dkim_key("v=OTHER; p=YQ=="), None);
+    fn key_record_must_be_unique_and_match_the_signature_algorithm() {
+        let signature = DkimSignature::parse(b"DKIM-Signature: v=1; a=ed25519-sha256; d=example.test; s=s1; h=from; bh=YQ==; b=Yg==\r\n")
+            .unwrap_or_else(|_| panic!("signature"));
+        assert!(
+            dkim_key_for(
+                &[
+                    "v=DKIM1; k=ed25519; p=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+                    "v=DKIM1; k=ed25519; p=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+                ],
+                &signature,
+            )
+            .is_err()
+        );
+        assert!(dkim_key_for(&["v=DKIM1; k=rsa; p=YQ==".into()], &signature).is_err());
+    }
+
+    #[test]
+    fn spf_syntax_and_budget_errors_are_not_reported_as_dns_failures() {
+        assert_eq!(spf_result(Err(SpfError::Invalid)), SpfResult::PermError);
+        assert_eq!(spf_result(Err(SpfError::LookupLimit)), SpfResult::PermError);
+        assert_eq!(
+            spf_result(Err(SpfError::Temporary("timeout".into()))),
+            SpfResult::TempError
+        );
     }
 }

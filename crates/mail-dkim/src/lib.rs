@@ -1,8 +1,15 @@
 #![forbid(unsafe_code)]
 
+mod key;
+mod signature;
+mod tag_list;
+
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use ring::{digest, rand::SystemRandom, signature};
+use ring::{digest, rand::SystemRandom, signature as ring_signature};
 use thiserror::Error;
+
+pub use key::{DkimKeyRecord, KeyType};
+pub use signature::{Algorithm, DkimSignature};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Canonicalization {
@@ -14,7 +21,7 @@ pub enum SigningKey {
     RsaPkcs8(Vec<u8>),
     Ed25519Pkcs8(Vec<u8>),
 }
-#[derive(Debug, Error)]
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum DkimError {
     #[error("malformed DKIM header")]
     Malformed,
@@ -24,6 +31,10 @@ pub enum DkimError {
     Key(String),
     #[error("signature verification failed")]
     Verify,
+    #[error("signature has expired")]
+    Expired,
+    #[error("public key has been revoked")]
+    Revoked,
 }
 
 #[allow(clippy::struct_excessive_bools)] // Each flag tracks independent streaming wire state.
@@ -163,7 +174,7 @@ pub fn sign(
         SigningKey::Ed25519Pkcs8(_) => "ed25519-sha256",
     };
     let unsigned = format!(
-        "v=1; a={algorithm}; c={}:{}; d={domain}; s={selector}; h={names}; bh={bh}; b=",
+        "v=1; a={algorithm}; c={}/{}; d={domain}; s={selector}; h={names}; bh={bh}; b=",
         canon_name(header_canon),
         canon_name(body_canon)
     );
@@ -195,7 +206,7 @@ pub fn sign_headers(
         SigningKey::Ed25519Pkcs8(_) => "ed25519-sha256",
     };
     let unsigned = format!(
-        "v=1; a={algorithm}; c={}:{}; d={domain}; s={selector}; h={names}; bh={precomputed_body_hash}; b=",
+        "v=1; a={algorithm}; c={}/{}; d={domain}; s={selector}; h={names}; bh={precomputed_body_hash}; b=",
         canon_name(header_canon),
         canon_name(body_canon)
     );
@@ -226,7 +237,7 @@ pub fn sign_headers_named(
     }
     let algorithm = algorithm_name(&key);
     let unsigned = format!(
-        "{leading_tags}a={algorithm}; c=relaxed:relaxed; d={domain}; s={selector}; h={}; bh={precomputed_body_hash}; b=",
+        "{leading_tags}a={algorithm}; c=relaxed/relaxed; d={domain}; s={selector}; h={}; bh={precomputed_body_hash}; b=",
         headers.join(":")
     );
     let line = format!("{header_name}: {unsigned}\r\n");
@@ -261,45 +272,51 @@ pub fn sign_signature_data(
 }
 
 pub fn verify(message: &[u8], dkim_header: &[u8], public_key: &[u8]) -> Result<bool, DkimError> {
-    let tags = parse_tags(dkim_header)?;
-    let algorithm = tags.get("a").ok_or(DkimError::Malformed)?;
-    let header_canon = if tags
-        .get("c")
-        .is_some_and(|value| value.starts_with("relaxed"))
-    {
-        Canonicalization::Relaxed
-    } else {
-        Canonicalization::Simple
-    };
-    let body_canon = if tags
-        .get("c")
-        .is_some_and(|value| value.ends_with("relaxed"))
-    {
-        Canonicalization::Relaxed
-    } else {
-        Canonicalization::Simple
-    };
+    verify_at(message, dkim_header, public_key, unix_now())
+}
+
+pub fn verify_at(
+    message: &[u8],
+    dkim_header: &[u8],
+    public_key: &[u8],
+    now: u64,
+) -> Result<bool, DkimError> {
+    let signature = DkimSignature::parse(dkim_header)?;
+    signature.validate_time(now)?;
     let (_, body) = split_body(message);
-    if tags.get("bh").map(|value| compact(value)) != Some(body_hash(body, body_canon)) {
+    let canonicalized = canonicalize_body(body, signature.body_canonicalization);
+    let signed_body = match signature.body_length {
+        Some(length) if length <= canonicalized.len() => &canonicalized[..length],
+        Some(_) => return Err(DkimError::Malformed),
+        None => canonicalized.as_slice(),
+    };
+    if digest::digest(&digest::SHA256, signed_body).as_ref() != signature.body_hash {
         return Ok(false);
     }
-    let names = tags.get("h").ok_or(DkimError::Malformed)?.split(':');
-    let header_names = names.collect::<Vec<_>>();
     let unsigned = remove_tag_value(dkim_header, "b")?;
-    let signing = signing_input(message, &unsigned, &header_names, header_canon);
-    let signature_bytes = STANDARD
-        .decode(compact(tags.get("b").ok_or(DkimError::Malformed)?))
-        .map_err(|_| DkimError::Malformed)?;
-    let valid = match algorithm.as_str() {
-        "rsa-sha256" => {
-            signature::UnparsedPublicKey::new(&signature::RSA_PKCS1_2048_8192_SHA256, public_key)
-                .verify(&signing, &signature_bytes)
+    let names = signature
+        .signed_headers
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let signing = signing_input(
+        message,
+        &unsigned,
+        &names,
+        signature.header_canonicalization,
+    );
+    let valid = match signature.algorithm {
+        Algorithm::RsaSha256 => ring_signature::UnparsedPublicKey::new(
+            &ring_signature::RSA_PKCS1_1024_8192_SHA256_FOR_LEGACY_USE_ONLY,
+            public_key,
+        )
+        .verify(&signing, &signature.signature)
+        .is_ok(),
+        Algorithm::Ed25519Sha256 => {
+            ring_signature::UnparsedPublicKey::new(&ring_signature::ED25519, public_key)
+                .verify(&signing, &signature.signature)
                 .is_ok()
         }
-        "ed25519-sha256" => signature::UnparsedPublicKey::new(&signature::ED25519, public_key)
-            .verify(&signing, &signature_bytes)
-            .is_ok(),
-        _ => return Err(DkimError::Algorithm),
     };
     Ok(valid)
 }
@@ -310,66 +327,84 @@ pub fn verify_headers(
     public_key: &[u8],
     precomputed_body_hash: &str,
 ) -> Result<bool, DkimError> {
-    let tags = parse_tags(dkim_header)?;
-    if tags.get("bh").map(|value| compact(value)) != Some(precomputed_body_hash.to_owned()) {
+    verify_headers_at(
+        message_headers,
+        dkim_header,
+        public_key,
+        precomputed_body_hash,
+        unix_now(),
+    )
+}
+
+pub fn verify_headers_at(
+    message_headers: &[u8],
+    dkim_header: &[u8],
+    public_key: &[u8],
+    precomputed_body_hash: &str,
+    now: u64,
+) -> Result<bool, DkimError> {
+    let signature = DkimSignature::parse(dkim_header)?;
+    signature.validate_time(now)?;
+    if signature.body_length.is_some() {
+        return Err(DkimError::Algorithm);
+    }
+    let body_hash = STANDARD
+        .decode(compact(precomputed_body_hash))
+        .map_err(|_| DkimError::Malformed)?;
+    if signature.body_hash != body_hash {
         return Ok(false);
     }
-    let algorithm = tags.get("a").ok_or(DkimError::Malformed)?;
-    let header_canon = if tags
-        .get("c")
-        .is_some_and(|value| value.starts_with("relaxed"))
-    {
-        Canonicalization::Relaxed
-    } else {
-        Canonicalization::Simple
-    };
-    let names = tags
-        .get("h")
-        .ok_or(DkimError::Malformed)?
-        .split(':')
+    let names = signature
+        .signed_headers
+        .iter()
+        .map(String::as_str)
         .collect::<Vec<_>>();
     let unsigned = remove_tag_value(dkim_header, "b")?;
-    let signing = signing_input(message_headers, &unsigned, &names, header_canon);
-    let signature_bytes = STANDARD
-        .decode(compact(tags.get("b").ok_or(DkimError::Malformed)?))
-        .map_err(|_| DkimError::Malformed)?;
-    match algorithm.as_str() {
-        "rsa-sha256" => Ok(signature::UnparsedPublicKey::new(
-            &signature::RSA_PKCS1_2048_8192_SHA256,
+    let signing = signing_input(
+        message_headers,
+        &unsigned,
+        &names,
+        signature.header_canonicalization,
+    );
+    match signature.algorithm {
+        Algorithm::RsaSha256 => Ok(ring_signature::UnparsedPublicKey::new(
+            &ring_signature::RSA_PKCS1_1024_8192_SHA256_FOR_LEGACY_USE_ONLY,
             public_key,
         )
-        .verify(&signing, &signature_bytes)
+        .verify(&signing, &signature.signature)
         .is_ok()),
-        "ed25519-sha256" => Ok(
-            signature::UnparsedPublicKey::new(&signature::ED25519, public_key)
-                .verify(&signing, &signature_bytes)
-                .is_ok(),
-        ),
-        _ => Err(DkimError::Algorithm),
+        Algorithm::Ed25519Sha256 => Ok(ring_signature::UnparsedPublicKey::new(
+            &ring_signature::ED25519,
+            public_key,
+        )
+        .verify(&signing, &signature.signature)
+        .is_ok()),
     }
 }
 
 pub fn identity(dkim_header: &[u8]) -> Result<(String, String), DkimError> {
-    let tags = parse_tags(dkim_header)?;
-    Ok((
-        tags.get("d").ok_or(DkimError::Malformed)?.clone(),
-        tags.get("s").ok_or(DkimError::Malformed)?.clone(),
-    ))
+    let tags = tag_list::parse(dkim_header)?;
+    Ok((required_tag(&tags, "d")?, required_tag(&tags, "s")?))
+}
+
+pub fn signature_algorithm(signature_header: &[u8]) -> Result<Algorithm, DkimError> {
+    let tags = tag_list::parse(signature_header)?;
+    match tags.get("a").map(String::as_str) {
+        Some("rsa-sha256") => Ok(Algorithm::RsaSha256),
+        Some("ed25519-sha256") => Ok(Algorithm::Ed25519Sha256),
+        _ => Err(DkimError::Algorithm),
+    }
 }
 
 pub fn body_canonicalization(dkim_header: &[u8]) -> Result<Canonicalization, DkimError> {
-    let tags = parse_tags(dkim_header)?;
-    Ok(
-        if tags
-            .get("c")
-            .and_then(|value| value.split_once(':').map(|(_, body)| body))
-            .is_some_and(|body| body.eq_ignore_ascii_case("relaxed"))
-        {
-            Canonicalization::Relaxed
-        } else {
-            Canonicalization::Simple
-        },
-    )
+    let tags = tag_list::parse(dkim_header)?;
+    let value = tags.get("c").map_or("simple/simple", String::as_str);
+    let body = value.split_once('/').map_or("simple", |(_, body)| body);
+    match body {
+        "simple" => Ok(Canonicalization::Simple),
+        "relaxed" => Ok(Canonicalization::Relaxed),
+        _ => Err(DkimError::Algorithm),
+    }
 }
 
 pub fn signature_header_without_b(header: &[u8]) -> Result<Vec<u8>, DkimError> {
@@ -386,35 +421,51 @@ pub fn verify_signature_data(
     public_key: &[u8],
     signing_data: &[u8],
 ) -> Result<bool, DkimError> {
-    let tags = parse_tags(signature_header)?;
-    let signature_bytes = STANDARD
+    let tags = tag_list::parse(signature_header)?;
+    let signature = STANDARD
         .decode(compact(tags.get("b").ok_or(DkimError::Malformed)?))
         .map_err(|_| DkimError::Malformed)?;
     match tags.get("a").map(String::as_str) {
-        Some("rsa-sha256") => Ok(signature::UnparsedPublicKey::new(
-            &signature::RSA_PKCS1_2048_8192_SHA256,
+        Some("rsa-sha256") => Ok(ring_signature::UnparsedPublicKey::new(
+            &ring_signature::RSA_PKCS1_1024_8192_SHA256_FOR_LEGACY_USE_ONLY,
             public_key,
         )
-        .verify(signing_data, &signature_bytes)
+        .verify(signing_data, &signature)
         .is_ok()),
-        Some("ed25519-sha256") => Ok(signature::UnparsedPublicKey::new(
-            &signature::ED25519,
+        Some("ed25519-sha256") => Ok(ring_signature::UnparsedPublicKey::new(
+            &ring_signature::ED25519,
             public_key,
         )
-        .verify(signing_data, &signature_bytes)
+        .verify(signing_data, &signature)
         .is_ok()),
         _ => Err(DkimError::Algorithm),
     }
 }
 
+fn required_tag(
+    tags: &std::collections::HashMap<String, String>,
+    name: &str,
+) -> Result<String, DkimError> {
+    tags.get(name)
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .ok_or(DkimError::Malformed)
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
 fn sign_bytes(data: &[u8], key: SigningKey) -> Result<Vec<u8>, DkimError> {
     match key {
         SigningKey::RsaPkcs8(der) => {
-            let pair = signature::RsaKeyPair::from_der(&der)
+            let pair = ring_signature::RsaKeyPair::from_der(&der)
                 .map_err(|error| DkimError::Key(error.to_string()))?;
             let mut out = vec![0; pair.public().modulus_len()];
             pair.sign(
-                &signature::RSA_PKCS1_SHA256,
+                &ring_signature::RSA_PKCS1_SHA256,
                 &SystemRandom::new(),
                 data,
                 &mut out,
@@ -422,7 +473,7 @@ fn sign_bytes(data: &[u8], key: SigningKey) -> Result<Vec<u8>, DkimError> {
             .map_err(|error| DkimError::Key(error.to_string()))?;
             Ok(out)
         }
-        SigningKey::Ed25519Pkcs8(der) => signature::Ed25519KeyPair::from_pkcs8(&der)
+        SigningKey::Ed25519Pkcs8(der) => ring_signature::Ed25519KeyPair::from_pkcs8(&der)
             .map(|pair| pair.sign(data).as_ref().to_vec())
             .map_err(|error| DkimError::Key(error.to_string())),
     }
@@ -450,16 +501,19 @@ fn signing_input(
 ) -> Vec<u8> {
     let (headers, _) = split_body(message);
     let mut signing = Vec::new();
+    let mut selected = std::collections::HashMap::<String, usize>::new();
     for name in names {
-        if let Some(line) = find_header(headers, name) {
+        let used = selected.entry(name.to_ascii_lowercase()).or_default();
+        if let Some(line) = find_header_from_bottom(headers, name, *used) {
             signing.extend_from_slice(&canonicalize_header(line, mode));
+            *used = used.saturating_add(1);
         }
     }
     signing.extend_from_slice(&canonicalize_header(signature_header, mode));
     signing
 }
-fn find_header<'a>(headers: &'a [u8], name: &str) -> Option<&'a [u8]> {
-    let mut found = None;
+fn header_fields(headers: &[u8]) -> Vec<&[u8]> {
+    let mut fields = Vec::new();
     let mut start = 0;
     let mut field_start = 0;
     while start < headers.len() {
@@ -468,17 +522,25 @@ fn find_header<'a>(headers: &'a [u8], name: &str) -> Option<&'a [u8]> {
             .position(|byte| *byte == b'\n')
             .map_or(headers.len(), |offset| start + offset + 1);
         if !matches!(headers.get(start), Some(b' ' | b'\t')) {
-            if header_name_matches(&headers[field_start..start], name) {
-                found = Some(&headers[field_start..start]);
+            if start > field_start {
+                fields.push(&headers[field_start..start]);
             }
             field_start = start;
         }
         start = end;
     }
-    if header_name_matches(&headers[field_start..], name) {
-        found = Some(&headers[field_start..]);
+    if field_start < headers.len() {
+        fields.push(&headers[field_start..]);
     }
-    found
+    fields
+}
+
+fn find_header_from_bottom<'a>(headers: &'a [u8], name: &str, skip: usize) -> Option<&'a [u8]> {
+    header_fields(headers)
+        .into_iter()
+        .rev()
+        .filter(|field| header_name_matches(field, name))
+        .nth(skip)
 }
 
 fn header_name_matches(field: &[u8], name: &str) -> bool {
@@ -532,45 +594,65 @@ fn canon_name(mode: Canonicalization) -> &'static str {
         "simple"
     }
 }
-fn parse_tags(header: &[u8]) -> Result<std::collections::HashMap<String, String>, DkimError> {
-    let text = std::str::from_utf8(header)
-        .map_err(|_| DkimError::Malformed)?
-        .split_once(':')
-        .ok_or(DkimError::Malformed)?
-        .1;
-    let value = text.replace("\r\n", "\n").replace(['\n', '\t'], " ");
-    value
-        .split(';')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            part.split_once('=')
-                .ok_or(DkimError::Malformed)
-                .map(|(key, value)| (key.trim().to_owned(), value.trim().to_owned()))
-        })
-        .collect()
-}
-
 fn compact(value: &str) -> String {
     value.split_ascii_whitespace().collect()
 }
 fn remove_tag_value(header: &[u8], target: &str) -> Result<Vec<u8>, DkimError> {
-    let text = std::str::from_utf8(header).map_err(|_| DkimError::Malformed)?;
-    let (name, value) = text.split_once(':').ok_or(DkimError::Malformed)?;
-    let mut out = format!("{}:", name.trim());
-    for part in value.split(';') {
-        let part = part.trim();
-        if part.starts_with(&format!("{target}=")) {
-            out.push_str("; ");
-            out.push_str(target);
-            out.push('=');
-        } else if !part.is_empty() {
-            out.push_str(if out.ends_with(':') { " " } else { "; " });
-            out.push_str(part);
+    let colon = header
+        .iter()
+        .position(|byte| *byte == b':')
+        .ok_or(DkimError::Malformed)?;
+    let mut output = Vec::with_capacity(header.len());
+    let mut copied = 0;
+    let mut start = colon + 1;
+    let mut found = false;
+    while start < header.len() {
+        let end = header[start..]
+            .iter()
+            .position(|byte| *byte == b';')
+            .map_or(header.len(), |offset| start + offset);
+        let segment = &header[start..end];
+        if let Some(equals) = segment.iter().position(|byte| *byte == b'=') {
+            let name = trim_fws(&segment[..equals]);
+            if name.eq_ignore_ascii_case(target.as_bytes()) {
+                if found {
+                    return Err(DkimError::Malformed);
+                }
+                found = true;
+                let value_start = start + equals + 1;
+                output.extend_from_slice(&header[copied..value_start]);
+                output.extend(
+                    header[value_start..end]
+                        .iter()
+                        .copied()
+                        .filter(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n')),
+                );
+                copied = end;
+            }
         }
+        start = end.saturating_add(1);
     }
-    out.push_str("\r\n");
-    Ok(out.into_bytes())
+    if !found {
+        return Err(DkimError::Malformed);
+    }
+    output.extend_from_slice(&header[copied..]);
+    Ok(output)
+}
+
+fn trim_fws(mut value: &[u8]) -> &[u8] {
+    while value
+        .first()
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+    {
+        value = &value[1..];
+    }
+    while value
+        .last()
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+    {
+        value = &value[..value.len() - 1];
+    }
+    value
 }
 
 #[cfg(test)]
@@ -616,17 +698,38 @@ mod tests {
     fn signed_header_lookup_includes_continuation_lines() {
         let headers = b"From: a@example.test\r\nSubject: first\r\n second\r\nDate: now\r\n";
         assert_eq!(
-            find_header(headers, "Subject"),
+            find_header_from_bottom(headers, "Subject", 0),
             Some(b"Subject: first\r\n second\r\n".as_slice())
         );
     }
 
     #[test]
+    fn repeated_headers_are_selected_once_each_from_the_bottom() {
+        let headers = b"From: a@example.test\r\nX-Test: first\r\nX-Test: second\r\n";
+        let input = signing_input(
+            headers,
+            b"DKIM-Signature: v=1; b=\r\n",
+            &["X-Test", "X-Test"],
+            Canonicalization::Simple,
+        );
+        assert!(input.starts_with(b"X-Test: second\r\nX-Test: first\r\n"));
+    }
+
+    #[test]
+    fn removing_b_value_preserves_simple_canonicalization_octets() {
+        let header = b"DKIM-Signature: v=1; b=YWJj\r\n \tZGVm; x=1\r\n";
+        assert_eq!(
+            remove_tag_value(header, "b"),
+            Ok(b"DKIM-Signature: v=1; b=\r\n \t; x=1\r\n".to_vec())
+        );
+    }
+
+    #[test]
     fn ed25519_signature_round_trip() {
-        let key = signature::Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
+        let key = ring_signature::Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
             .unwrap_or_else(|_| panic!("key"));
-        let pair =
-            signature::Ed25519KeyPair::from_pkcs8(key.as_ref()).unwrap_or_else(|_| panic!("key"));
+        let pair = ring_signature::Ed25519KeyPair::from_pkcs8(key.as_ref())
+            .unwrap_or_else(|_| panic!("key"));
         let message = b"From: a@example.test\r\nSubject: test\r\n\r\nbody\r\n";
         let header = sign(
             message,
@@ -664,12 +767,12 @@ mod tests {
         let direct =
             sign_bytes(&input, SigningKey::Ed25519Pkcs8(key.as_ref().to_vec())).unwrap_or_default();
         assert!(
-            signature::UnparsedPublicKey::new(&signature::ED25519, pair.public_key())
+            ring_signature::UnparsedPublicKey::new(&ring_signature::ED25519, pair.public_key())
                 .verify(&input, &direct)
                 .is_ok()
         );
         let expected_unsigned = format!(
-            "DKIM-Signature: v=1; a=ed25519-sha256; c=relaxed:relaxed; d=example.test; s=s1; h=From:Subject; bh={}; b=\r\n",
+            "DKIM-Signature: v=1; a=ed25519-sha256; c=relaxed/relaxed; d=example.test; s=s1; h=From:Subject; bh={}; b=\r\n",
             body_hash(b"body\r\n", Canonicalization::Relaxed)
         );
         assert_eq!(
