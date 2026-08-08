@@ -16,6 +16,7 @@ mail-postgres = { path = "../../crates/mail-postgres" }
 mail-dns = { path = "../../crates/mail-dns" }
 mail-smtp-server = { path = "../../crates/mail-smtp-server" }
 mail-storage = { path = "../../crates/mail-storage" }
+mail-tls = { path = "../../crates/mail-tls" }
 rustls.workspace = true
 sqlx.workspace = true
 tokio.workspace = true

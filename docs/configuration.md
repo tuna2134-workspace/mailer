@@ -46,9 +46,10 @@ cors = "deny"
 `maild` currently accepts secret-capable environment inputs while the typed TOML loader remains scheduled with the wider listener configuration:
 
 - `MAIL_DATABASE_URL`: PostgreSQL URL (required).
-- `MAIL_ACME_DOMAINS`: comma-separated DNS names (required).
-- `MAIL_ACME_CONTACTS`: comma-separated `mailto:` contacts (required).
-- `MAIL_ACME_CACHE_KEY_HEX`: separate 32-byte AES key encoded as exactly 64 hex characters (required; never stored in PostgreSQL).
+- `MAIL_ACME_DOMAINS`: comma-separated DNS names (required in ACME mode).
+- `MAIL_ACME_CONTACTS`: comma-separated `mailto:` contacts (required in ACME mode).
+- `MAIL_ACME_CACHE_KEY_HEX`: separate 32-byte AES key encoded as exactly 64 hex characters (required in ACME mode; never stored in PostgreSQL).
+- `MAIL_TLS_CERT_FILE` and `MAIL_TLS_KEY_FILE`: manual PEM identity; both must be set and disable the ACME listener. `MAIL_HOSTNAME` is then required.
 - `MAIL_ACME_PRODUCTION=true`: use Let's Encrypt production; omitted means staging.
 - `MAIL_ACME_LISTEN`: TLS-ALPN-01 address, default `0.0.0.0:443`.
 - `MAIL_ADMIN_LISTEN`: administration HTTPS address, default `127.0.0.1:8443`.

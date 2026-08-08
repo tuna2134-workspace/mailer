@@ -499,31 +499,30 @@ impl MailRepository for PostgresRepository {
             let original: Option<(Uuid, String)> = sqlx::query_as(
                 "SELECT m.tenant_id,m.envelope_sender FROM queue_recipients q JOIN messages m ON m.id=q.message_id WHERE q.id=$1")
                 .bind(queue_id.into_uuid()).fetch_optional(&mut *tx).await.map_err(map_sqlx)?;
-            if let Some((tenant_id, sender)) = original {
-                if let Some(domain) = sender
+            if let Some((tenant_id, sender)) = original
+                && let Some(domain) = sender
                     .rsplit_once('@')
                     .map(|(_, domain)| domain)
                     .filter(|domain| !domain.is_empty() && !sender.contains(['\r', '\n']))
-                {
-                    let message_id = Uuid::new_v4();
-                    let bounce = failure_message(&FailureNotice {
-                        sender: "MAILER-DAEMON@localhost",
-                        recipient: &sender,
-                        original_recipient: None,
-                        action: "failed",
-                        status: "5.0.0",
-                        diagnostic: &diagnostic.chars().take(2_000).collect::<String>(),
-                        remote_mta: None,
-                        envelope_id: None,
-                    })
-                    .map_err(|error| StorageError::Unavailable(error.to_string()))?;
-                    sqlx::query("INSERT INTO messages(id,tenant_id,raw_message,envelope_sender,envelope_recipients,received_at,message_size,content_hash,storage_state) VALUES($1,$2,$3,'',ARRAY[$4],clock_timestamp(),octet_length($3),digest($3,'sha256'),'committed')")
+            {
+                let message_id = Uuid::new_v4();
+                let bounce = failure_message(&FailureNotice {
+                    sender: "MAILER-DAEMON@localhost",
+                    recipient: &sender,
+                    original_recipient: None,
+                    action: "failed",
+                    status: "5.0.0",
+                    diagnostic: &diagnostic.chars().take(2_000).collect::<String>(),
+                    remote_mta: None,
+                    envelope_id: None,
+                })
+                .map_err(|error| StorageError::Unavailable(error.to_string()))?;
+                sqlx::query("INSERT INTO messages(id,tenant_id,raw_message,envelope_sender,envelope_recipients,received_at,message_size,content_hash,storage_state) VALUES($1,$2,$3,'',ARRAY[$4],clock_timestamp(),octet_length($3),digest($3,'sha256'),'committed')")
                         .bind(message_id).bind(tenant_id).bind(&bounce).bind(&sender)
                         .execute(&mut *tx).await.map_err(map_sqlx)?;
-                    sqlx::query("INSERT INTO queue_recipients(id,tenant_id,message_id,recipient,destination_domain,state,next_attempt_at,expires_at) VALUES($1,$2,$3,$4,$5,'pending',clock_timestamp(),clock_timestamp()+interval '5 days')")
+                sqlx::query("INSERT INTO queue_recipients(id,tenant_id,message_id,recipient,destination_domain,state,next_attempt_at,expires_at) VALUES($1,$2,$3,$4,$5,'pending',clock_timestamp(),clock_timestamp()+interval '5 days')")
                         .bind(Uuid::new_v4()).bind(tenant_id).bind(message_id).bind(&sender).bind(domain)
                         .execute(&mut *tx).await.map_err(map_sqlx)?;
-                }
             }
         }
         tx.commit().await.map_err(map_sqlx)
@@ -922,7 +921,20 @@ impl SmtpRepository for PostgresRepository {
         address: &str,
     ) -> Result<Option<LocalRecipient>, StorageError> {
         let row = sqlx::query(
-            "SELECT u.tenant_id,m.id AS mailbox_id FROM users u JOIN domains d ON d.id=u.domain_id JOIN mailboxes m ON m.user_id=u.id AND m.tenant_id=u.tenant_id AND m.name='INBOX' WHERE u.local_part || '@' || d.name=$1 AND u.status='active' AND d.status='active'",
+            "WITH candidates AS (\
+             SELECT u.tenant_id,m.id AS mailbox_id,$1::text AS delivery_address,NULL::text AS original_recipient,0 AS priority \
+             FROM users u JOIN domains d ON d.id=u.domain_id \
+             JOIN mailboxes m ON m.user_id=u.id AND m.tenant_id=u.tenant_id AND m.name='INBOX' \
+             WHERE lower(u.local_part || '@' || d.name)=lower($1) AND u.status='active' AND d.status='active' \
+             UNION ALL \
+             SELECT a.tenant_id,m.id,t.target,a.source,1 \
+             FROM aliases a JOIN alias_targets t ON t.alias_id=a.id AND t.position=0 \
+             JOIN domains sd ON sd.tenant_id=a.tenant_id AND lower(sd.name)=lower(split_part(a.source,'@',2)) AND sd.status='active' \
+             LEFT JOIN domains td ON lower(td.name)=lower(split_part(t.target,'@',2)) AND td.tenant_id=a.tenant_id AND td.status='active' \
+             LEFT JOIN users u ON u.domain_id=td.id AND u.tenant_id=a.tenant_id AND lower(u.local_part)=lower(split_part(t.target,'@',1)) AND u.status='active' \
+             LEFT JOIN mailboxes m ON m.user_id=u.id AND m.tenant_id=a.tenant_id AND m.name='INBOX' \
+             WHERE lower(a.source)=lower($1) AND a.kind IN ('user','forwarding') AND split_part(t.target,'@',2)<>''\
+             ) SELECT tenant_id,mailbox_id,delivery_address,original_recipient FROM candidates ORDER BY priority LIMIT 1",
         )
         .bind(address)
         .fetch_optional(&self.pool)
@@ -930,11 +942,14 @@ impl SmtpRepository for PostgresRepository {
         .map_err(map_sqlx)?;
         row.map(|row| {
             Ok(LocalRecipient {
-                address: address.to_owned(),
+                address: row.try_get("delivery_address").map_err(map_sqlx)?,
                 tenant_id: TenantId::new(row.try_get("tenant_id").map_err(map_sqlx)?),
-                mailbox_id: MailboxId::new(row.try_get("mailbox_id").map_err(map_sqlx)?),
+                mailbox_id: row
+                    .try_get::<Option<Uuid>, _>("mailbox_id")
+                    .map_err(map_sqlx)?
+                    .map(MailboxId::new),
                 dsn_notify: None,
-                original_recipient: None,
+                original_recipient: row.try_get("original_recipient").map_err(map_sqlx)?,
             })
         })
         .transpose()
@@ -1029,17 +1044,28 @@ impl SmtpRepository for PostgresRepository {
             for recipient in tenant_recipients {
                 sqlx::query("INSERT INTO message_recipient_options(message_id,recipient,dsn_notify,original_recipient) VALUES($1,$2,$3,$4)")
                     .bind(message_id).bind(&recipient.address).bind(&recipient.dsn_notify).bind(&recipient.original_recipient).execute(&mut *transaction).await.map_err(map_sqlx)?;
-                let quota = sqlx::query("UPDATE users u SET used_bytes=used_bytes+$1 WHERE u.tenant_id=$2 AND u.id=(SELECT user_id FROM mailboxes WHERE id=$3 AND tenant_id=$2) AND u.status='active' AND used_bytes<=quota_bytes-$1")
-                    .bind(size).bind(tenant_id.into_uuid()).bind(recipient.mailbox_id.into_uuid()).execute(&mut *transaction).await.map_err(map_sqlx)?;
-                if quota.rows_affected() != 1 {
-                    return Err(StorageError::QuotaExceeded);
+                if let Some(mailbox_id) = recipient.mailbox_id {
+                    let quota = sqlx::query("UPDATE users u SET used_bytes=used_bytes+$1 WHERE u.tenant_id=$2 AND u.id=(SELECT user_id FROM mailboxes WHERE id=$3 AND tenant_id=$2) AND u.status='active' AND used_bytes<=quota_bytes-$1")
+                        .bind(size).bind(tenant_id.into_uuid()).bind(mailbox_id.into_uuid()).execute(&mut *transaction).await.map_err(map_sqlx)?;
+                    if quota.rows_affected() != 1 {
+                        return Err(StorageError::QuotaExceeded);
+                    }
+                    let allocation = sqlx::query("UPDATE mailboxes SET uid_next=uid_next+1,highest_modseq=highest_modseq+1,message_count=message_count+1,unseen_count=unseen_count+1 WHERE id=$1 AND tenant_id=$2 AND uid_next<4294967295 AND highest_modseq<9223372036854775807 RETURNING uid_next-1 AS uid,highest_modseq")
+                        .bind(mailbox_id.into_uuid()).bind(tenant_id.into_uuid()).fetch_optional(&mut *transaction).await.map_err(map_sqlx)?.ok_or(StorageError::Conflict)?;
+                    let uid: i64 = allocation.try_get("uid").map_err(map_sqlx)?;
+                    let modseq: i64 = allocation.try_get("highest_modseq").map_err(map_sqlx)?;
+                    sqlx::query("INSERT INTO mailbox_messages(mailbox_id,message_id,uid,modseq,internal_date,object_id) VALUES($1,$2,$3,$4,clock_timestamp(),$5)")
+                        .bind(mailbox_id.into_uuid()).bind(message_id).bind(uid).bind(modseq).bind(Uuid::new_v4()).execute(&mut *transaction).await.map_err(map_sqlx)?;
+                } else {
+                    let domain = recipient
+                        .address
+                        .rsplit_once('@')
+                        .map(|(_, domain)| domain)
+                        .filter(|domain| !domain.is_empty())
+                        .ok_or(StorageError::Conflict)?;
+                    sqlx::query("INSERT INTO queue_recipients(id,tenant_id,message_id,recipient,destination_domain,state,next_attempt_at,expires_at) VALUES($1,$2,$3,$4,$5,'pending',clock_timestamp(),clock_timestamp()+interval '5 days')")
+                        .bind(Uuid::new_v4()).bind(tenant_id.into_uuid()).bind(message_id).bind(&recipient.address).bind(domain.to_ascii_lowercase()).execute(&mut *transaction).await.map_err(map_sqlx)?;
                 }
-                let allocation = sqlx::query("UPDATE mailboxes SET uid_next=uid_next+1,highest_modseq=highest_modseq+1,message_count=message_count+1,unseen_count=unseen_count+1 WHERE id=$1 AND tenant_id=$2 AND uid_next<4294967295 AND highest_modseq<9223372036854775807 RETURNING uid_next-1 AS uid,highest_modseq")
-                    .bind(recipient.mailbox_id.into_uuid()).bind(tenant_id.into_uuid()).fetch_optional(&mut *transaction).await.map_err(map_sqlx)?.ok_or(StorageError::Conflict)?;
-                let uid: i64 = allocation.try_get("uid").map_err(map_sqlx)?;
-                let modseq: i64 = allocation.try_get("highest_modseq").map_err(map_sqlx)?;
-                sqlx::query("INSERT INTO mailbox_messages(mailbox_id,message_id,uid,modseq,internal_date,object_id) VALUES($1,$2,$3,$4,clock_timestamp(),$5)")
-                    .bind(recipient.mailbox_id.into_uuid()).bind(message_id).bind(uid).bind(modseq).bind(Uuid::new_v4()).execute(&mut *transaction).await.map_err(map_sqlx)?;
             }
             octets = u64::try_from(size).map_err(|_| StorageError::Conflict)?;
             message_ids.push(message_id);

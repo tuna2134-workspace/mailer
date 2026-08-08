@@ -528,7 +528,7 @@ where
                     Ok(Some(recipient)) => {
                         let recipient = LocalRecipient {
                             dsn_notify: parameters.notify,
-                            original_recipient: parameters.orcpt,
+                            original_recipient: parameters.orcpt.or(recipient.original_recipient),
                             ..recipient
                         };
                         resolved.insert(address.clone(), recipient);
@@ -1113,7 +1113,7 @@ mod tests {
             Ok((address == "alice@example.test").then(|| LocalRecipient {
                 address: address.into(),
                 tenant_id: TenantId::new(Uuid::nil()),
-                mailbox_id: MailboxId::new(Uuid::nil()),
+                mailbox_id: Some(MailboxId::new(Uuid::nil())),
                 dsn_notify: None,
                 original_recipient: None,
             }))
@@ -1276,6 +1276,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tcp_listener_receives_a_real_smtp_message() -> Result<(), Box<dyn std::error::Error>> {
+        let repository = Arc::new(Repository::default());
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let task_repository = Arc::clone(&repository);
+        let server =
+            tokio::spawn(
+                async move { serve(listener, task_repository, SmtpConfig::default()).await },
+            );
+        let client = TcpStream::connect(address).await?;
+        let (read, mut write) = tokio::io::split(client);
+        let mut reader = BufReader::new(read);
+        assert!(response(&mut reader).await?.starts_with("220 "));
+        for (command, code) in [
+            ("EHLO sender.example\r\n", "250"),
+            ("MAIL FROM:<sender@example.net>\r\n", "250"),
+            ("RCPT TO:<alice@example.test>\r\n", "250"),
+            ("DATA\r\n", "354"),
+        ] {
+            write.write_all(command.as_bytes()).await?;
+            assert!(response(&mut reader).await?.starts_with(code));
+        }
+        write
+            .write_all(b"Subject: docker e2e\r\n\r\nreal body\r\n.\r\n")
+            .await?;
+        assert!(response(&mut reader).await?.starts_with("250"));
+        write.write_all(b"QUIT\r\n").await?;
+        assert!(response(&mut reader).await?.starts_with("221"));
+        assert!(*repository.committed.lock().map_err(|_| "lock")?);
+        assert!(
+            repository
+                .chunks
+                .lock()
+                .map_err(|_| "lock")?
+                .ends_with(b"real body\r\n")
+        );
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn idle_command_timeout_terminates_session() -> Result<(), Box<dyn std::error::Error>> {
         let (mut client, server) = duplex(1024);
         let repository = Repository::default();
@@ -1364,18 +1405,27 @@ mod tests {
             pki_types::{PrivatePkcs8KeyDer, ServerName},
         };
 
-        let identity = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
-        let certificate = identity.cert.der().clone();
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new())?;
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params
+            .key_usages
+            .push(rcgen::KeyUsagePurpose::KeyCertSign);
+        let ca_key = rcgen::KeyPair::generate()?;
+        let ca_certificate = ca_params.self_signed(&ca_key)?;
+        let issuer = rcgen::Issuer::new(ca_params, ca_key);
+        let leaf_key = rcgen::KeyPair::generate()?;
+        let certificate = rcgen::CertificateParams::new(vec!["localhost".into()])?
+            .signed_by(&leaf_key, &issuer)?;
         let server_tls =
             ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
                 .with_safe_default_protocol_versions()?
                 .with_no_client_auth()
                 .with_single_cert(
-                    vec![certificate.clone()],
-                    PrivatePkcs8KeyDer::from(identity.signing_key.serialize_der()).into(),
+                    vec![certificate.der().clone()],
+                    PrivatePkcs8KeyDer::from(leaf_key.serialize_der()).into(),
                 )?;
         let mut roots = RootCertStore::empty();
-        roots.add(certificate)?;
+        roots.add(ca_certificate.der().clone())?;
         let client_tls =
             ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
                 .with_safe_default_protocol_versions()?

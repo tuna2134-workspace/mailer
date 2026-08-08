@@ -1,6 +1,6 @@
 use mail_domain::{
-    Domain, DomainId, DomainName, EntityStatus, LocalPart, Mailbox, MailboxId, QuotaBytes, Tenant,
-    TenantId, User, UserId,
+    Alias, AliasId, AliasKind, Domain, DomainId, DomainName, EntityStatus, LocalPart, Mailbox,
+    MailboxId, QuotaBytes, Tenant, TenantId, User, UserId,
 };
 use mail_mailbox::{FlagSet, StoreMode, SystemFlag};
 use mail_postgres::PostgresRepository;
@@ -93,6 +93,27 @@ async fn streaming_ingestion_and_atomic_local_delivery() -> Result<(), Box<dyn s
     .await?;
     assert_eq!(validities.len(), 2);
     assert_ne!(validities[0], validities[1]);
+
+    let forwarded = format!("forwarded@{hosted_domain}");
+    repository
+        .create_alias(&Alias {
+            id: AliasId::new(Uuid::new_v4()),
+            tenant_id: tenant,
+            source: forwarded.clone(),
+            kind: AliasKind::Forwarding,
+            targets: vec![identity.clone()],
+        })
+        .await?;
+    let forwarded_recipient = repository
+        .resolve_local_recipient(&forwarded)
+        .await?
+        .ok_or("forwarding alias missing")?;
+    assert_eq!(forwarded_recipient.address, identity);
+    assert_eq!(forwarded_recipient.mailbox_id, Some(mailbox));
+    assert_eq!(
+        forwarded_recipient.original_recipient.as_deref(),
+        Some(forwarded.as_str())
+    );
 
     let recipient = repository
         .resolve_local_recipient(&identity)

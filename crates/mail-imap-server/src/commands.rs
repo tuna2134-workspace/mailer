@@ -72,34 +72,34 @@ pub async fn execute<R: ImapRepository>(
                 .collect();
             let selection = selection_options(options.as_deref(), qresync_enabled)?;
             out.responses.extend(select_responses(&mailbox));
-            if let Some(request) = &selection.qresync {
-                if request.uid_validity == mailbox.uid_validity {
-                    let changes = repo
-                        .imap_changes(user, mailbox.id, request.modseq)
-                        .await
-                        .map_err(storage)?;
-                    let vanished = request.known_uids.as_ref().map_or_else(
-                        || changes.vanished.clone(),
-                        |known| {
-                            changes
-                                .vanished
-                                .iter()
-                                .copied()
-                                .filter(|uid| {
-                                    set_contains(known, *uid, mailbox.uid_next.saturating_sub(1))
-                                })
-                                .collect()
-                        },
+            if let Some(request) = &selection.qresync
+                && request.uid_validity == mailbox.uid_validity
+            {
+                let changes = repo
+                    .imap_changes(user, mailbox.id, request.modseq)
+                    .await
+                    .map_err(storage)?;
+                let vanished = request.known_uids.as_ref().map_or_else(
+                    || changes.vanished.clone(),
+                    |known| {
+                        changes
+                            .vanished
+                            .iter()
+                            .copied()
+                            .filter(|uid| {
+                                set_contains(known, *uid, mailbox.uid_next.saturating_sub(1))
+                            })
+                            .collect()
+                    },
+                );
+                if !vanished.is_empty() {
+                    out.responses.push(
+                        format!("* VANISHED (EARLIER) {}\r\n", join_numbers(&vanished))
+                            .into_bytes(),
                     );
-                    if !vanished.is_empty() {
-                        out.responses.push(
-                            format!("* VANISHED (EARLIER) {}\r\n", join_numbers(&vanished))
-                                .into_bytes(),
-                        );
-                    }
-                    out.responses
-                        .extend(change_responses(&changes.changed, true));
                 }
+                out.responses
+                    .extend(change_responses(&changes.changed, true));
             }
             out.completion = if examine {
                 "[READ-ONLY] EXAMINE completed"

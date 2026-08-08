@@ -194,7 +194,7 @@ pub enum DeliveryOutcome {
 pub struct LocalRecipient {
     pub address: String,
     pub tenant_id: TenantId,
-    pub mailbox_id: MailboxId,
+    pub mailbox_id: Option<MailboxId>,
     pub dsn_notify: Option<String>,
     pub original_recipient: Option<String>,
 }

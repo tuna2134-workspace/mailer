@@ -1836,6 +1836,7 @@ dependencies = [
  "mail-postgres",
  "mail-smtp-server",
  "mail-storage",
+ "mail-tls",
  "rustls",
  "sqlx",
  "tokio",

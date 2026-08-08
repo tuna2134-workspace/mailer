@@ -6,6 +6,7 @@ use mail_acme::{AcmeSettings, PostgresAcmeCache, RenewalLock, run_tls_alpn_liste
 use mail_dns::MailResolver;
 use mail_postgres::PostgresRepository;
 use mail_storage::SmtpRepository;
+use mail_tls::PemIdentity;
 use rustls::ServerConfig;
 use sqlx::postgres::PgPoolOptions;
 use std::{net::SocketAddr, sync::Arc};
@@ -16,25 +17,26 @@ const RENEWAL_LOCK_ID: i64 = 0x4d41_494c_4143_4d45;
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| anyhow::anyhow!("install rustls ring crypto provider"))?;
     let database_url = required("MAIL_DATABASE_URL")?;
-    let domains = csv("MAIL_ACME_DOMAINS")?;
-    let contacts = csv("MAIL_ACME_CONTACTS")?;
-    let cache_key = decode_hex(&required("MAIL_ACME_CACHE_KEY_HEX")?)?;
-    let production = std::env::var("MAIL_ACME_PRODUCTION").is_ok_and(|value| value == "true");
-    let acme_addr = address("MAIL_ACME_LISTEN", "0.0.0.0:443")?;
     let admin_addr = address("MAIL_ADMIN_LISTEN", "127.0.0.1:8443")?;
     let smtp_addr = address("MAIL_SMTP_LISTEN", "0.0.0.0:25")?;
     let submission_addr = address("MAIL_SUBMISSION_LISTEN", "0.0.0.0:587")?;
     let implicit_submission_addr = address("MAIL_SUBMISSIONS_LISTEN", "0.0.0.0:465")?;
     let imap_addr = address("MAIL_IMAP_LISTEN", "0.0.0.0:143")?;
     let implicit_imap_addr = address("MAIL_IMAPS_LISTEN", "0.0.0.0:993")?;
-    let hostname = match std::env::var("MAIL_HOSTNAME") {
-        Ok(value) => value,
-        Err(_) => domains
-            .first()
-            .cloned()
-            .context("ACME domain list is empty")?,
+    let manual_identity = manual_identity().await?;
+    let domains = if manual_identity.is_some() {
+        Vec::new()
+    } else {
+        csv("MAIL_ACME_DOMAINS")?
     };
+    let hostname = std::env::var("MAIL_HOSTNAME")
+        .ok()
+        .or_else(|| domains.first().cloned())
+        .context("MAIL_HOSTNAME is required when manual TLS certificates are used")?;
     if !valid_hostname(&hostname) {
         bail!("MAIL_HOSTNAME must be a valid ASCII DNS hostname");
     }
@@ -45,18 +47,50 @@ async fn main() -> Result<()> {
         .await
         .context("connect to PostgreSQL")?;
     check_migrations(&pool).await?;
-    let _renewal_lock = RenewalLock::acquire(&database_url, RENEWAL_LOCK_ID)
-        .await
-        .context("acquire distributed ACME renewal lock")?;
-    let settings = AcmeSettings {
-        domains,
-        contacts,
-        production,
+    let mut renewal_lock = None;
+    let (resolver, acme_task): (_, tokio::task::JoinHandle<Result<()>>) = if let Some(identity) =
+        manual_identity
+    {
+        (
+            mail_tls::sni_resolver(&[identity]).context("load manual TLS identity")?,
+            tokio::spawn(std::future::pending()),
+        )
+    } else {
+        let contacts = csv("MAIL_ACME_CONTACTS")?;
+        let cache_key = decode_hex(&required("MAIL_ACME_CACHE_KEY_HEX")?)?;
+        let production = std::env::var("MAIL_ACME_PRODUCTION").is_ok_and(|value| value == "true");
+        let acme_addr = address("MAIL_ACME_LISTEN", "0.0.0.0:443")?;
+        renewal_lock = Some(
+            RenewalLock::acquire(&database_url, RENEWAL_LOCK_ID)
+                .await
+                .context("acquire distributed ACME renewal lock")?,
+        );
+        let settings = AcmeSettings {
+            domains,
+            contacts,
+            production,
+        };
+        let cache = PostgresAcmeCache::new(pool.clone(), &cache_key)?;
+        let acme_state = state(&settings, cache);
+        let resolver = acme_state.resolver();
+        let listener = TcpListener::bind(acme_addr)
+            .await
+            .with_context(|| format!("bind ACME TLS-ALPN-01 listener {acme_addr}"))?;
+        let (accepted_tx, mut accepted_rx) = mpsc::channel(32);
+        let acme_pool = pool.clone();
+        let acme_task = tokio::spawn(async move {
+            run_tls_alpn_listener(acme_state, listener, accepted_tx, acme_pool, settings)
+                .await
+                .map_err(anyhow::Error::from)
+        });
+        tokio::spawn(async move {
+            while let Some(mut connection) = accepted_rx.recv().await {
+                let _ = tokio::io::AsyncWriteExt::shutdown(&mut connection).await;
+            }
+        });
+        (resolver, acme_task)
     };
-    let cache = PostgresAcmeCache::new(pool.clone(), &cache_key)?;
-    let acme_state = state(&settings, cache);
-    let resolver = acme_state.resolver();
-    let smtp_resolver: Arc<dyn rustls::server::ResolvesServerCert> = resolver.clone();
+    let smtp_resolver: Arc<dyn rustls::server::ResolvesServerCert> = Arc::clone(&resolver);
     let smtp_tls = Arc::new(
         ServerConfig::builder()
             .with_no_client_auth()
@@ -64,22 +98,11 @@ async fn main() -> Result<()> {
     );
     let mut admin_tls = ServerConfig::builder()
         .with_no_client_auth()
-        .with_cert_resolver(resolver);
+        .with_cert_resolver(Arc::clone(&resolver));
     admin_tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
-    let listener = TcpListener::bind(acme_addr)
-        .await
-        .with_context(|| format!("bind ACME TLS-ALPN-01 listener {acme_addr}"))?;
-    let (accepted_tx, mut accepted_rx) = mpsc::channel(32);
-    let acme_pool = pool.clone();
-    let acme_task = tokio::spawn(async move {
-        run_tls_alpn_listener(acme_state, listener, accepted_tx, acme_pool, settings).await
-    });
-    tokio::spawn(async move {
-        while let Some(mut connection) = accepted_rx.recv().await {
-            let _ = tokio::io::AsyncWriteExt::shutdown(&mut connection).await;
-        }
-    });
+    // Keep the PostgreSQL advisory-lock connection alive for the ACME task.
+    let _renewal_lock = renewal_lock;
 
     let repository = PostgresRepository::new(pool);
     repository
@@ -309,6 +332,24 @@ fn valid_hostname(value: &str) -> bool {
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
         })
+}
+
+async fn manual_identity() -> Result<Option<PemIdentity>> {
+    let certificate = std::env::var("MAIL_TLS_CERT_FILE").ok();
+    let private_key = std::env::var("MAIL_TLS_KEY_FILE").ok();
+    match (certificate, private_key) {
+        (None, None) => Ok(None),
+        (Some(certificate), Some(private_key)) => Ok(Some(PemIdentity {
+            names: vec![required("MAIL_HOSTNAME")?],
+            certificate_chain: tokio::fs::read(&certificate)
+                .await
+                .with_context(|| format!("read TLS certificate {certificate}"))?,
+            private_key: tokio::fs::read(&private_key)
+                .await
+                .with_context(|| format!("read TLS private key {private_key}"))?,
+        })),
+        _ => bail!("MAIL_TLS_CERT_FILE and MAIL_TLS_KEY_FILE must be set together"),
+    }
 }
 
 async fn check_migrations(pool: &sqlx::PgPool) -> Result<()> {

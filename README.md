@@ -6,7 +6,7 @@ Rust/Tokio、PostgreSQL、rustlsで構築されたインターネットメール
 
 ## 必要なもの
 
-- Rust 1.85以降
+- Rust 1.88以降
 - PostgreSQL（`pgcrypto`を利用可能なもの）
 - 公開メールサーバとして動かす場合は、TCP 25、443、465、587、143、993の到達性
 - ACME対象ホスト名を指すDNS A/AAAAレコード
@@ -79,9 +79,9 @@ INSERT INTO api_tokens (
 | 変数 | 内容 |
 | --- | --- |
 | `MAIL_DATABASE_URL` | PostgreSQL接続URL |
-| `MAIL_ACME_DOMAINS` | 証明書対象名のカンマ区切り一覧 |
-| `MAIL_ACME_CONTACTS` | `mailto:`形式のACME連絡先一覧 |
-| `MAIL_ACME_CACHE_KEY_HEX` | ACME private material暗号化用32 byte keyの64桁hex |
+| `MAIL_ACME_DOMAINS` | ACME利用時の証明書対象名のカンマ区切り一覧 |
+| `MAIL_ACME_CONTACTS` | ACME利用時の`mailto:`形式の連絡先一覧 |
+| `MAIL_ACME_CACHE_KEY_HEX` | ACME利用時のprivate material暗号化用32 byte keyの64桁hex |
 
 主な任意環境変数:
 
@@ -96,6 +96,8 @@ INSERT INTO api_tokens (
 | `MAIL_SUBMISSIONS_LISTEN` | `0.0.0.0:465` |
 | `MAIL_IMAP_LISTEN` | `0.0.0.0:143` |
 | `MAIL_IMAPS_LISTEN` | `0.0.0.0:993` |
+| `MAIL_TLS_CERT_FILE` | 手動証明書chainのPEMファイル |
+| `MAIL_TLS_KEY_FILE` | 手動証明書private keyのPEMファイル |
 
 stagingでの起動例:
 
@@ -109,6 +111,8 @@ cargo run --release -p maild
 ```
 
 ACME staging取得、SNI、SMTP STARTTLS、Submission、IMAPS、管理APIを確認してから、`MAIL_ACME_PRODUCTION=true`へ切り替えてください。ACME cache encryption keyを失うと、PostgreSQL内の証明書private materialを復号できません。DBバックアップとは別に保管してください。
+
+手動証明書を使う場合は`MAIL_HOSTNAME`、`MAIL_TLS_CERT_FILE`、`MAIL_TLS_KEY_FILE`を設定します。この場合ACME用変数とTCP/443 listenerは不要です。証明書ファイルにはleafから中間CAまでのchainを含め、private keyはmaild実行ユーザーだけが読める権限にしてください。二つのファイル変数の片方だけを設定すると起動を拒否します。
 
 ## 配送worker
 

@@ -709,18 +709,27 @@ mod tests {
             pki_types::{PrivatePkcs8KeyDer, ServerName},
         };
 
-        let identity = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
-        let certificate = identity.cert.der().clone();
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new())?;
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params
+            .key_usages
+            .push(rcgen::KeyUsagePurpose::KeyCertSign);
+        let ca_key = rcgen::KeyPair::generate()?;
+        let ca_certificate = ca_params.self_signed(&ca_key)?;
+        let issuer = rcgen::Issuer::new(ca_params, ca_key);
+        let leaf_key = rcgen::KeyPair::generate()?;
+        let certificate = rcgen::CertificateParams::new(vec!["localhost".into()])?
+            .signed_by(&leaf_key, &issuer)?;
         let server_tls =
             ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
                 .with_safe_default_protocol_versions()?
                 .with_no_client_auth()
                 .with_single_cert(
-                    vec![certificate.clone()],
-                    PrivatePkcs8KeyDer::from(identity.signing_key.serialize_der()).into(),
+                    vec![certificate.der().clone()],
+                    PrivatePkcs8KeyDer::from(leaf_key.serialize_der()).into(),
                 )?;
         let mut roots = RootCertStore::empty();
-        roots.add(certificate)?;
+        roots.add(ca_certificate.der().clone())?;
         let client_tls =
             ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
                 .with_safe_default_protocol_versions()?
