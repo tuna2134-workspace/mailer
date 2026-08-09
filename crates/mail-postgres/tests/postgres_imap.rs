@@ -181,12 +181,16 @@ async fn phase10_and_phase11_mailbox_sync_contract() -> Result<(), Box<dyn std::
         .imap_copy(user_id.into_uuid(), inbox.id, &[uid], "Archive", false)
         .await?;
     assert_eq!(copied, [1]);
+    let copied_again = repository
+        .imap_copy(user_id.into_uuid(), inbox.id, &[uid], "Archive", false)
+        .await?;
+    assert_eq!(copied_again, [2]);
     assert_eq!(
         repository
             .imap_messages(user_id.into_uuid(), archive.id)
             .await?
             .len(),
-        1
+        2
     );
 
     let deleted = StoreFlags {

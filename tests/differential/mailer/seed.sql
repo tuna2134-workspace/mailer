@@ -1,0 +1,32 @@
+INSERT INTO tenants(id,name,status,quota_bytes,retention_days)
+VALUES ('00000000-0000-0000-0000-000000000001','Differential','active',1073741824,1)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO domains(id,tenant_id,name,status)
+VALUES ('00000000-0000-0000-0000-000000000002','00000000-0000-0000-0000-000000000001','example.test','active')
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO users(id,tenant_id,domain_id,local_part,display_name,status,quota_bytes)
+VALUES ('00000000-0000-0000-0000-000000000003','00000000-0000-0000-0000-000000000001','00000000-0000-0000-0000-000000000002','alice','Alice','active',536870912)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO password_credentials(user_id,password_hash)
+VALUES ('00000000-0000-0000-0000-000000000003','$argon2id$v=19$m=19456,t=2,p=1$MDEyMzQ1Njc4OWFiY2RlZg$8qPpaWig0H31wvibKAgpght2Ry2M8rtRQYtZ93ooMus')
+ON CONFLICT (user_id) DO NOTHING;
+
+INSERT INTO mailboxes(id,tenant_id,user_id,name,uid_validity)
+VALUES ('00000000-0000-0000-0000-000000000004','00000000-0000-0000-0000-000000000001','00000000-0000-0000-0000-000000000003','INBOX',1001)
+ON CONFLICT (id) DO NOTHING;
+
+-- Keep IMAP state independent from messages accepted by the SMTP cases.
+INSERT INTO users(id,tenant_id,domain_id,local_part,display_name,status,quota_bytes)
+VALUES ('00000000-0000-0000-0000-000000000005','00000000-0000-0000-0000-000000000001','00000000-0000-0000-0000-000000000002','imap','IMAP Differential','active',536870912)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO password_credentials(user_id,password_hash)
+VALUES ('00000000-0000-0000-0000-000000000005','$argon2id$v=19$m=19456,t=2,p=1$MDEyMzQ1Njc4OWFiY2RlZg$8qPpaWig0H31wvibKAgpght2Ry2M8rtRQYtZ93ooMus')
+ON CONFLICT (user_id) DO NOTHING;
+
+INSERT INTO mailboxes(id,tenant_id,user_id,name,uid_validity)
+VALUES ('00000000-0000-0000-0000-000000000006','00000000-0000-0000-0000-000000000001','00000000-0000-0000-0000-000000000005','INBOX',1002)
+ON CONFLICT (id) DO NOTHING;

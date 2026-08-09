@@ -1,0 +1,5 @@
+# RFC 9051 sections 6.4.7 and 2.3.1.1 regression
+A1 LOGIN imap@example.test <redacted>\r\n
+A2 SELECT INBOX\r\n
+A3 COPY 1 DiffArchive\r\n
+A4 UID COPY 1:* DiffArchive\r\n

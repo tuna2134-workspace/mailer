@@ -1,0 +1,28 @@
+hostname = "mailer"
+
+[database]
+url = "postgresql://mailer:mailer@postgres/mailer"
+
+[tls]
+certificate_file = "/certs/server.crt"
+private_key_file = "/certs/server.key"
+
+[smtp]
+listen = "0.0.0.0:25"
+data_progress_grace_seconds = 5
+data_min_bytes_per_second = 32
+
+[submission]
+listen = "0.0.0.0:587"
+
+[submissions]
+listen = "0.0.0.0:465"
+
+[imap]
+listen = "0.0.0.0:143"
+
+[imaps]
+listen = "0.0.0.0:993"
+
+[admin_api]
+listen = "0.0.0.0:8443"

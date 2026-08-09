@@ -1,0 +1,6 @@
+# RFC 5321 section 4.1.1.4 / RFC 5322 section 3.5 regression
+EHLO client.example\r\n
+MAIL FROM:<sender@example.test>\r\n
+RCPT TO:<alice@example.test>\r\n
+DATA\r\n
+.\r\n

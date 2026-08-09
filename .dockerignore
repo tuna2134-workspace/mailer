@@ -1,0 +1,11 @@
+.git
+target
+**/target
+fuzz/artifacts
+fuzz/corpus
+tests/differential/runner
+tests/differential/corpus
+tests/differential/expected
+.env
+*.pem
+*.key

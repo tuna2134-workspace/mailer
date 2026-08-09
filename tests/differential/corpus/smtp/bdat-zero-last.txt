@@ -1,0 +1,5 @@
+# RFC 3030 section 4 regression
+EHLO client.example\r\n
+MAIL FROM:<sender@example.test>\r\n
+RCPT TO:<alice@example.test>\r\n
+BDAT 0 LAST\r\n

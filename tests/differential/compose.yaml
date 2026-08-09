@@ -1,0 +1,107 @@
+name: mailer-differential
+
+services:
+  postgres:
+    image: postgres:17.6-bookworm
+    environment:
+      POSTGRES_DB: mailer
+      POSTGRES_USER: mailer
+      POSTGRES_PASSWORD: mailer
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mailer -d mailer"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks: [differential]
+    volumes: [postgres-data:/var/lib/postgresql/data]
+
+  mailer:
+    build:
+      context: ../..
+      dockerfile: tests/differential/mailer/Dockerfile
+    environment:
+      MAIL_DATABASE_URL: postgresql://mailer:mailer@postgres/mailer
+    depends_on:
+      postgres: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "25"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks: [differential]
+    volumes: [certs:/certs]
+
+  mailer-worker:
+    build:
+      context: ../..
+      dockerfile: tests/differential/mailer/Dockerfile
+    command: ["worker"]
+    environment:
+      MAIL_DATABASE_URL: postgresql://mailer:mailer@postgres/mailer
+      MAIL_HOSTNAME: mailer
+    depends_on:
+      mailer: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f /usr/local/bin/mail-queue-worker >/dev/null"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    networks: [differential]
+
+  postfix:
+    build:
+      context: ../..
+      dockerfile: tests/differential/postfix/Dockerfile
+    depends_on:
+      mailer: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "25"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks: [differential]
+    volumes: [certs:/certs:ro, postfix-spool:/var/spool/postfix]
+
+  dovecot:
+    build:
+      context: ../..
+      dockerfile: tests/differential/dovecot/Dockerfile
+    depends_on:
+      mailer: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "143"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks: [differential]
+    volumes: [certs:/certs:ro, dovecot-mail:/mail]
+
+  differential-runner:
+    build:
+      context: runner
+      dockerfile: Dockerfile
+    environment:
+      DIFFERENTIAL_CA_FILE: /certs/ca.crt
+      DIFFERENTIAL_REPORT_DIR: /reports
+      MAILER_COMMIT_SHA: ${GITHUB_SHA:-local}
+      POSTFIX_REFERENCE_VERSION: 3.7.11-0+deb12u1
+      DOVECOT_REFERENCE_VERSION: 2.3.19.1+dfsg1-2.1+deb12u6
+    depends_on:
+      mailer: { condition: service_healthy }
+      mailer-worker: { condition: service_healthy }
+      postfix: { condition: service_healthy }
+      dovecot: { condition: service_healthy }
+    networks: [differential]
+    volumes:
+      - certs:/certs:ro
+      - ../../target/differential:/reports
+
+networks:
+  differential:
+    internal: true
+
+volumes:
+  certs:
+  postgres-data:
+  postfix-spool:
+  dovecot-mail:

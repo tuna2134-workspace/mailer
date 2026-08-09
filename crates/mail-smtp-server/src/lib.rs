@@ -1004,7 +1004,7 @@ async fn receive_data_inner<S: AsyncRead + Unpin, R: SmtpRepository>(
             chunk.clear();
         }
     }
-    if !headers_complete && message.finish().is_err() {
+    if size != 0 && !headers_complete && message.finish().is_err() {
         return Err(DataError::InvalidMessage.into());
     }
     repository

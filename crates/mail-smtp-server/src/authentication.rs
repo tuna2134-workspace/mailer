@@ -250,11 +250,8 @@ async fn scan<R: SmtpRepository>(
         }
         position = position.checked_add(1).ok_or(StorageError::Conflict)?;
     }
-    if in_headers {
-        return Err(StorageError::Unavailable(
-            "message has no header/body separator".into(),
-        ));
-    }
+    // Header-only and zero-octet messages have an empty body and no separator.
+    // DATA syntax validation happens before this authentication-only scan.
     Ok(ScannedMessage {
         headers,
         simple_hash: simple.finish(),

@@ -96,3 +96,25 @@ jobs:
         run: rustup toolchain install stable --profile minimal
       - name: Build bounded parser fuzz harnesses
         run: cargo +stable check --manifest-path fuzz/Cargo.toml --bins
+
+  differential:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Run SMTP and IMAP differential suite
+        run: >-
+          docker compose -f tests/differential/compose.yaml up --build
+          --abort-on-container-exit --exit-code-from differential-runner
+      - name: Upload differential report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: differential-report
+          path: target/differential/
+          if-no-files-found: warn
+      - name: Tear down differential environment
+        if: always()
+        run: docker compose -f tests/differential/compose.yaml down -v --remove-orphans

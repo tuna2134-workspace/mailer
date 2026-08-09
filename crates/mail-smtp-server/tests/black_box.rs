@@ -309,3 +309,46 @@ async fn interrupted_bdat_is_aborted_without_acceptance() -> Result<(), Box<dyn 
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn accepts_empty_data_and_zero_length_last_bdat() -> Result<(), Box<dyn std::error::Error>> {
+    for use_bdat in [false, true] {
+        let server = Server::start(SmtpConfig {
+            chunking: true,
+            ..SmtpConfig::default()
+        })
+        .await?;
+        let mut client = BufReader::new(TcpStream::connect(server.address).await?);
+        let _ = reply(&mut client).await?;
+        assert_eq!(
+            code(&command(&mut client, b"EHLO client.example\r\n").await?),
+            "250"
+        );
+        assert_eq!(
+            code(&command(&mut client, b"MAIL FROM:<>\r\n").await?),
+            "250"
+        );
+        assert_eq!(
+            code(&command(&mut client, b"RCPT TO:<alice@example.test>\r\n").await?),
+            "250"
+        );
+        if use_bdat {
+            assert_eq!(
+                code(&command(&mut client, b"BDAT 0 LAST\r\n").await?),
+                "250"
+            );
+        } else {
+            assert_eq!(code(&command(&mut client, b"DATA\r\n").await?), "354");
+            assert_eq!(code(&command(&mut client, b".\r\n").await?), "250");
+        }
+        assert_eq!(
+            *server
+                .repository
+                .committed_recipients
+                .lock()
+                .map_err(|error| error.to_string())?,
+            1
+        );
+    }
+    Ok(())
+}
